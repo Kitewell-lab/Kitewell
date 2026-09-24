@@ -10,6 +10,8 @@ const FRIENDBOT_URL =
   process.env.FRIENDBOT_URL || "https://friendbot.stellar.org";
 const EXPLORER_BASE =
   process.env.EXPLORER_BASE || "https://stellar.expert/explorer/testnet";
+const SOROBAN_RPC_URL =
+  process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 
 /** Optional: set after deploying contracts/kitewell on Testnet */
 const KITEWELL_CONTRACT_ID = process.env.KITEWELL_CONTRACT_ID || null;
@@ -35,6 +37,7 @@ app.get("/api/network", (_req, res) => {
     horizonUrl: HORIZON_URL,
     friendbotUrl: FRIENDBOT_URL,
     explorerBase: EXPLORER_BASE,
+    sorobanRpcUrl: SOROBAN_RPC_URL,
     passphrase: StellarSdk.Networks.TESTNET,
     contract: {
       kitewell: KITEWELL_CONTRACT_ID,

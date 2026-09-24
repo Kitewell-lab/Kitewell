@@ -43,3 +43,20 @@ Set the contract id on the backend:
 ```bash
 export KITEWELL_CONTRACT_ID=C...
 ```
+
+## Register from the Lab tab
+
+After deploy, the frontend Lab tab reads `lab_name()`, `builder_count()`, and
+`get_builder(viewer)` via Soroban RPC, and lets Freighter sign a
+`register(caller, name)` invoke:
+
+1. Start the backend (`npm run dev:backend`) so `/api/network` serves
+   `KITEWELL_CONTRACT_ID`, then open the Lab tab.
+2. Enter a builder name (≤ 64 chars) and hit **Sign & register**. Freighter
+   pops up to sign the assembled Soroban transaction.
+3. The UI polls for on-chain confirmation, then refreshes `builder_count` and
+   shows your nickname from `get_builder`, with an explorer link for the tx.
+
+Reads and registration use the public Testnet RPC
+(`https://soroban-testnet.stellar.org`, env-overridable via
+`SOROBAN_RPC_URL` on both backend and frontend).
