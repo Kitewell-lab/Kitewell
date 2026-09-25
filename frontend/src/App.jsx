@@ -157,6 +157,28 @@ export default function App() {
     }
   };
 
+  const handleRemoveTrust = async (asset) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (parseFloat(asset.balance) > 0) {
+      return showToast(
+        `${asset.code} still holds a balance. Move it to 0 before removing the trustline.`,
+        "error"
+      );
+    }
+
+    setLoading(`remove-${asset.key}`);
+    try {
+      await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
+      const next = await getAccountBalances(publicKey);
+      setBalances(next);
+      showToast(`${asset.code} trustline removed.`);
+    } catch (err) {
+      showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const handleSend = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -495,8 +517,8 @@ export default function App() {
             <div className="section">
               <h2>Balances & trustlines</h2>
               <p className="muted">
-                View holdings and open a trustline with Freighter{" "}
-                <code>signTransaction</code>.
+                View holdings, open a trustline, or remove an empty one with Freighter{" "}
+                <code>signTransaction</code>. Removing sets the limit to 0.
               </p>
 
               {balances.length > 0 ? (
@@ -511,11 +533,30 @@ export default function App() {
                           </span>
                         )}
                       </div>
-                      <span>
-                        {parseFloat(b.balance).toLocaleString(undefined, {
-                          maximumFractionDigits: 7,
-                        })}
-                      </span>
+                      <div className="balance-row__actions">
+                        <span>
+                          {parseFloat(b.balance).toLocaleString(undefined, {
+                            maximumFractionDigits: 7,
+                          })}
+                        </span>
+                        {!b.isNative && (
+                          <button
+                            className="btn btn--secondary btn--sm"
+                            type="button"
+                            onClick={() => handleRemoveTrust(b)}
+                            disabled={loading === `remove-${b.key}`}
+                            title={
+                              parseFloat(b.balance) > 0
+                                ? "Balance must be 0 before removing this trustline"
+                                : `Remove the ${b.code} trustline`
+                            }
+                          >
+                            {loading === `remove-${b.key}`
+                              ? "Removing…"
+                              : "Remove"}
+                          </button>
+                        )}
+                      </div>
                     </li>
                   ))}
                 </ul>

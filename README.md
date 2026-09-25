@@ -81,7 +81,7 @@ Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explo
 
 - Freighter connect / disconnect (`setAllowed`, `getAddress`, `signTransaction`)
 - Friendbot funding
-- Balances + `changeTrust`
+- Balances + `changeTrust` (open a trustline or remove an empty one)
 - Native XLM payments + history
 - Backend-backed account/payment reads (Horizon fallback)
 - Lab panel for API + contract status
