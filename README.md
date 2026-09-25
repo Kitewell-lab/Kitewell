@@ -63,7 +63,8 @@ Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explo
 ## Features
 
 - Freighter connect / disconnect (`setAllowed`, `getAddress`, `signTransaction`)
-- Friendbot funding
+- Friendbot funding (Testnet only)
+- Testnet / Futurenet network toggle (persisted in `localStorage`)
 - Balances + `changeTrust`
 - Native XLM payments + history
 - Backend-backed account/payment reads (Horizon fallback)
@@ -91,4 +92,12 @@ MIT — [LICENSE](./LICENSE).
 
 ## Network
 
-Testnet only by default. No Mainnet funds.
+The header selector switches between **Testnet** (default) and **Futurenet**; the choice is
+persisted in `localStorage`. The Horizon URL, network passphrase, explorer base and Friendbot URL
+all live in `frontend/src/network.js`, so a switch updates transaction signing and submission in
+one place.
+
+- Friendbot is Testnet-only and is disabled on Futurenet.
+- The Kitewell backend is configured for Testnet, so account/payment reads go straight to Horizon
+  when another network is selected.
+- No Mainnet funds are ever used.

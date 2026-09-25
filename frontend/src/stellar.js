@@ -1,23 +1,37 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { fetchAccountViaApi, fetchPaymentsViaApi } from "./api";
+import {
+  getActiveNetwork,
+  getActiveNetworkId,
+  isFriendbotAvailable,
+} from "./network";
 
-export const HORIZON_URL = "https://horizon-testnet.stellar.org";
-export const NETWORK = "TESTNET";
-export const EXPLORER_BASE = "https://stellar.expert/explorer/testnet";
+function getServer() {
+  return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
+}
 
-const server = new StellarSdk.Horizon.Server(HORIZON_URL);
+/** The Kitewell backend is configured for Testnet, so skip it elsewhere. */
+function backendIsUsable() {
+  return getActiveNetworkId() === "TESTNET";
+}
 
 export function explorerAccountUrl(publicKey) {
-  return `${EXPLORER_BASE}/account/${publicKey}`;
+  return `${getActiveNetwork().explorerBase}/account/${publicKey}`;
 }
 
 export function explorerTxUrl(hash) {
-  return `${EXPLORER_BASE}/tx/${hash}`;
+  return `${getActiveNetwork().explorerBase}/tx/${hash}`;
 }
 
 export async function fundWithFriendbot(publicKey) {
+  if (!isFriendbotAvailable()) {
+    throw new Error(
+      `Friendbot is only available on Testnet, not ${getActiveNetwork().label}.`
+    );
+  }
+
   const response = await fetch(
-    `https://friendbot.stellar.org?addr=${encodeURIComponent(publicKey)}`
+    `${getActiveNetwork().friendbotUrl}?addr=${encodeURIComponent(publicKey)}`
   );
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -53,31 +67,39 @@ function mapHorizonBalances(account) {
   });
 }
 
-/** Prefer Kitewell backend; fall back to direct Horizon. */
+/** Prefer the Kitewell backend on Testnet; otherwise read Horizon directly. */
 export async function getAccountBalances(publicKey) {
-  try {
-    const data = await fetchAccountViaApi(publicKey);
-    return data.balances;
-  } catch {
-    const account = await server.loadAccount(publicKey);
-    return mapHorizonBalances(account);
+  if (backendIsUsable()) {
+    try {
+      const data = await fetchAccountViaApi(publicKey);
+      return data.balances;
+    } catch {
+      /* fall back to direct Horizon */
+    }
   }
+
+  const account = await getServer().loadAccount(publicKey);
+  return mapHorizonBalances(account);
 }
 
 export async function getAccountDetails(publicKey) {
-  try {
-    return await fetchAccountViaApi(publicKey);
-  } catch {
-    const account = await server.loadAccount(publicKey);
-    return {
-      id: account.id,
-      sequence: account.sequenceNumber(),
-      subentryCount: account.subentry_count,
-      thresholds: account.thresholds,
-      balances: mapHorizonBalances(account),
-      explorerUrl: explorerAccountUrl(publicKey),
-    };
+  if (backendIsUsable()) {
+    try {
+      return await fetchAccountViaApi(publicKey);
+    } catch {
+      /* fall back to direct Horizon */
+    }
   }
+
+  const account = await getServer().loadAccount(publicKey);
+  return {
+    id: account.id,
+    sequence: account.sequenceNumber(),
+    subentryCount: account.subentry_count,
+    thresholds: account.thresholds,
+    balances: mapHorizonBalances(account),
+    explorerUrl: explorerAccountUrl(publicKey),
+  };
 }
 
 export async function getBalance(publicKey) {
@@ -87,27 +109,31 @@ export async function getBalance(publicKey) {
 }
 
 export async function getTransactions(publicKey, limit = 15) {
-  try {
-    return await fetchPaymentsViaApi(publicKey, limit);
-  } catch {
-    const payments = await server
-      .payments()
-      .forAccount(publicKey)
-      .limit(limit)
-      .order("desc")
-      .call();
-
-    return payments.records
-      .filter((p) => p.type === "payment")
-      .map((p) => ({
-        id: p.id,
-        from: p.from,
-        to: p.to,
-        amount: p.amount,
-        asset_type: p.asset_type,
-        asset_code: p.asset_code || "XLM",
-        transaction_hash: p.transaction_hash,
-        created_at: p.created_at,
-      }));
+  if (backendIsUsable()) {
+    try {
+      return await fetchPaymentsViaApi(publicKey, limit);
+    } catch {
+      /* fall back to direct Horizon */
+    }
   }
+
+  const payments = await getServer()
+    .payments()
+    .forAccount(publicKey)
+    .limit(limit)
+    .order("desc")
+    .call();
+
+  return payments.records
+    .filter((p) => p.type === "payment")
+    .map((p) => ({
+      id: p.id,
+      from: p.from,
+      to: p.to,
+      amount: p.amount,
+      asset_type: p.asset_type,
+      asset_code: p.asset_code || "XLM",
+      transaction_hash: p.transaction_hash,
+      created_at: p.created_at,
+    }));
 }

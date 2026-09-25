@@ -5,10 +5,16 @@ import {
   signTransaction,
 } from "@stellar/freighter-api";
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { HORIZON_URL } from "./stellar";
+import { getActiveNetwork } from "./network";
 
-const server = new StellarSdk.Horizon.Server(HORIZON_URL);
-const NETWORK_PASSPHRASE = StellarSdk.Networks.TESTNET;
+function getServer() {
+  return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
+}
+
+function currentPassphrase() {
+  return getActiveNetwork().passphrase;
+}
+
 const MAX_MEMO_TEXT_BYTES = 28;
 const MAX_U64 = 18446744073709551615n;
 
@@ -68,9 +74,10 @@ export async function connectFreighterWallet() {
 }
 
 async function signAndSubmit(transaction, publicKey) {
+  const passphrase = currentPassphrase();
   const unsignedXdr = transaction.toXDR();
   const signResult = await signTransaction(unsignedXdr, {
-    networkPassphrase: NETWORK_PASSPHRASE,
+    networkPassphrase: passphrase,
     address: publicKey,
   });
 
@@ -82,10 +89,10 @@ async function signAndSubmit(transaction, publicKey) {
 
   const signedTx = StellarSdk.TransactionBuilder.fromXDR(
     signResult.signedTxXdr,
-    NETWORK_PASSPHRASE
+    passphrase
   );
 
-  return server.submitTransaction(signedTx);
+  return getServer().submitTransaction(signedTx);
 }
 
 export async function sendPaymentWithFreighter(
@@ -100,10 +107,10 @@ export async function sendPaymentWithFreighter(
   }
 
   const transactionMemo = createMemo(memoType, memo);
-  const sourceAccount = await server.loadAccount(publicKey);
+  const sourceAccount = await getServer().loadAccount(publicKey);
   const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
+    networkPassphrase: currentPassphrase(),
   }).addOperation(
     StellarSdk.Operation.payment({
       destination,
@@ -138,10 +145,10 @@ export async function changeTrustWithFreighter(
   }
 
   const asset = new StellarSdk.Asset(assetCode.toUpperCase(), assetIssuer);
-  const sourceAccount = await server.loadAccount(publicKey);
+  const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
+    networkPassphrase: currentPassphrase(),
   })
     .addOperation(
       StellarSdk.Operation.changeTrust({

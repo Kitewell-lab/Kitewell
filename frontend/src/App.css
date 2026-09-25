@@ -159,6 +159,15 @@ body {
   padding: 5px 12px;
 }
 
+.network {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+.network .eyebrow {
+  margin-bottom: 2px;
+}
+
 .main {
   display: flex;
   flex-direction: column;
@@ -341,6 +350,15 @@ body {
 }
 .input::placeholder {
   color: #5c6578;
+}
+.input--compact {
+  width: auto;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--sun);
+  background: rgba(245, 197, 66, 0.08);
+  border-color: var(--line-strong);
 }
 
 .btn {

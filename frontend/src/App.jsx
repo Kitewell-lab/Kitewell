@@ -14,6 +14,12 @@ import {
   explorerTxUrl,
 } from "./stellar";
 import { fetchHealth, fetchNetworkInfo } from "./api";
+import {
+  NETWORKS,
+  getActiveNetworkId,
+  isFriendbotAvailable,
+  setActiveNetwork,
+} from "./network";
 import "./App.css";
 
 const TABS = ["Wallet", "Fund", "Assets", "Send", "History", "Lab"];
@@ -38,6 +44,7 @@ const MEMO_FIELDS = {
 export default function App() {
   const [activeTab, setActiveTab] = useState("Wallet");
   const [publicKey, setPublicKey] = useState(null);
+  const [networkId, setNetworkId] = useState(getActiveNetworkId());
   const [freighterInstalled, setFreighterInstalled] = useState(null);
   const [balances, setBalances] = useState([]);
   const [transactions, setTransactions] = useState([]);
@@ -62,6 +69,8 @@ export default function App() {
 
   const xlmBalance = balances.find((b) => b.isNative)?.balance ?? null;
   const memoField = MEMO_FIELDS[sendForm.memoType];
+  const activeNetwork = NETWORKS[networkId];
+  const friendbotAvailable = isFriendbotAvailable();
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -114,6 +123,20 @@ export default function App() {
     setTransactions([]);
     setAccountDetails(null);
     showToast("Disconnected.");
+  };
+
+  const handleNetworkChange = (id) => {
+    try {
+      const next = setActiveNetwork(id);
+      setNetworkId(id);
+      setBalances([]);
+      setTransactions([]);
+      setAccountDetails(null);
+      showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
+      if (publicKey) refreshBalances();
+    } catch (e) {
+      showToast(e.message || "Could not switch network.", "error");
+    }
   };
 
   const handleFund = async () => {
@@ -263,10 +286,25 @@ export default function App() {
           <KitewellMark />
           <div className="header__titles">
             <span className="header__name">Kitewell</span>
-            <span className="header__tag">Stellar Testnet lab</span>
+            <span className="header__tag">Stellar {activeNetwork.label} lab</span>
           </div>
         </div>
-        <span className="badge">Testnet</span>
+        <label className="network" htmlFor="network-select">
+          <span className="eyebrow">Network</span>
+          <select
+            id="network-select"
+            className="input input--compact"
+            value={networkId}
+            onChange={(e) => handleNetworkChange(e.target.value)}
+            aria-label="Stellar network"
+          >
+            {Object.values(NETWORKS).map((network) => (
+              <option key={network.id} value={network.id}>
+                {network.label}
+              </option>
+            ))}
+          </select>
+        </label>
       </header>
 
       <main className="main">
@@ -466,8 +504,17 @@ export default function App() {
             <div className="section">
               <h2>Fund with Friendbot</h2>
               <p className="muted">
-                Activate the account on Testnet and receive free XLM. Mainnet is never used.
+                Activate the account and receive free test XLM. Only available on Testnet.
               </p>
+              {!friendbotAvailable && (
+                <div className="info-box info-box--warning">
+                  <span className="eyebrow">Friendbot unavailable</span>
+                  <p className="muted">
+                    Friendbot is disabled on {activeNetwork.label}. Switch to Testnet to fund an
+                    account here, or fund it through a {activeNetwork.label} faucet.
+                  </p>
+                </div>
+              )}
               {publicKey && (
                 <div className="info-box">
                   <span className="eyebrow">Funding address</span>
@@ -478,7 +525,7 @@ export default function App() {
                 className="btn btn--primary"
                 type="button"
                 onClick={handleFund}
-                disabled={loading === "fund" || requireWallet}
+                disabled={loading === "fund" || requireWallet || !friendbotAvailable}
               >
                 {loading === "fund" ? (
                   <>
@@ -763,7 +810,7 @@ export default function App() {
       </main>
 
       <footer className="footer">
-        <strong>Kitewell</strong> · Stellar Testnet · Freighter ·{" "}
+        <strong>Kitewell</strong> · Stellar {activeNetwork.label} · Freighter ·{" "}
         <a
           href="https://github.com/Kitewell-lab/Kitewell"
           target="_blank"
