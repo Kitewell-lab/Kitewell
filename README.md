@@ -38,6 +38,23 @@ npm run dev:frontend
 
 Freighter must be on **Testnet**.
 
+## Backend configuration
+
+The backend (`backend/`) is configured entirely through environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8787` | HTTP port the API listens on |
+| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Horizon API base URL |
+| `NETWORK` | `TESTNET` | Network label reported by `/health` and `/api/network` |
+| `FRIENDBOT_URL` | `https://friendbot.stellar.org` | Friendbot funding endpoint |
+| `EXPLORER_BASE` | `https://stellar.expert/explorer/testnet` | Block explorer base for deep links |
+| `KITEWELL_CONTRACT_ID` | _(unset)_ | Soroban contract ID once `contracts/kitewell` is deployed |
+| `RATE_LIMIT_WINDOW_MS` | `60000` | Fixed-window duration for the per-IP rate limiter on `/api/*` |
+| `RATE_LIMIT_MAX` | `60` | Max requests per IP per window; excess requests get `429` with a `Retry-After` header |
+
+Rate limiting is per-IP and in-memory (no external store); responses include `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` headers. Every request emits one structured JSON log line with `method`, `path`, `status`, and `ms`.
+
 ## Demo
 
 The frontend is deployed at https://kitewell.vercel.app or https://kitewell.github.io/kitewell/
@@ -64,10 +81,11 @@ Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explo
 
 - Freighter connect / disconnect (`setAllowed`, `getAddress`, `signTransaction`)
 - Friendbot funding
-- Balances + `changeTrust`
+- Balances + `changeTrust` (open a trustline or remove an empty one)
 - XLM + credit-asset payments (asset picked from balances) + history
 - Backend-backed account/payment reads (Horizon fallback)
 - Lab panel for API + contract status
+- Lab tab Soroban registry: Freighter-signed `register(caller, name)` check-in + `lab_name` / `builder_count` / `get_builder` reads
 
 Send supports optional text memos up to 28 UTF-8 bytes, uint64 ID memos, and 32-byte hash memos.
 
