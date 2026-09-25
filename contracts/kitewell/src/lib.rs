@@ -116,4 +116,15 @@ mod test {
         assert_eq!(client.get_builder(&a), None);
         assert_eq!(client.builder_count(), 0);
     }
+
+    #[test]
+    fn get_builder_never_registered_is_none() {
+        let env = Env::default();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let stranger = Address::generate(&env);
+
+        // Lookup is a pure read: no auth and nothing written for an unknown addr.
+        assert_eq!(client.get_builder(&stranger), None);
+    }
 }
