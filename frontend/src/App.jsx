@@ -5,6 +5,8 @@ import {
   sendPaymentWithFreighter,
   pathPaymentWithFreighter,
   changeTrustWithFreighter,
+  readKitewellState,
+  registerBuilderWithFreighter,
 } from "./freighter";
 import {
   fundWithFriendbot,
@@ -59,6 +61,7 @@ export default function App() {
   const [sendForm, setSendForm] = useState({
     destination: "",
     amount: "",
+    assetKey: "native",
     memoType: "text",
     memo: "",
   });
@@ -79,6 +82,10 @@ export default function App() {
   const [pathResult, setPathResult] = useState(null);
   const [labInfo, setLabInfo] = useState(null);
   const [labError, setLabError] = useState(null);
+  const [labState, setLabState] = useState(null);
+  const [labStateError, setLabStateError] = useState(null);
+  const [registerForm, setRegisterForm] = useState({ name: "" });
+  const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
@@ -91,6 +98,7 @@ export default function App() {
   const memoField = MEMO_FIELDS[sendForm.memoType];
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
   const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
+  const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -186,6 +194,28 @@ export default function App() {
     }
   };
 
+  const handleRemoveTrust = async (asset) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (parseFloat(asset.balance) > 0) {
+      return showToast(
+        `${asset.code} still holds a balance. Move it to 0 before removing the trustline.`,
+        "error"
+      );
+    }
+
+    setLoading(`remove-${asset.key}`);
+    try {
+      await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
+      const next = await getAccountBalances(publicKey);
+      setBalances(next);
+      showToast(`${asset.code} trustline removed.`);
+    } catch (err) {
+      showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const handleSend = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -198,18 +228,41 @@ export default function App() {
     ) {
       return showToast("Text memos must be 28 UTF-8 bytes or fewer.", "error");
     }
+
+    const selected = balances.find((b) => b.key === sendForm.assetKey);
+    if (!selected) {
+      return showToast("Choose an asset you hold a trustline for.", "error");
+    }
+    if (parseFloat(sendForm.amount) > parseFloat(selected.balance)) {
+      return showToast(
+        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
+        "error"
+      );
+    }
+
+    const asset = selected.isNative
+      ? { isNative: true }
+      : { isNative: false, code: selected.code, issuer: selected.issuer };
+
     setLoading("send");
     try {
       const result = await sendPaymentWithFreighter(
         publicKey,
         sendForm.destination,
         sendForm.amount,
+        asset,
         sendForm.memoType,
         sendForm.memo
       );
       const next = await getAccountBalances(publicKey);
       setBalances(next);
-      setSendForm({ destination: "", amount: "", memoType: "text", memo: "" });
+      setSendForm({
+        destination: "",
+        amount: "",
+        assetKey: "native",
+        memoType: "text",
+        memo: "",
+      });
       showToast(`Payment submitted · ${result.hash.slice(0, 12)}…`);
     } catch (err) {
       showToast(err.message || "Payment failed.", "error");
@@ -305,11 +358,75 @@ export default function App() {
     }
   };
 
+  const refreshLabState = useCallback(async () => {
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      setLabState(null);
+      setLabStateError(null);
+      return;
+    }
+    setLoading("labstate");
+    setLabStateError(null);
+    try {
+      const state = await readKitewellState(contractId, publicKey);
+      setLabState(state);
+    } catch (e) {
+      setLabState(null);
+      setLabStateError(
+        e.message || "Could not read the kitewell contract via Soroban RPC."
+      );
+    } finally {
+      setLoading("");
+    }
+  }, [labInfo, publicKey]);
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+    if (!registerForm.name.trim()) {
+      return showToast("Enter a builder name to register.", "error");
+    }
+    setLoading("register");
+    try {
+      const result = await registerBuilderWithFreighter(
+        publicKey,
+        contractId,
+        registerForm.name
+      );
+      setLastRegisterTx(result);
+      setRegisterForm({ name: "" });
+      showToast(
+        result.confirmed
+          ? `Registered on-chain · ${result.hash.slice(0, 12)}…`
+          : `Submitted · ${result.hash.slice(0, 12)}…`,
+        "success"
+      );
+      const state = await readKitewellState(contractId, publicKey);
+      setLabState(state);
+    } catch (err) {
+      showToast(err.message || "Contract invoke failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const activateTab = (tab) => {
     setActiveTab(tab);
     if (tab === "History") handleHistory();
-    if (tab === "Lab") loadLabInfo();
-    if ((tab === "Wallet" || tab === "Assets") && publicKey) refreshBalances();
+    if (tab === "Lab") {
+      loadLabInfo();
+      refreshLabState();
+    }
+    if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
+      refreshBalances();
+    }
   };
 
   const handleTabKeyDown = (event, index) => {
@@ -578,8 +695,8 @@ export default function App() {
             <div className="section">
               <h2>Balances & trustlines</h2>
               <p className="muted">
-                View holdings and open a trustline with Freighter{" "}
-                <code>signTransaction</code>.
+                View holdings, open a trustline, or remove an empty one with Freighter{" "}
+                <code>signTransaction</code>. Removing sets the limit to 0.
               </p>
 
               {balances.length > 0 ? (
@@ -594,11 +711,30 @@ export default function App() {
                           </span>
                         )}
                       </div>
-                      <span>
-                        {parseFloat(b.balance).toLocaleString(undefined, {
-                          maximumFractionDigits: 7,
-                        })}
-                      </span>
+                      <div className="balance-row__actions">
+                        <span>
+                          {parseFloat(b.balance).toLocaleString(undefined, {
+                            maximumFractionDigits: 7,
+                          })}
+                        </span>
+                        {!b.isNative && (
+                          <button
+                            className="btn btn--secondary btn--sm"
+                            type="button"
+                            onClick={() => handleRemoveTrust(b)}
+                            disabled={loading === `remove-${b.key}`}
+                            title={
+                              parseFloat(b.balance) > 0
+                                ? "Balance must be 0 before removing this trustline"
+                                : `Remove the ${b.code} trustline`
+                            }
+                          >
+                            {loading === `remove-${b.key}`
+                              ? "Removing…"
+                              : "Remove"}
+                          </button>
+                        )}
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -657,9 +793,10 @@ export default function App() {
 
           {activeTab === "Send" && (
             <div className="section">
-              <h2>Send XLM</h2>
+              <h2>Send payment</h2>
               <p className="muted">
-                Builds a payment op, signs in Freighter, then submits to Horizon Testnet.
+                Builds a payment op for XLM or a credit asset you hold, signs in Freighter, then
+                submits to Horizon Testnet.
               </p>
               <form onSubmit={handleSend} className="form">
                 <label className="label">Destination</label>
@@ -671,7 +808,27 @@ export default function App() {
                   onChange={(e) => setSendForm({ ...sendForm, destination: e.target.value })}
                   required
                 />
-                <label className="label">Amount (XLM)</label>
+                <label className="label">Asset</label>
+                <select
+                  className="input"
+                  value={sendForm.assetKey}
+                  onChange={(e) => setSendForm({ ...sendForm, assetKey: e.target.value })}
+                >
+                  <option value="native">XLM (native)</option>
+                  {balances
+                    .filter((b) => !b.isNative)
+                    .map((b) => (
+                      <option key={b.key} value={b.key}>
+                        {b.code} ·{" "}
+                        {parseFloat(b.balance).toLocaleString(undefined, {
+                          maximumFractionDigits: 4,
+                        })}
+                      </option>
+                    ))}
+                </select>
+                <label className="label">
+                  Amount ({selectedSendAsset?.code ?? "XLM"})
+                </label>
                 <input
                   className="input"
                   type="number"
@@ -961,6 +1118,97 @@ export default function App() {
                       Status: {labInfo.network.contract?.status}
                     </p>
                   </div>
+                  <div className="section__row">
+                    <div className="subhead">On-chain registry</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={refreshLabState}
+                      disabled={loading === "labstate"}
+                    >
+                      {loading === "labstate" ? (
+                        <>
+                          <Spinner /> Reading…
+                        </>
+                      ) : (
+                        "Refresh"
+                      )}
+                    </button>
+                  </div>
+                  {labState ? (
+                    <div className="info-box">
+                      <span className="eyebrow">Contract state</span>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">lab_name</span>
+                          <span className="metadata-value">{labState.labName ?? "—"}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">builder_count</span>
+                          <span className="metadata-value">{labState.builderCount ?? 0}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">get_builder (you)</span>
+                          <span className="metadata-value">
+                            {publicKey ? labState.builder ?? "Not registered" : "Connect to check"}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="muted">
+                      Reads lab_name, builder_count, and get_builder via Soroban RPC.
+                    </p>
+                  )}
+                  {labStateError && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Soroban RPC</span>
+                      <p className="muted">{labStateError}</p>
+                    </div>
+                  )}
+                  <form className="form" onSubmit={handleRegister}>
+                    <label className="label" htmlFor="builder-name">
+                      Builder name
+                    </label>
+                    <input
+                      id="builder-name"
+                      className="input"
+                      maxLength={64}
+                      placeholder="e.g. stellar-alice"
+                      value={registerForm.name}
+                      onChange={(e) =>
+                        setRegisterForm({ ...registerForm, name: e.target.value })
+                      }
+                    />
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "register" || requireWallet}
+                    >
+                      {loading === "register" ? (
+                        <>
+                          <Spinner /> Signing in Freighter…
+                        </>
+                      ) : (
+                        "Sign & register"
+                      )}
+                    </button>
+                    {!publicKey && <p className="muted">Connect Freighter to sign.</p>}
+                  </form>
+                  {lastRegisterTx && (
+                    <div className="info-box">
+                      <span className="eyebrow">Register tx</span>
+                      <code>{lastRegisterTx.hash}</code>
+                      <a
+                        href={explorerTxUrl(lastRegisterTx.hash)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-link"
+                      >
+                        Explorer ↗
+                      </a>
+                    </div>
+                  )}
                 </>
               )}
               {!labInfo && !labError && (
