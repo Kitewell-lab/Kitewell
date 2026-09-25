@@ -6,6 +6,7 @@ import {
 } from "@stellar/freighter-api";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
+import { buildAsset, parsePathAssets } from "./stellar";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -17,6 +18,152 @@ function currentPassphrase() {
 
 const MAX_MEMO_TEXT_BYTES = 28;
 const MAX_U64 = 18446744073709551615n;
+
+/** Public Stellar RPC endpoint for Soroban reads + invokes (Testnet). */
+export const SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
+const sorobanRpc = new StellarSdk.rpc.Server(SOROBAN_RPC_URL);
+
+/** Read-only invokes need a funded-looking source; the zero address works. */
+const ZERO_ADDRESS =
+  "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+const POLL_ATTEMPTS = 15;
+const POLL_INTERVAL_MS = 2000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function scOptionToNative(scVal) {
+  if (!scVal) return null;
+  const native = StellarSdk.scValToNative(scVal);
+  // Option<T> arrives as an empty vec (None) or a one-element vec (Some).
+  return Array.isArray(native) ? (native.length > 0 ? native[0] : null) : native;
+}
+
+function buildContractTx(contract, method, args, sourceAccount, timeout = 60) {
+  return new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(timeout)
+    .build();
+}
+
+/**
+ * Read-only lookups against the Kitewell registry via Soroban RPC.
+ * Calls lab_name(), builder_count(), and get_builder(viewer).
+ *
+ * @returns {{ labName: string, builderCount: number, builder: string|null }}
+ */
+export async function readKitewellState(contractId, viewerAddress) {
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const viewer = viewerAddress || ZERO_ADDRESS;
+  const source = new StellarSdk.Account(ZERO_ADDRESS, "0");
+
+  const simulate = async (method, ...args) => {
+    const tx = buildContractTx(contract, method, args, source, 30);
+    const sim = await sorobanRpc.simulateTransaction(tx);
+    if (sim.error) {
+      throw new Error(`${method}() simulation failed: ${sim.error}`);
+    }
+    return sim.result?.retval ?? null;
+  };
+
+  const [labName, builderCount, builder] = await Promise.all([
+    simulate("lab_name").then((v) => (v ? StellarSdk.scValToNative(v) : null)),
+    simulate("builder_count").then((v) =>
+      v ? StellarSdk.scValToNative(v) : 0
+    ),
+    simulate("get_builder", StellarSdk.nativeToScVal(viewer, { type: "address" })).then(
+      scOptionToNative
+    ),
+  ]);
+
+  return { labName, builderCount, builder };
+}
+
+/**
+ * Check in a builder: builds + simulates a Soroban `register(caller, name)`
+ * invoke, lets Freighter sign it, then submits via Soroban RPC and waits for
+ * on-chain confirmation.
+ *
+ * @returns {{ hash: string, returnValue: unknown, confirmed: boolean }}
+ */
+export async function registerBuilderWithFreighter(
+  publicKey,
+  contractId,
+  name
+) {
+  const trimmed = (name || "").trim();
+  if (!trimmed) {
+    throw new Error("Enter a builder name to register.");
+  }
+  if ([...trimmed].length > 64) {
+    throw new Error("Builder name must be 64 characters or fewer.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = buildContractTx(
+    contract,
+    "register",
+    [
+      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
+      StellarSdk.nativeToScVal(trimmed, { type: "string" }),
+    ],
+    sourceAccount
+  );
+
+  // Simulation fills in auth entries + resource fees for the invoke.
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `Contract invoke rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  // RPC submission is asynchronous: poll getTransaction until applied.
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return {
+        hash: sendResult.hash,
+        returnValue: status.returnValue
+          ? StellarSdk.scValToNative(status.returnValue)
+          : null,
+        confirmed: true,
+      };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(
+        `Contract invoke failed on-chain. Tx hash: ${sendResult.hash}`
+      );
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  // Still pending after the polling window; the tx may land shortly.
+  return { hash: sendResult.hash, returnValue: null, confirmed: false };
+}
 
 function createMemo(memoType, value) {
   if (!value) return null;
@@ -73,9 +220,9 @@ export async function connectFreighterWallet() {
   return addressResult.address;
 }
 
-async function signAndSubmit(transaction, publicKey) {
+/** Ask Freighter to sign raw XDR and return the parsed signed transaction. */
+async function signWithFreighter(unsignedXdr, publicKey) {
   const passphrase = currentPassphrase();
-  const unsignedXdr = transaction.toXDR();
   const signResult = await signTransaction(unsignedXdr, {
     networkPassphrase: passphrase,
     address: publicKey,
@@ -87,18 +234,64 @@ async function signAndSubmit(transaction, publicKey) {
     );
   }
 
-  const signedTx = StellarSdk.TransactionBuilder.fromXDR(
+  return StellarSdk.TransactionBuilder.fromXDR(
     signResult.signedTxXdr,
     passphrase
   );
+}
 
+async function signAndSubmit(transaction, publicKey) {
+  const signedTx = await signWithFreighter(transaction.toXDR(), publicKey);
   return getServer().submitTransaction(signedTx);
 }
 
+/**
+ * Validate a Stellar amount string (positive, max 7 decimal places) without
+ * going through floating point, so values like 0.0000001 stay intact.
+ */
+export function normalizeAmount(value, label = "Amount") {
+  const text = String(value ?? "").trim();
+  if (!/^\d+(\.\d{1,7})?$/.test(text)) {
+    throw new Error(`${label} must be a positive number with up to 7 decimals.`);
+  }
+
+  const [whole, fraction = ""] = text.split(".");
+  if (!/[1-9]/.test(whole) && !/[1-9]/.test(fraction)) {
+    throw new Error(`${label} must be greater than zero.`);
+  }
+
+  return text;
+}
+
+/**
+ * Resolve a UI payment asset descriptor into an SDK Asset.
+ * `null` / `{ isNative: true }` is native XLM; a credit asset is
+ * `{ isNative: false, code, issuer }`.
+ */
+export function resolvePaymentAsset(asset) {
+  if (!asset || asset.isNative) return StellarSdk.Asset.native();
+
+  const code = (asset.code || "").trim().toUpperCase();
+  if (!code || code.length > 12) {
+    throw new Error("Asset code must be 1–12 characters.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(asset.issuer)) {
+    throw new Error("Asset issuer must be a valid Stellar public key (G…).");
+  }
+
+  return new StellarSdk.Asset(code, asset.issuer);
+}
+
+/**
+ * Build a payment op, sign it with Freighter, and submit it to Horizon.
+ * `asset` accepts a UI descriptor (`{ isNative: true }` or
+ * `{ isNative: false, code, issuer }`); omit it to send native XLM.
+ */
 export async function sendPaymentWithFreighter(
   publicKey,
   destination,
   amount,
+  asset = null,
   memoType = "text",
   memo = ""
 ) {
@@ -114,7 +307,7 @@ export async function sendPaymentWithFreighter(
   }).addOperation(
     StellarSdk.Operation.payment({
       destination,
-      asset: StellarSdk.Asset.native(),
+      asset: resolvePaymentAsset(asset),
       amount: amount.toString(),
     })
   );
@@ -124,6 +317,80 @@ export async function sendPaymentWithFreighter(
   }
 
   const transaction = txBuilder.setTimeout(180).build();
+  return signAndSubmit(transaction, publicKey);
+}
+
+/**
+ * Build a path payment (strict send or strict receive), sign it with Freighter,
+ * and submit it to Horizon Testnet.
+ *
+ * `sendAsset` / `destAsset` are UI descriptors ({ isNative } or
+ * { isNative: false, code, issuer }). `path` is the optional comma-separated
+ * intermediate hop list (e.g. "USDC:G…, XLM").
+ *
+ * Strict send fixes the amount sent (`amount`) and the minimum received
+ * (`destMin`). Strict receive fixes the amount received (`amount`) and the
+ * maximum sent (`sendMax`).
+ */
+export async function pathPaymentWithFreighter({
+  publicKey,
+  destination,
+  mode = "strictSend",
+  sendAsset,
+  destAsset,
+  amount,
+  destMin,
+  sendMax,
+  path = "",
+} = {}) {
+  if (mode !== "strictSend" && mode !== "strictReceive") {
+    throw new Error(`Unsupported path payment mode: ${mode}`);
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
+    throw new Error("Destination must be a valid Stellar public key (G…).");
+  }
+
+  const isStrictReceive = mode === "strictReceive";
+  const sourceAsset = buildAsset(sendAsset);
+  const destinationAsset = buildAsset(destAsset);
+  const intermediatePath = parsePathAssets(path);
+
+  const amountValue = normalizeAmount(
+    amount,
+    isStrictReceive ? "Amount to receive" : "Amount to send"
+  );
+  const boundValue = normalizeAmount(
+    isStrictReceive ? sendMax : destMin,
+    isStrictReceive ? "Maximum to send" : "Minimum received"
+  );
+
+  const operation = isStrictReceive
+    ? StellarSdk.Operation.pathPaymentStrictReceive({
+        sendAsset: sourceAsset,
+        sendMax: boundValue,
+        destination,
+        destAsset: destinationAsset,
+        destAmount: amountValue,
+        path: intermediatePath,
+      })
+    : StellarSdk.Operation.pathPaymentStrictSend({
+        sendAsset: sourceAsset,
+        sendAmount: amountValue,
+        destination,
+        destAsset: destinationAsset,
+        destMin: boundValue,
+        path: intermediatePath,
+      });
+
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(operation)
+    .setTimeout(180)
+    .build();
+
   return signAndSubmit(transaction, publicKey);
 }
 
