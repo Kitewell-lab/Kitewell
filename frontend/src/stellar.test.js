@@ -42,7 +42,9 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
 });
 
 const { fetchAccountViaApi, fetchPaymentsViaApi } = await import("./api");
+const StellarSdk = await import("@stellar/stellar-sdk");
 const {
+  buildAsset,
   explorerAccountUrl,
   explorerTxUrl,
   fundWithFriendbot,
@@ -50,6 +52,7 @@ const {
   getAccountDetails,
   getBalance,
   getTransactions,
+  parsePathAssets,
 } = await import("./stellar");
 
 /** Minimal Horizon account payload: 3.5 XLM + an issued asset. */
@@ -93,6 +96,48 @@ describe("explorer urls", () => {
     expect(explorerTxUrl("hash123")).toBe(
       "https://stellar.expert/explorer/testnet/tx/hash123"
     );
+  });
+});
+
+describe("asset + path helpers", () => {
+  const issuer = StellarSdk.Keypair.random().publicKey();
+
+  it("builds a native XLM asset", () => {
+    expect(buildAsset({ isNative: true }).isNative()).toBe(true);
+  });
+
+  it("builds a credit asset and upper-cases the code", () => {
+    const asset = buildAsset({ isNative: false, code: "usdc", issuer });
+    expect(asset.getCode()).toBe("USDC");
+    expect(asset.getIssuer()).toBe(issuer);
+  });
+
+  it("rejects missing codes, bad issuers, and over-long codes", () => {
+    expect(() => buildAsset({ isNative: false })).toThrow(/code is required/);
+    expect(() =>
+      buildAsset({ isNative: false, code: "USDC", issuer: "not-a-key" })
+    ).toThrow(/valid Stellar public key/);
+    expect(() =>
+      buildAsset({ isNative: false, code: "TOOLONGCODE123", issuer })
+    ).toThrow(/12 characters or fewer/);
+  });
+
+  it("parses an empty path to nothing", () => {
+    expect(parsePathAssets("")).toEqual([]);
+    expect(parsePathAssets("   ")).toEqual([]);
+    expect(parsePathAssets(undefined)).toEqual([]);
+  });
+
+  it("parses native and credit hops", () => {
+    const path = parsePathAssets(`USDC:${issuer}, xlm`);
+    expect(path).toHaveLength(2);
+    expect(path[0].getCode()).toBe("USDC");
+    expect(path[0].getIssuer()).toBe(issuer);
+    expect(path[1].isNative()).toBe(true);
+  });
+
+  it("rejects a credit hop without an issuer", () => {
+    expect(() => parsePathAssets("USDC")).toThrow(/needs an issuer/);
   });
 });
 

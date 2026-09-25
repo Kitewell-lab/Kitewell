@@ -5,7 +5,7 @@ import {
   signTransaction,
 } from "@stellar/freighter-api";
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { HORIZON_URL } from "./stellar";
+import { HORIZON_URL, buildAsset, parsePathAssets } from "./stellar";
 
 const server = new StellarSdk.Horizon.Server(HORIZON_URL);
 const NETWORK_PASSPHRASE = StellarSdk.Networks.TESTNET;
@@ -88,6 +88,24 @@ async function signAndSubmit(transaction, publicKey) {
   return server.submitTransaction(signedTx);
 }
 
+/**
+ * Validate a Stellar amount string (positive, max 7 decimal places) without
+ * going through floating point, so values like 0.0000001 stay intact.
+ */
+export function normalizeAmount(value, label = "Amount") {
+  const text = String(value ?? "").trim();
+  if (!/^\d+(\.\d{1,7})?$/.test(text)) {
+    throw new Error(`${label} must be a positive number with up to 7 decimals.`);
+  }
+
+  const [whole, fraction = ""] = text.split(".");
+  if (!/[1-9]/.test(whole) && !/[1-9]/.test(fraction)) {
+    throw new Error(`${label} must be greater than zero.`);
+  }
+
+  return text;
+}
+
 export async function sendPaymentWithFreighter(
   publicKey,
   destination,
@@ -117,6 +135,80 @@ export async function sendPaymentWithFreighter(
   }
 
   const transaction = txBuilder.setTimeout(180).build();
+  return signAndSubmit(transaction, publicKey);
+}
+
+/**
+ * Build a path payment (strict send or strict receive), sign it with Freighter,
+ * and submit it to Horizon Testnet.
+ *
+ * `sendAsset` / `destAsset` are UI descriptors ({ isNative } or
+ * { isNative: false, code, issuer }). `path` is the optional comma-separated
+ * intermediate hop list (e.g. "USDC:G…, XLM").
+ *
+ * Strict send fixes the amount sent (`amount`) and the minimum received
+ * (`destMin`). Strict receive fixes the amount received (`amount`) and the
+ * maximum sent (`sendMax`).
+ */
+export async function pathPaymentWithFreighter({
+  publicKey,
+  destination,
+  mode = "strictSend",
+  sendAsset,
+  destAsset,
+  amount,
+  destMin,
+  sendMax,
+  path = "",
+} = {}) {
+  if (mode !== "strictSend" && mode !== "strictReceive") {
+    throw new Error(`Unsupported path payment mode: ${mode}`);
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
+    throw new Error("Destination must be a valid Stellar public key (G…).");
+  }
+
+  const isStrictReceive = mode === "strictReceive";
+  const sourceAsset = buildAsset(sendAsset);
+  const destinationAsset = buildAsset(destAsset);
+  const intermediatePath = parsePathAssets(path);
+
+  const amountValue = normalizeAmount(
+    amount,
+    isStrictReceive ? "Amount to receive" : "Amount to send"
+  );
+  const boundValue = normalizeAmount(
+    isStrictReceive ? sendMax : destMin,
+    isStrictReceive ? "Maximum to send" : "Minimum received"
+  );
+
+  const operation = isStrictReceive
+    ? StellarSdk.Operation.pathPaymentStrictReceive({
+        sendAsset: sourceAsset,
+        sendMax: boundValue,
+        destination,
+        destAsset: destinationAsset,
+        destAmount: amountValue,
+        path: intermediatePath,
+      })
+    : StellarSdk.Operation.pathPaymentStrictSend({
+        sendAsset: sourceAsset,
+        sendAmount: amountValue,
+        destination,
+        destAsset: destinationAsset,
+        destMin: boundValue,
+        path: intermediatePath,
+      });
+
+  const sourceAccount = await server.loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(operation)
+    .setTimeout(180)
+    .build();
+
   return signAndSubmit(transaction, publicKey);
 }
 

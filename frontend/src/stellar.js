@@ -15,6 +15,58 @@ export function explorerTxUrl(hash) {
   return `${EXPLORER_BASE}/tx/${hash}`;
 }
 
+export const MAX_ASSET_CODE_LENGTH = 12;
+
+/**
+ * Convert a simple UI asset descriptor into an SDK Asset.
+ * Native XLM is `{ isNative: true }`; a credit asset is
+ * `{ isNative: false, code, issuer }`. Throws a user-facing error when the
+ * descriptor is incomplete so callers can surface it in a toast.
+ */
+export function buildAsset({ isNative, code, issuer } = {}) {
+  if (isNative) return StellarSdk.Asset.native();
+
+  const normalizedCode = (code || "").trim();
+  if (!normalizedCode) {
+    throw new Error("Asset code is required for a credit asset.");
+  }
+  if (normalizedCode.length > MAX_ASSET_CODE_LENGTH) {
+    throw new Error(
+      `Asset code must be ${MAX_ASSET_CODE_LENGTH} characters or fewer.`
+    );
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(issuer)) {
+    throw new Error("Asset issuer must be a valid Stellar public key (G…).");
+  }
+
+  return new StellarSdk.Asset(normalizedCode.toUpperCase(), issuer);
+}
+
+/**
+ * Parse a comma-separated intermediate path (e.g. `USDC:G…, XLM`) into SDK
+ * Assets. An empty string yields an empty path, which lets Horizon route
+ * through the direct order book.
+ */
+export function parsePathAssets(input) {
+  if (!input) return [];
+
+  return input
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      if (/^(xlm|native)$/i.test(entry)) return StellarSdk.Asset.native();
+
+      const [code, issuer] = entry.split(":").map((part) => part.trim());
+      if (!issuer) {
+        throw new Error(
+          `Path asset "${entry}" needs an issuer as CODE:ISSUER, or use XLM.`
+        );
+      }
+      return buildAsset({ isNative: false, code, issuer });
+    });
+}
+
 export async function fundWithFriendbot(publicKey) {
   const response = await fetch(
     `https://friendbot.stellar.org?addr=${encodeURIComponent(publicKey)}`
