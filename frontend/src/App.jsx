@@ -46,6 +46,7 @@ export default function App() {
   const [sendForm, setSendForm] = useState({
     destination: "",
     amount: "",
+    assetKey: "native",
     memoType: "text",
     memo: "",
   });
@@ -62,6 +63,7 @@ export default function App() {
 
   const xlmBalance = balances.find((b) => b.isNative)?.balance ?? null;
   const memoField = MEMO_FIELDS[sendForm.memoType];
+  const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -169,18 +171,41 @@ export default function App() {
     ) {
       return showToast("Text memos must be 28 UTF-8 bytes or fewer.", "error");
     }
+
+    const selected = balances.find((b) => b.key === sendForm.assetKey);
+    if (!selected) {
+      return showToast("Choose an asset you hold a trustline for.", "error");
+    }
+    if (parseFloat(sendForm.amount) > parseFloat(selected.balance)) {
+      return showToast(
+        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
+        "error"
+      );
+    }
+
+    const asset = selected.isNative
+      ? { isNative: true }
+      : { isNative: false, code: selected.code, issuer: selected.issuer };
+
     setLoading("send");
     try {
       const result = await sendPaymentWithFreighter(
         publicKey,
         sendForm.destination,
         sendForm.amount,
+        asset,
         sendForm.memoType,
         sendForm.memo
       );
       const next = await getAccountBalances(publicKey);
       setBalances(next);
-      setSendForm({ destination: "", amount: "", memoType: "text", memo: "" });
+      setSendForm({
+        destination: "",
+        amount: "",
+        assetKey: "native",
+        memoType: "text",
+        memo: "",
+      });
       showToast(`Payment submitted · ${result.hash.slice(0, 12)}…`);
     } catch (err) {
       showToast(err.message || "Payment failed.", "error");
@@ -226,7 +251,9 @@ export default function App() {
     setActiveTab(tab);
     if (tab === "History") handleHistory();
     if (tab === "Lab") loadLabInfo();
-    if ((tab === "Wallet" || tab === "Assets") && publicKey) refreshBalances();
+    if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
+      refreshBalances();
+    }
   };
 
   const handleTabKeyDown = (event, index) => {
@@ -574,9 +601,10 @@ export default function App() {
 
           {activeTab === "Send" && (
             <div className="section">
-              <h2>Send XLM</h2>
+              <h2>Send payment</h2>
               <p className="muted">
-                Builds a payment op, signs in Freighter, then submits to Horizon Testnet.
+                Builds a payment op for XLM or a credit asset you hold, signs in Freighter, then
+                submits to Horizon Testnet.
               </p>
               <form onSubmit={handleSend} className="form">
                 <label className="label">Destination</label>
@@ -588,7 +616,27 @@ export default function App() {
                   onChange={(e) => setSendForm({ ...sendForm, destination: e.target.value })}
                   required
                 />
-                <label className="label">Amount (XLM)</label>
+                <label className="label">Asset</label>
+                <select
+                  className="input"
+                  value={sendForm.assetKey}
+                  onChange={(e) => setSendForm({ ...sendForm, assetKey: e.target.value })}
+                >
+                  <option value="native">XLM (native)</option>
+                  {balances
+                    .filter((b) => !b.isNative)
+                    .map((b) => (
+                      <option key={b.key} value={b.key}>
+                        {b.code} ·{" "}
+                        {parseFloat(b.balance).toLocaleString(undefined, {
+                          maximumFractionDigits: 4,
+                        })}
+                      </option>
+                    ))}
+                </select>
+                <label className="label">
+                  Amount ({selectedSendAsset?.code ?? "XLM"})
+                </label>
                 <input
                   className="input"
                   type="number"

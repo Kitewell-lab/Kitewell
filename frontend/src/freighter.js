@@ -88,10 +88,35 @@ async function signAndSubmit(transaction, publicKey) {
   return server.submitTransaction(signedTx);
 }
 
+/**
+ * Resolve a UI payment asset descriptor into an SDK Asset.
+ * `null` / `{ isNative: true }` is native XLM; a credit asset is
+ * `{ isNative: false, code, issuer }`.
+ */
+export function resolvePaymentAsset(asset) {
+  if (!asset || asset.isNative) return StellarSdk.Asset.native();
+
+  const code = (asset.code || "").trim().toUpperCase();
+  if (!code || code.length > 12) {
+    throw new Error("Asset code must be 1–12 characters.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(asset.issuer)) {
+    throw new Error("Asset issuer must be a valid Stellar public key (G…).");
+  }
+
+  return new StellarSdk.Asset(code, asset.issuer);
+}
+
+/**
+ * Build a payment op, sign it with Freighter, and submit it to Horizon.
+ * `asset` accepts a UI descriptor (`{ isNative: true }` or
+ * `{ isNative: false, code, issuer }`); omit it to send native XLM.
+ */
 export async function sendPaymentWithFreighter(
   publicKey,
   destination,
   amount,
+  asset = null,
   memoType = "text",
   memo = ""
 ) {
@@ -107,7 +132,7 @@ export async function sendPaymentWithFreighter(
   }).addOperation(
     StellarSdk.Operation.payment({
       destination,
-      asset: StellarSdk.Asset.native(),
+      asset: resolvePaymentAsset(asset),
       amount: amount.toString(),
     })
   );
