@@ -127,4 +127,24 @@ mod test {
         // Lookup is a pure read: no auth and nothing written for an unknown addr.
         assert_eq!(client.get_builder(&stranger), None);
     }
+
+    #[test]
+    fn register_twice_keeps_count_and_latest_name() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let a = Address::generate(&env);
+
+        client.register(&a, &String::from_str(&env, "cem"));
+        assert_eq!(client.builder_count(), 1);
+
+        // Re-registering is idempotent for the count and overwrites the nickname.
+        client.register(&a, &String::from_str(&env, "cem-late"));
+        assert_eq!(client.builder_count(), 1);
+        assert_eq!(
+            client.get_builder(&a),
+            Some(String::from_str(&env, "cem-late"))
+        );
+    }
 }
