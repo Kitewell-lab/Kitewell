@@ -4,6 +4,8 @@ import {
   connectFreighterWallet,
   sendPaymentWithFreighter,
   changeTrustWithFreighter,
+  readKitewellState,
+  registerBuilderWithFreighter,
 } from "./freighter";
 import {
   fundWithFriendbot,
@@ -52,6 +54,10 @@ export default function App() {
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
   const [labInfo, setLabInfo] = useState(null);
   const [labError, setLabError] = useState(null);
+  const [labState, setLabState] = useState(null);
+  const [labStateError, setLabStateError] = useState(null);
+  const [registerForm, setRegisterForm] = useState({ name: "" });
+  const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
@@ -244,10 +250,72 @@ export default function App() {
     }
   };
 
+  const refreshLabState = useCallback(async () => {
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      setLabState(null);
+      setLabStateError(null);
+      return;
+    }
+    setLoading("labstate");
+    setLabStateError(null);
+    try {
+      const state = await readKitewellState(contractId, publicKey);
+      setLabState(state);
+    } catch (e) {
+      setLabState(null);
+      setLabStateError(
+        e.message || "Could not read the kitewell contract via Soroban RPC."
+      );
+    } finally {
+      setLoading("");
+    }
+  }, [labInfo, publicKey]);
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+    if (!registerForm.name.trim()) {
+      return showToast("Enter a builder name to register.", "error");
+    }
+    setLoading("register");
+    try {
+      const result = await registerBuilderWithFreighter(
+        publicKey,
+        contractId,
+        registerForm.name
+      );
+      setLastRegisterTx(result);
+      setRegisterForm({ name: "" });
+      showToast(
+        result.confirmed
+          ? `Registered on-chain · ${result.hash.slice(0, 12)}…`
+          : `Submitted · ${result.hash.slice(0, 12)}…`,
+        "success"
+      );
+      const state = await readKitewellState(contractId, publicKey);
+      setLabState(state);
+    } catch (err) {
+      showToast(err.message || "Contract invoke failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const activateTab = (tab) => {
     setActiveTab(tab);
     if (tab === "History") handleHistory();
-    if (tab === "Lab") loadLabInfo();
+    if (tab === "Lab") {
+      loadLabInfo();
+      refreshLabState();
+    }
     if ((tab === "Wallet" || tab === "Assets") && publicKey) refreshBalances();
   };
 
@@ -736,6 +804,97 @@ export default function App() {
                       Status: {labInfo.network.contract?.status}
                     </p>
                   </div>
+                  <div className="section__row">
+                    <div className="subhead">On-chain registry</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={refreshLabState}
+                      disabled={loading === "labstate"}
+                    >
+                      {loading === "labstate" ? (
+                        <>
+                          <Spinner /> Reading…
+                        </>
+                      ) : (
+                        "Refresh"
+                      )}
+                    </button>
+                  </div>
+                  {labState ? (
+                    <div className="info-box">
+                      <span className="eyebrow">Contract state</span>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">lab_name</span>
+                          <span className="metadata-value">{labState.labName ?? "—"}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">builder_count</span>
+                          <span className="metadata-value">{labState.builderCount ?? 0}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">get_builder (you)</span>
+                          <span className="metadata-value">
+                            {publicKey ? labState.builder ?? "Not registered" : "Connect to check"}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="muted">
+                      Reads lab_name, builder_count, and get_builder via Soroban RPC.
+                    </p>
+                  )}
+                  {labStateError && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Soroban RPC</span>
+                      <p className="muted">{labStateError}</p>
+                    </div>
+                  )}
+                  <form className="form" onSubmit={handleRegister}>
+                    <label className="label" htmlFor="builder-name">
+                      Builder name
+                    </label>
+                    <input
+                      id="builder-name"
+                      className="input"
+                      maxLength={64}
+                      placeholder="e.g. stellar-alice"
+                      value={registerForm.name}
+                      onChange={(e) =>
+                        setRegisterForm({ ...registerForm, name: e.target.value })
+                      }
+                    />
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "register" || requireWallet}
+                    >
+                      {loading === "register" ? (
+                        <>
+                          <Spinner /> Signing in Freighter…
+                        </>
+                      ) : (
+                        "Sign & register"
+                      )}
+                    </button>
+                    {!publicKey && <p className="muted">Connect Freighter to sign.</p>}
+                  </form>
+                  {lastRegisterTx && (
+                    <div className="info-box">
+                      <span className="eyebrow">Register tx</span>
+                      <code>{lastRegisterTx.hash}</code>
+                      <a
+                        href={explorerTxUrl(lastRegisterTx.hash)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-link"
+                      >
+                        Explorer ↗
+                      </a>
+                    </div>
+                  )}
                 </>
               )}
               {!labInfo && !labError && (

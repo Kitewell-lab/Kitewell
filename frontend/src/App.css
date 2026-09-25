@@ -459,6 +459,25 @@ body {
   border-radius: 8px;
 }
 
+.metadata-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.metadata-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.metadata-value {
+  font-size: 13px;
+  word-break: break-word;
+}
+
 .tx-list {
   display: flex;
   flex-direction: column;

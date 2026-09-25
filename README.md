@@ -85,6 +85,7 @@ Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explo
 - Native XLM payments + history
 - Backend-backed account/payment reads (Horizon fallback)
 - Lab panel for API + contract status
+- Lab tab Soroban registry: Freighter-signed `register(caller, name)` check-in + `lab_name` / `builder_count` / `get_builder` reads
 
 Send supports optional text memos up to 28 UTF-8 bytes, uint64 ID memos, and 32-byte hash memos.
 

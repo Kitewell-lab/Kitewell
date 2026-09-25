@@ -10,6 +10,8 @@ const FRIENDBOT_URL =
   process.env.FRIENDBOT_URL || "https://friendbot.stellar.org";
 const EXPLORER_BASE =
   process.env.EXPLORER_BASE || "https://stellar.expert/explorer/testnet";
+const SOROBAN_RPC_URL =
+  process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 
 /** Per-IP rate limiting on /api/* (in-memory, no external store) */
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000;
@@ -94,6 +96,7 @@ app.get("/api/network", (_req, res) => {
     horizonUrl: HORIZON_URL,
     friendbotUrl: FRIENDBOT_URL,
     explorerBase: EXPLORER_BASE,
+    sorobanRpcUrl: SOROBAN_RPC_URL,
     passphrase: StellarSdk.Networks.TESTNET,
     contract: {
       kitewell: KITEWELL_CONTRACT_ID,
