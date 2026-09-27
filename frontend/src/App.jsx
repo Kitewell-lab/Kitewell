@@ -25,6 +25,7 @@ import {
   isFriendbotAvailable,
   setActiveNetwork,
 } from "./network";
+import { validateAssetCode } from "./validateAssetCode";
 import "./App.css";
 
 const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
@@ -196,15 +197,20 @@ export default function App() {
   const handleTrust = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!trustForm.code || !trustForm.issuer) {
-      return showToast("Asset code and issuer are required.", "error");
+    if (!trustForm.issuer) {
+      return showToast("Issuer is required.", "error");
+    }
+    let code;
+    try {
+      code = validateAssetCode(trustForm.code);
+    } catch (err) {
+      return showToast(err.message, "error");
     }
     setLoading("trust");
-    const code = trustForm.code.toUpperCase();
     try {
       await changeTrustWithFreighter(
         publicKey,
-        trustForm.code,
+        code,
         trustForm.issuer,
         trustForm.limit || "1000000"
       );
