@@ -571,7 +571,7 @@ export default function App() {
                     navigator.clipboard.writeText(publicKey);
                     showToast("Address copied.");
                   }}
-                  title="Copy"
+                  title="Copy public key"
                   aria-label="Copy public key"
                 >
                   ⎘
