@@ -17,6 +17,7 @@ import {
   explorerAccountUrl,
   explorerTxUrl,
 } from "./stellar";
+import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
 import {
   NETWORKS,
@@ -243,8 +244,14 @@ export default function App() {
   const handleSend = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!sendForm.destination || !sendForm.amount) {
-      return showToast("Destination and amount are required.", "error");
+    if (!sendForm.destination) {
+      return showToast("Destination is required.", "error");
+    }
+    let amount;
+    try {
+      amount = validatePaymentAmount(sendForm.amount);
+    } catch (err) {
+      return showToast(err.message, "error");
     }
     if (
       sendForm.memoType === "text" &&
@@ -257,7 +264,7 @@ export default function App() {
     if (!selected) {
       return showToast("Choose an asset you hold a trustline for.", "error");
     }
-    if (parseFloat(sendForm.amount) > parseFloat(selected.balance)) {
+    if (parseFloat(amount) > parseFloat(selected.balance)) {
       return showToast(
         `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
         "error"
@@ -273,7 +280,7 @@ export default function App() {
       const result = await sendPaymentWithFreighter(
         publicKey,
         sendForm.destination,
-        sendForm.amount,
+        amount,
         asset,
         sendForm.memoType,
         sendForm.memo
