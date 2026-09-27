@@ -96,8 +96,8 @@ export default function App() {
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
-  const showToast = (message, type = "success") => {
-    setToast({ message, type });
+  const showToast = (message, type = "success", explorerUrl = null) => {
+    setToast({ message, type, explorerUrl });
     setTimeout(() => setToast(null), 4200);
   };
 
@@ -286,7 +286,11 @@ export default function App() {
         memoType: "text",
         memo: "",
       });
-      showToast(`Payment submitted · ${result.hash.slice(0, 12)}…`);
+      showToast(
+        `Payment submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
     } catch (err) {
       showToast(err.message || "Payment failed.", "error");
     } finally {
@@ -477,7 +481,17 @@ export default function App() {
           aria-live={toast.type === "error" ? "assertive" : "polite"}
           aria-atomic="true"
         >
-          {toast.message}
+          <span>{toast.message}</span>
+          {toast.explorerUrl && (
+            <a
+              className="toast__link"
+              href={toast.explorerUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              View on explorer ↗
+            </a>
+          )}
         </div>
       )}
 
