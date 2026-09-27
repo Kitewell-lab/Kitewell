@@ -8,6 +8,7 @@ import {
   readKitewellState,
   registerBuilderWithFreighter,
 } from "./freighter";
+import { shortenAddress } from "./addressFormat";
 import {
   fundWithFriendbot,
   getAccountBalances,
@@ -549,7 +550,7 @@ export default function App() {
               </div>
               <div className="hero-card__key">
                 <span className="eyebrow">Public key</span>
-                <code>{shorten(publicKey)}</code>
+                <code>{shortenAddress(publicKey)}</code>
                 <button
                   className="icon-btn"
                   type="button"
@@ -768,7 +769,7 @@ export default function App() {
                         <strong>{b.code}</strong>
                         {!b.isNative && (
                           <span className="muted balance-row__issuer">
-                            {shorten(b.issuer)}
+                            {shortenAddress(b.issuer)}
                           </span>
                         )}
                       </div>
@@ -1337,8 +1338,8 @@ export default function App() {
                         </div>
                         <div className="tx-item__addr muted">
                           {isOutgoing
-                            ? `To ${shorten(tx.to)}`
-                            : `From ${shorten(tx.from)}`}
+                            ? `To ${shortenAddress(tx.to)}`
+                            : `From ${shortenAddress(tx.from)}`}
                         </div>
                         <a
                           href={explorerTxUrl(tx.transaction_hash)}
@@ -1380,11 +1381,6 @@ export default function App() {
       </footer>
     </div>
   );
-}
-
-function shorten(key) {
-  if (!key || key.length < 12) return key;
-  return `${key.slice(0, 6)}…${key.slice(-6)}`;
 }
 
 function formatCreatedAt(value) {
