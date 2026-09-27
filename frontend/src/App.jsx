@@ -1287,6 +1287,7 @@ export default function App() {
                 <div className="tx-list">
                   {transactions.map((tx) => {
                     const isOutgoing = tx.from === publicKey;
+                    const createdAt = formatCreatedAt(tx.created_at);
                     return (
                       <div
                         key={tx.id}
@@ -1311,6 +1312,14 @@ export default function App() {
                         >
                           Explorer ↗
                         </a>
+                        {createdAt && (
+                          <time
+                            className="tx-item__time"
+                            dateTime={tx.created_at}
+                          >
+                            {createdAt}
+                          </time>
+                        )}
                       </div>
                     );
                   })}
@@ -1340,6 +1349,13 @@ export default function App() {
 function shorten(key) {
   if (!key || key.length < 12) return key;
   return `${key.slice(0, 6)}…${key.slice(-6)}`;
+}
+
+function formatCreatedAt(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString();
 }
 
 function KitewellMark() {

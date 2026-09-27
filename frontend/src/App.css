@@ -546,6 +546,11 @@ body {
 .tx-item__link:hover {
   text-decoration: underline;
 }
+.tx-item__time {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--muted);
+}
 
 .muted {
   color: var(--muted);
