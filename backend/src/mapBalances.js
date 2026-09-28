@@ -1,44 +1,46 @@
 /**
- * Maps Horizon account balance entries to a consistent, normalized shape.
- *
- * @param {Object} b Raw balance object from Horizon server.loadAccount
- * @returns {{key: string, code: string, issuer: string|null, balance: string, limit: string|null, isNative: boolean}|null}
+ * Pure helpers that map Horizon account balance records into the compact
+ * shape the Kitewell API returns to the frontend.
  */
-export function mapBalance(b) {
-  if (!b || typeof b !== "object") return null;
 
-  if (b.asset_type === "native") {
+/**
+ * Map a single Horizon balance record.
+ *
+ * @param {object} balance Horizon balance record (`asset_type`, `balance`, …).
+ * @returns {object|null} Mapped balance, or `null` for malformed input.
+ */
+export function mapBalance(balance) {
+  if (!balance || typeof balance !== "object") return null;
+
+  if (balance.asset_type === "native") {
     return {
       key: "native",
       code: "XLM",
       issuer: null,
-      balance: b.balance,
+      balance: balance.balance,
       limit: null,
       isNative: true,
     };
   }
 
   return {
-    key: `${b.asset_code}:${b.asset_issuer}`,
-    code: b.asset_code,
-    issuer: b.asset_issuer,
-    balance: b.balance,
-    limit: b.limit ?? null,
+    key: `${balance.asset_code}:${balance.asset_issuer}`,
+    code: balance.asset_code,
+    issuer: balance.asset_issuer,
+    balance: balance.balance,
+    limit: balance.limit,
     isNative: false,
   };
 }
 
 /**
- * Deduplicates Horizon balance mapping behind a pure helper.
+ * Map a list of Horizon balance records, preserving order and dropping
+ * malformed entries.
  *
- * @param {Array<Object>} [balances=[]] List of raw balances from Horizon
- * @returns {Array<{key: string, code: string, issuer: string|null, balance: string, limit: string|null, isNative: boolean}>}
+ * @param {object[]} balances Horizon balance records.
+ * @returns {object[]} Mapped balances.
  */
 export function mapBalances(balances) {
-  if (!Array.isArray(balances)) {
-    return [];
-  }
-  return balances.map(mapBalance).filter(Boolean);
+  if (!Array.isArray(balances)) return [];
+  return balances.map(mapBalance).filter((mapped) => mapped !== null);
 }
-
-export default mapBalances;

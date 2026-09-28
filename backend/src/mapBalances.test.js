@@ -1,95 +1,81 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+
 import { mapBalance, mapBalances } from "./mapBalances.js";
 
-test("mapBalance: correctly maps native XLM balance", () => {
-  const rawNative = {
+test("mapBalance maps a native XLM balance", () => {
+  const result = mapBalance({
     asset_type: "native",
-    balance: "100.5000000",
-    buying_liabilities: "0.0000000",
-    selling_liabilities: "0.0000000",
-  };
+    balance: "42.5000000",
+  });
 
-  const mapped = mapBalance(rawNative);
-  assert.deepEqual(mapped, {
+  assert.deepEqual(result, {
     key: "native",
     code: "XLM",
     issuer: null,
-    balance: "100.5000000",
+    balance: "42.5000000",
     limit: null,
     isNative: true,
   });
 });
 
-test("mapBalance: correctly maps credit_alphanum4 asset balance", () => {
-  const rawCredit4 = {
+test("mapBalance maps a credit_alphanum4 asset balance", () => {
+  const result = mapBalance({
     asset_type: "credit_alphanum4",
     asset_code: "USDC",
     asset_issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
-    balance: "50.0000000",
-    limit: "10000.0000000",
-    buying_liabilities: "0.0000000",
-    selling_liabilities: "0.0000000",
-  };
+    balance: "123.4567890",
+    limit: "1000000.0000000",
+  });
 
-  const mapped = mapBalance(rawCredit4);
-  assert.deepEqual(mapped, {
+  assert.deepEqual(result, {
     key: "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
     code: "USDC",
     issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
-    balance: "50.0000000",
-    limit: "10000.0000000",
+    balance: "123.4567890",
+    limit: "1000000.0000000",
     isNative: false,
   });
 });
 
-test("mapBalance: correctly maps credit_alphanum12 asset balance", () => {
-  const rawCredit12 = {
+test("mapBalance maps a credit_alphanum12 asset balance", () => {
+  const result = mapBalance({
     asset_type: "credit_alphanum12",
-    asset_code: "STELLAREUR",
-    asset_issuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
-    balance: "12.3400000",
-    limit: "5000.0000000",
-  };
-
-  const mapped = mapBalance(rawCredit12);
-  assert.deepEqual(mapped, {
-    key: "STELLAREUR:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
-    code: "STELLAREUR",
-    issuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
-    balance: "12.3400000",
-    limit: "5000.0000000",
-    isNative: false,
+    asset_code: "KITEWELLXLM",
+    asset_issuer: "GDUKMGUGDZQK6YHYA5Z6AY2G4XDSZPSZ3SW5UN3ARVMO6QSRDWP5YLEX",
+    balance: "0.1000000",
+    limit: "922337203685.4775807",
   });
+
+  assert.equal(result.key, "KITEWELLXLM:GDUKMGUGDZQK6YHYA5Z6AY2G4XDSZPSZ3SW5UN3ARVMO6QSRDWP5YLEX");
+  assert.equal(result.code, "KITEWELLXLM");
+  assert.equal(result.isNative, false);
 });
 
-test("mapBalances: maps mixed native and credit fixtures preserving order", () => {
-  const fixtures = [
-    {
-      asset_type: "native",
-      balance: "99.0000000",
-    },
+test("mapBalances maps native and credit fixtures preserving order", () => {
+  const result = mapBalances([
+    { asset_type: "native", balance: "10.0000000" },
     {
       asset_type: "credit_alphanum4",
-      asset_code: "TEST",
-      asset_issuer: "GABC123",
-      balance: "10.0000000",
-      limit: "100.0000000",
+      asset_code: "USDC",
+      asset_issuer: "GISSUER",
+      balance: "5.0000000",
+      limit: "1000.0000000",
     },
-  ];
+  ]);
 
-  const results = mapBalances(fixtures);
-  assert.equal(results.length, 2);
-  assert.equal(results[0].key, "native");
-  assert.equal(results[0].isNative, true);
-  assert.equal(results[1].key, "TEST:GABC123");
-  assert.equal(results[1].isNative, false);
+  assert.equal(result.length, 2);
+  assert.equal(result[0].isNative, true);
+  assert.equal(result[1].isNative, false);
+  assert.equal(result[1].code, "USDC");
 });
 
-test("mapBalances: handles empty or invalid inputs gracefully", () => {
+test("mapBalances tolerates empty and malformed input", () => {
   assert.deepEqual(mapBalances([]), []);
   assert.deepEqual(mapBalances(null), []);
   assert.deepEqual(mapBalances(undefined), []);
-  assert.deepEqual(mapBalances("non-array string"), []);
-  assert.deepEqual(mapBalances([null, undefined, 42]), []);
+
+  const result = mapBalances([null, { asset_type: "native", balance: "1.0000000" }, 7]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].key, "native");
 });

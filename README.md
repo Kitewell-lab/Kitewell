@@ -77,6 +77,22 @@ npm test
 
 Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explorer URLs, asset/path parsing, Friendbot funding, balance/payment mapping, backend → Horizon fallback) with mocked Horizon SDK and API calls — CI-friendly, no Freighter wallet or network access required. `frontend/src/path-payment.test.js` covers amount normalization and path-payment operation building. `frontend/src/freighter.test.js` covers the Lab-tab Soroban registry reads and `register` invoke.
 
+## Screenshots
+
+The Testnet lab UI, using the existing assets in [`screenshots/`](./screenshots):
+
+### Home screen (tab navigation, including the Lab)
+![Home screen](./screenshots/01-home.png)
+
+### Wallet connected via Freighter
+![Wallet connected](./screenshots/01-wallet-connected.png)
+
+### Send a payment (optional memo)
+![Send payment form](./screenshots/04-send-form.png)
+
+### Transaction history with explorer links
+![Transaction history](./screenshots/05-transaction-history.png)
+
 ## Features
 
 - Freighter connect / disconnect (`setAllowed`, `getAddress`, `signTransaction`)
