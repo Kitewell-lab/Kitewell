@@ -1,0 +1,52 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("./api", () => ({
+  fetchAccountViaApi: vi.fn(),
+  fetchPaymentsViaApi: vi.fn(),
+}));
+
+const { loadAccountMock, paymentsCallMock } = vi.hoisted(() => ({
+  loadAccountMock: vi.fn(),
+  paymentsCallMock: vi.fn(),
+}));
+
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    Horizon: {
+      ...actual.Horizon,
+      Server: vi.fn(function () {
+        return {
+          loadAccount: loadAccountMock,
+          payments: () => ({
+            forAccount: () => ({
+              limit: () => ({
+                order: () => ({ call: paymentsCallMock }),
+              }),
+            }),
+          }),
+        };
+      }),
+    },
+  };
+});
+
+const { fetchPaymentsViaApi } = await import("./api");
+const { getTransactions } = await import("./stellar");
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  loadAccountMock.mockReset();
+  paymentsCallMock.mockReset();
+});
+
+describe("getTransactions API limit", () => {
+  it("forwards a custom limit to the payments API and returns its result", async () => {
+    const records = [{ id: "p1" }];
+    fetchPaymentsViaApi.mockResolvedValue(records);
+
+    await expect(getTransactions("GTEST", 7)).resolves.toBe(records);
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 7);
+  });
+});
