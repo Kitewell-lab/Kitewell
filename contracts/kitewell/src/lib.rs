@@ -25,20 +25,6 @@ pub enum Error {
     Paused = 4,
 }
 
-/// Contract errors.
-///
-/// Pattern chosen: a `#[contracterror]` enum returned as `Result<_, Error>`.
-/// Compared with a stringly `panic!`, this keeps `EmptyName` in the contract
-/// spec and lets the generated `try_register` surface it as
-/// `Err(Ok(Error::EmptyName))`. (`panic_with_error!(&env, Error::EmptyName)` is
-/// the equivalent for a fn that must keep a non-`Result` signature.)
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    EmptyName = 1,
-}
-
 #[contract]
 pub struct Kitewell;
 
@@ -161,6 +147,27 @@ mod test {
         );
 
         // The rejected check-in wrote nothing: no nickname and no count bump.
+        assert_eq!(client.get_builder(&a), None);
+        assert_eq!(client.builder_count(), 0);
+    }
+
+    #[test]
+    fn register_rejects_empty_name_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let a = Address::generate(&env);
+
+        client.init(&admin);
+        client.set_paused(&admin, &true);
+
+        // Empty name is payload validation, so pause does not change the error.
+        assert_eq!(
+            client.try_register(&a, &String::from_str(&env, "")),
+            Err(Ok(Error::EmptyName))
+        );
         assert_eq!(client.get_builder(&a), None);
         assert_eq!(client.builder_count(), 0);
     }
