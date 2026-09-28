@@ -1,11 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// Mock config module
+vi.mock("./src/config", () => ({
+  API_BASE: "http://localhost:8787",
+}));
+
+// Mock stelllar module to include setActiveNetwork from network
+const actualStellar = await vi.importActual("./stellar");
+const networkModule = await vi.importActual("./network");
+vi.mock("./stellar", () => ({
+  ...actualStellar,
+  setActiveNetwork: networkModule.setActiveNetwork,
+}));
+
 import * as StellarSdk from "@stellar/stellar-sdk";
-import {
-  fetchPaymentsViaApi,
-  getTransactions,
-  setActiveNetwork,
-} from "./stellar";
+import { getTransactions, setActiveNetwork } from "./stellar";
 
 const MOCK_HORIZON_URL = "https://horizon-testnet.stellar.org";
 const MOCK_ACTIVE_NETWORK = {
@@ -34,13 +43,16 @@ const MOCK_PAYMENTS = [
   },
 ];
 
-describe("stellar.js", () => {
+describe("transactions-off-testnet", () => {
   let fetchMock;
+  let fetchPaymentsViaApiMock;
 
   beforeEach(() => {
     fetchMock = vi.fn();
     global.fetch = fetchMock;
     vi.stubGlobal("fetch", fetchMock);
+    // Mock the api module's fetchPaymentsViaApi
+    fetchPaymentsViaApiMock = vi.spyOn(require("./api"), "fetchPaymentsViaApi");
   });
 
   afterEach(() => {
@@ -52,7 +64,7 @@ describe("stellar.js", () => {
   describe("getTransactions", () => {
     it("on TESTNET, calls fetchPaymentsViaApi and Horizon", async () => {
       // Mock fetchPaymentsViaApi to return empty array
-      vi.spyOn(require("./api"), "fetchPaymentsViaApi").mockResolvedValue([]);
+      fetchPaymentsViaApiMock.mockResolvedValue([]);
       // Mock Horizon response
       fetchMock.mockResolvedValueOnce({
         ok: true,
@@ -62,7 +74,7 @@ describe("stellar.js", () => {
       });
 
       const result = await getTransactions();
-      expect(fetchPaymentsViaApi).toHaveBeenCalledTimes(1);
+      expect(fetchPaymentsViaApiMock).toHaveBeenCalledTimes(1);
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(result).toEqual(MOCK_PAYMENTS);
     });
@@ -71,7 +83,7 @@ describe("stellar.js", () => {
       // Switch to FUTURENET
       setActiveNetwork(MOCK_FUTURENET_NETWORK);
       // Mock fetchPaymentsViaApi to ensure it's not called
-      const fetchPaymentsViaApiMock = vi.spyOn(require("./api"), "fetchPaymentsViaApi").mockResolvedValue([]);
+      fetchPaymentsViaApiMock.mockResolvedValue([]);
       // Mock Horizon response
       fetchMock.mockResolvedValueOnce({
         ok: true,
