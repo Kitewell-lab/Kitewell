@@ -5,15 +5,6 @@ use soroban_sdk::{
 
 const LAB: Symbol = symbol_short!("KITEWELL");
 const COUNT: Symbol = symbol_short!("COUNT");
-const ADMIN: Symbol = symbol_short!("ADMIN");
-const PAUSED: Symbol = symbol_short!("PAUSED");
-
-#[contracterror]
-pub enum Error {
-    AlreadyInit = 1,
-    NotAdmin = 2,
-    Paused = 3,
-}
 
 /// Contract errors.
 ///
@@ -34,30 +25,6 @@ pub struct Kitewell;
 
 #[contractimpl]
 impl Kitewell {
-    /// One-time initialiser that sets the admin address.
-    pub fn init(env: Env, admin: Address) -> Result<(), Error> {
-        if env.storage().instance().has(&ADMIN) {
-            return Err(Error::AlreadyInit);
-        }
-        env.storage().instance().set(&ADMIN, &admin);
-        Ok(())
-    }
-
-    /// Admin-only pause / unpause toggle.
-    pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
-        admin.require_auth();
-        let stored: Address = env
-            .storage()
-            .instance()
-            .get(&ADMIN)
-            .ok_or(Error::NotAdmin)?;
-        if admin != stored {
-            return Err(Error::NotAdmin);
-        }
-        env.storage().instance().set(&PAUSED, &paused);
-        Ok(())
-    }
-
     /// Returns the lab name. Useful as a smoke-test invoke.
     pub fn lab_name(env: Env) -> String {
         String::from_str(&env, "Kitewell")
@@ -113,66 +80,6 @@ mod test {
         let id = env.register(Kitewell, ());
         let client = KitewellClient::new(&env, &id);
         assert_eq!(client.lab_name(), String::from_str(&env, "Kitewell"));
-    }
-
-    #[test]
-    fn init_sets_admin() {
-        let env = Env::default();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-
-        assert!(client.try_init(&admin).is_ok());
-    }
-
-    #[test]
-    fn init_fails_if_already_set() {
-        let env = Env::default();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-
-        client.init(&admin);
-        let err = client.try_init(&admin).unwrap();
-        assert_eq!(err, Err(Error::AlreadyInit));
-    }
-
-    #[test]
-    fn set_paused_works_as_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-
-        client.init(&admin);
-        assert!(client.try_set_paused(&admin, &true).is_ok());
-    }
-
-    #[test]
-    fn set_paused_rejects_non_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let other = Address::generate(&env);
-
-        client.init(&admin);
-        let err = client.try_set_paused(&other, &true).unwrap();
-        assert_eq!(err, Err(Error::NotAdmin));
-    }
-
-    #[test]
-    fn set_paused_rejects_before_init() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-
-        let err = client.try_set_paused(&admin, &true).unwrap();
-        assert_eq!(err, Err(Error::NotAdmin));
     }
 
     #[test]
