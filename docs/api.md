@@ -33,6 +33,7 @@ Returns network configuration and contract status.
   "horizonUrl": "https://horizon-testnet.stellar.org",
   "friendbotUrl": "https://friendbot.stellar.org",
   "explorerBase": "https://stellar.expert/explorer/testnet",
+  "sorobanRpcUrl": "https://soroban-testnet.stellar.org",
   "passphrase": "Test SDF Network ; September 2015",
   "contract": {
     "kitewell": null,
