@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { mapBalances } from "./mapBalances.js";
 
 const PORT = Number(process.env.PORT) || 8787;
 const HORIZON_URL =
@@ -113,26 +114,7 @@ app.get("/api/account/:address", async (req, res) => {
 
   try {
     const account = await server.loadAccount(address);
-    const balances = account.balances.map((b) => {
-      if (b.asset_type === "native") {
-        return {
-          key: "native",
-          code: "XLM",
-          issuer: null,
-          balance: b.balance,
-          limit: null,
-          isNative: true,
-        };
-      }
-      return {
-        key: `${b.asset_code}:${b.asset_issuer}`,
-        code: b.asset_code,
-        issuer: b.asset_issuer,
-        balance: b.balance,
-        limit: b.limit,
-        isNative: false,
-      };
-    });
+    const balances = mapBalances(account.balances);
 
     res.json({
       id: account.id,

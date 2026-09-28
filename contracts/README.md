@@ -11,6 +11,27 @@ On-chain builder check-in for the Kitewell Testnet experience.
 | `register(caller, name)` | Auth-gated check-in; stores nickname |
 | `get_builder(address)` | Lookup nickname |
 
+## Behavior notes
+
+**Auth gate.** `register(caller, name)` calls `caller.require_auth()` before it
+touches storage, so every successful check-in must be signed by the `caller`
+address passed in. The read methods (`lab_name`, `builder_count`,
+`get_builder`) are permissionless and need no auth entry. There is no admin or
+pause role — do not assume one exists.
+
+**Count on first register.** `builder_count()` is incremented only the first
+time a given `caller` is seen: `register` checks whether the persistent
+`(KITEWELL, caller)` entry already exists, writes the nickname, and bumps the
+instance counter only when the entry was missing. Calling `register` again for
+the same address overwrites the stored name without changing the count.
+
+**TTL extend on write.** `register` is the only method that extends storage
+TTL. When a new builder is added it extends the instance storage TTL with
+`extend_ttl(1000, 5000)` alongside the counter update, and it always extends the
+persistent `(KITEWELL, caller)` entry TTL with `extend_ttl(1000, 5000)` after
+writing the name. Reads never extend TTL, so a long-idle registry can still
+require a write to keep entries live.
+
 ## Build
 
 Requires Rust. Unit tests:

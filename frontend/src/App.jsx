@@ -8,6 +8,7 @@ import {
   readKitewellState,
   registerBuilderWithFreighter,
 } from "./freighter";
+import { shortenAddress } from "./addressFormat";
 import {
   fundWithFriendbot,
   getAccountBalances,
@@ -16,6 +17,7 @@ import {
   explorerAccountUrl,
   explorerTxUrl,
 } from "./stellar";
+import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
 import {
   NETWORKS,
@@ -23,6 +25,7 @@ import {
   isFriendbotAvailable,
   setActiveNetwork,
 } from "./network";
+import { validateAssetCode } from "./validateAssetCode";
 import "./App.css";
 
 const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
@@ -96,8 +99,8 @@ export default function App() {
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
-  const showToast = (message, type = "success") => {
-    setToast({ message, type });
+  const showToast = (message, type = "success", explorerUrl = null) => {
+    setToast({ message, type, explorerUrl });
     setTimeout(() => setToast(null), 4200);
   };
 
@@ -194,15 +197,20 @@ export default function App() {
   const handleTrust = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!trustForm.code || !trustForm.issuer) {
-      return showToast("Asset code and issuer are required.", "error");
+    if (!trustForm.issuer) {
+      return showToast("Issuer is required.", "error");
+    }
+    let code;
+    try {
+      code = validateAssetCode(trustForm.code);
+    } catch (err) {
+      return showToast(err.message, "error");
     }
     setLoading("trust");
-    const code = trustForm.code.toUpperCase();
     try {
       await changeTrustWithFreighter(
         publicKey,
-        trustForm.code,
+        code,
         trustForm.issuer,
         trustForm.limit || "1000000"
       );
@@ -242,8 +250,14 @@ export default function App() {
   const handleSend = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!sendForm.destination || !sendForm.amount) {
-      return showToast("Destination and amount are required.", "error");
+    if (!sendForm.destination) {
+      return showToast("Destination is required.", "error");
+    }
+    let amount;
+    try {
+      amount = validatePaymentAmount(sendForm.amount);
+    } catch (err) {
+      return showToast(err.message, "error");
     }
     if (
       sendForm.memoType === "text" &&
@@ -256,7 +270,7 @@ export default function App() {
     if (!selected) {
       return showToast("Choose an asset you hold a trustline for.", "error");
     }
-    if (parseFloat(sendForm.amount) > parseFloat(selected.balance)) {
+    if (parseFloat(amount) > parseFloat(selected.balance)) {
       return showToast(
         `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
         "error"
@@ -272,7 +286,7 @@ export default function App() {
       const result = await sendPaymentWithFreighter(
         publicKey,
         sendForm.destination,
-        sendForm.amount,
+        amount,
         asset,
         sendForm.memoType,
         sendForm.memo
@@ -286,7 +300,11 @@ export default function App() {
         memoType: "text",
         memo: "",
       });
-      showToast(`Payment submitted · ${result.hash.slice(0, 12)}…`);
+      showToast(
+        `Payment submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
     } catch (err) {
       showToast(err.message || "Payment failed.", "error");
     } finally {
@@ -477,7 +495,17 @@ export default function App() {
           aria-live={toast.type === "error" ? "assertive" : "polite"}
           aria-atomic="true"
         >
-          {toast.message}
+          <span>{toast.message}</span>
+          {toast.explorerUrl && (
+            <a
+              className="toast__link"
+              href={toast.explorerUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              View on explorer ↗
+            </a>
+          )}
         </div>
       )}
 
@@ -535,7 +563,7 @@ export default function App() {
               </div>
               <div className="hero-card__key">
                 <span className="eyebrow">Public key</span>
-                <code>{shorten(publicKey)}</code>
+                <code>{shortenAddress(publicKey)}</code>
                 <button
                   className="icon-btn"
                   type="button"
@@ -543,7 +571,7 @@ export default function App() {
                     navigator.clipboard.writeText(publicKey);
                     showToast("Address copied.");
                   }}
-                  title="Copy"
+                  title="Copy public key"
                   aria-label="Copy public key"
                 >
                   ⎘
@@ -754,7 +782,7 @@ export default function App() {
                         <strong>{b.code}</strong>
                         {!b.isNative && (
                           <span className="muted balance-row__issuer">
-                            {shorten(b.issuer)}
+                            {shortenAddress(b.issuer)}
                           </span>
                         )}
                       </div>
@@ -795,8 +823,11 @@ export default function App() {
 
               <form onSubmit={handleTrust} className="form">
                 <h3 className="subhead">Add trustline</h3>
-                <label className="label">Asset code</label>
+                <label className="label" htmlFor="trust-asset-code">
+                  Asset code
+                </label>
                 <input
+                  id="trust-asset-code"
                   className="input"
                   value={trustForm.code}
                   onChange={(e) => setTrustForm({ ...trustForm, code: e.target.value })}
@@ -804,16 +835,22 @@ export default function App() {
                   maxLength={12}
                   required
                 />
-                <label className="label">Issuer</label>
+                <label className="label" htmlFor="trust-issuer">
+                  Issuer
+                </label>
                 <input
+                  id="trust-issuer"
                   className="input"
                   value={trustForm.issuer}
                   onChange={(e) => setTrustForm({ ...trustForm, issuer: e.target.value })}
                   placeholder="G…"
                   required
                 />
-                <label className="label">Limit</label>
+                <label className="label" htmlFor="trust-limit">
+                  Limit
+                </label>
                 <input
+                  id="trust-limit"
                   className="input"
                   type="number"
                   min="0"
@@ -846,8 +883,11 @@ export default function App() {
                 submits to Horizon Testnet.
               </p>
               <form onSubmit={handleSend} className="form">
-                <label className="label">Destination</label>
+                <label className="label" htmlFor="send-destination">
+                  Destination
+                </label>
                 <input
+                  id="send-destination"
                   className="input"
                   type="text"
                   placeholder="G…"
@@ -855,8 +895,11 @@ export default function App() {
                   onChange={(e) => setSendForm({ ...sendForm, destination: e.target.value })}
                   required
                 />
-                <label className="label">Asset</label>
+                <label className="label" htmlFor="send-asset">
+                  Asset
+                </label>
                 <select
+                  id="send-asset"
                   className="input"
                   value={sendForm.assetKey}
                   onChange={(e) => setSendForm({ ...sendForm, assetKey: e.target.value })}
@@ -873,10 +916,11 @@ export default function App() {
                       </option>
                     ))}
                 </select>
-                <label className="label">
+                <label className="label" htmlFor="send-amount">
                   Amount ({selectedSendAsset?.code ?? "XLM"})
                 </label>
                 <input
+                  id="send-amount"
                   className="input"
                   type="number"
                   step="0.0000001"
@@ -886,8 +930,11 @@ export default function App() {
                   onChange={(e) => setSendForm({ ...sendForm, amount: e.target.value })}
                   required
                 />
-                <label className="label">Memo type</label>
+                <label className="label" htmlFor="send-memo-type">
+                  Memo type
+                </label>
                 <select
+                  id="send-memo-type"
                   className="input"
                   value={sendForm.memoType}
                   onChange={(e) =>
@@ -902,8 +949,11 @@ export default function App() {
                   <option value="id">ID</option>
                   <option value="hash">Hash</option>
                 </select>
-                <label className="label">Memo (optional)</label>
+                <label className="label" htmlFor="send-memo">
+                  Memo (optional)
+                </label>
                 <input
+                  id="send-memo"
                   className="input"
                   type="text"
                   maxLength={memoField.maxLength}
@@ -1287,6 +1337,7 @@ export default function App() {
                 <div className="tx-list">
                   {transactions.map((tx) => {
                     const isOutgoing = tx.from === publicKey;
+                    const createdAt = formatCreatedAt(tx.created_at);
                     return (
                       <div
                         key={tx.id}
@@ -1300,8 +1351,8 @@ export default function App() {
                         </div>
                         <div className="tx-item__addr muted">
                           {isOutgoing
-                            ? `To ${shorten(tx.to)}`
-                            : `From ${shorten(tx.from)}`}
+                            ? `To ${shortenAddress(tx.to)}`
+                            : `From ${shortenAddress(tx.from)}`}
                         </div>
                         <a
                           href={explorerTxUrl(tx.transaction_hash)}
@@ -1311,6 +1362,14 @@ export default function App() {
                         >
                           Explorer ↗
                         </a>
+                        {createdAt && (
+                          <time
+                            className="tx-item__time"
+                            dateTime={tx.created_at}
+                          >
+                            {createdAt}
+                          </time>
+                        )}
                       </div>
                     );
                   })}
@@ -1337,9 +1396,11 @@ export default function App() {
   );
 }
 
-function shorten(key) {
-  if (!key || key.length < 12) return key;
-  return `${key.slice(0, 6)}…${key.slice(-6)}`;
+function formatCreatedAt(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString();
 }
 
 function KitewellMark() {
