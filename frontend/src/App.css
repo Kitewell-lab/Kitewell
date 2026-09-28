@@ -26,6 +26,14 @@
   --sans: "DM Sans", system-ui, sans-serif;
 }
 
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+[tabindex]:focus-visible {
+  outline: 3px solid var(--sun);
+  outline-offset: 3px;
+}
+
 body {
   min-height: 100vh;
   color: var(--text);
@@ -76,11 +84,23 @@ body {
   left: 50%;
   transform: translateX(-50%);
   z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
   padding: 10px 18px;
   border-radius: 999px;
   font-size: 13px;
   font-weight: 600;
   animation: rise 0.22s ease;
+}
+.toast__link {
+  color: inherit;
+  text-decoration: underline;
+  white-space: nowrap;
+}
+.toast__link:hover {
+  text-decoration: none;
 }
 .toast--success {
   background: var(--success);
@@ -149,6 +169,15 @@ body {
   background: rgba(245, 197, 66, 0.08);
   border-radius: 999px;
   padding: 5px 12px;
+}
+
+.network {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+.network .eyebrow {
+  margin-bottom: 2px;
 }
 
 .main {
@@ -334,6 +363,15 @@ body {
 .input::placeholder {
   color: #5c6578;
 }
+.input--compact {
+  width: auto;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--sun);
+  background: rgba(245, 197, 66, 0.08);
+  border-color: var(--line-strong);
+}
 
 .btn {
   display: inline-flex;
@@ -440,6 +478,35 @@ body {
   font-size: 11px;
   margin-top: 2px;
 }
+.balance-row__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.btn--sm {
+  padding: 6px 10px;
+  font-size: 11px;
+  border-radius: 8px;
+}
+
+.metadata-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.metadata-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.metadata-value {
+  font-size: 13px;
+  word-break: break-word;
+}
 
 .tx-list {
   display: flex;
@@ -491,6 +558,11 @@ body {
 .tx-item__link:hover {
   text-decoration: underline;
 }
+.tx-item__time {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--muted);
+}
 
 .muted {
   color: var(--muted);
@@ -525,5 +597,16 @@ body {
   .tab {
     font-size: 11px;
     padding: 8px 4px;
+  }
+}
+
+/* Respect the user's reduced-motion preference: keep the toast and spinner
+   from animating while leaving their layout and meaning unchanged. */
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    animation: none;
+  }
+  .spinner {
+    animation: none;
   }
 }
