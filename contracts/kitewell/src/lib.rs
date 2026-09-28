@@ -152,6 +152,27 @@ mod test {
     }
 
     #[test]
+    fn register_rejects_empty_name_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let a = Address::generate(&env);
+
+        client.init(&admin);
+        client.set_paused(&admin, &true);
+
+        // Empty name is payload validation, so pause does not change the error.
+        assert_eq!(
+            client.try_register(&a, &String::from_str(&env, "")),
+            Err(Ok(Error::EmptyName))
+        );
+        assert_eq!(client.get_builder(&a), None);
+        assert_eq!(client.builder_count(), 0);
+    }
+
+    #[test]
     fn get_builder_never_registered_is_none() {
         let env = Env::default();
         let id = env.register(Kitewell, ());
