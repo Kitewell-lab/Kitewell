@@ -1,41 +1,116 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   checkFreighterInstalled,
   connectFreighterWallet,
   sendPaymentWithFreighter,
+  pathPaymentWithFreighter,
   changeTrustWithFreighter,
+  readKitewellState,
+  registerBuilderWithFreighter,
 } from "./freighter";
+import { shortenAddress } from "./addressFormat";
 import {
   fundWithFriendbot,
   getAccountBalances,
+  getAccountDetails,
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
 } from "./stellar";
+import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
+import {
+  NETWORKS,
+  getActiveNetworkId,
+  isFriendbotAvailable,
+  setActiveNetwork,
+} from "./network";
+import { validateAssetCode } from "./validateAssetCode";
 import "./App.css";
 
-const TABS = ["Wallet", "Fund", "Assets", "Send", "History", "Lab"];
+const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
+const PATH_MODE_FIELDS = {
+  strictSend: {
+    amountLabel: "Amount to send",
+    boundLabel: "Minimum received",
+    boundHint: "Lowest amount of the destination asset you will accept.",
+  },
+  strictReceive: {
+    amountLabel: "Amount to receive",
+    boundLabel: "Maximum to send",
+    boundHint: "Most of the send asset you are willing to spend.",
+  },
+};
+const MEMO_FIELDS = {
+  text: {
+    maxLength: 28,
+    placeholder: "Up to 28 UTF-8 bytes",
+  },
+  id: {
+    maxLength: 20,
+    pattern: "[0-9]{1,20}",
+    placeholder: "Unsigned 64-bit integer",
+    inputMode: "numeric",
+  },
+  hash: {
+    maxLength: 64,
+    pattern: "[0-9a-fA-F]{64}",
+    placeholder: "64 hexadecimal characters",
+  },
+};
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("Wallet");
   const [publicKey, setPublicKey] = useState(null);
+  const [networkId, setNetworkId] = useState(getActiveNetworkId());
   const [freighterInstalled, setFreighterInstalled] = useState(null);
   const [balances, setBalances] = useState([]);
   const [transactions, setTransactions] = useState([]);
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
-  const [sendForm, setSendForm] = useState({ destination: "", amount: "", memo: "" });
+  const [sendForm, setSendForm] = useState({
+    destination: "",
+    amount: "",
+    assetKey: "native",
+    memoType: "text",
+    memo: "",
+  });
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
+  const [pathForm, setPathForm] = useState({
+    mode: "strictSend",
+    destination: "",
+    amount: "",
+    bound: "",
+    sendAssetType: "native",
+    sendCode: "",
+    sendIssuer: "",
+    destAssetType: "native",
+    destCode: "",
+    destIssuer: "",
+    path: "",
+  });
+  const [pathResult, setPathResult] = useState(null);
   const [labInfo, setLabInfo] = useState(null);
   const [labError, setLabError] = useState(null);
+  const [labState, setLabState] = useState(null);
+  const [labStateError, setLabStateError] = useState(null);
+  const [registerForm, setRegisterForm] = useState({ name: "" });
+  const [lastRegisterTx, setLastRegisterTx] = useState(null);
+  const tabRefs = useRef([]);
+  const [accountDetails, setAccountDetails] = useState(null);
 
-  const showToast = (message, type = "success") => {
-    setToast({ message, type });
+  const showToast = (message, type = "success", explorerUrl = null) => {
+    setToast({ message, type, explorerUrl });
     setTimeout(() => setToast(null), 4200);
   };
 
   const xlmBalance = balances.find((b) => b.isNative)?.balance ?? null;
+  const memoField = MEMO_FIELDS[sendForm.memoType];
+  const activeNetwork = NETWORKS[networkId];
+  const friendbotAvailable = isFriendbotAvailable();
+  const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
+  const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
+  const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -47,6 +122,12 @@ export default function App() {
     try {
       const next = await getAccountBalances(publicKey);
       setBalances(next);
+      try {
+        const details = await getAccountDetails(publicKey);
+        setAccountDetails(details);
+      } catch {
+        setAccountDetails(null);
+      }
     } catch {
       setBalances([]);
       showToast("Account not found on Testnet yet. Fund it with Friendbot.", "error");
@@ -80,7 +161,22 @@ export default function App() {
     setPublicKey(null);
     setBalances([]);
     setTransactions([]);
+    setAccountDetails(null);
     showToast("Disconnected.");
+  };
+
+  const handleNetworkChange = (id) => {
+    try {
+      const next = setActiveNetwork(id);
+      setNetworkId(id);
+      setBalances([]);
+      setTransactions([]);
+      setAccountDetails(null);
+      showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
+      if (publicKey) refreshBalances();
+    } catch (e) {
+      showToast(e.message || "Could not switch network.", "error");
+    }
   };
 
   const handleFund = async () => {
@@ -101,15 +197,20 @@ export default function App() {
   const handleTrust = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!trustForm.code || !trustForm.issuer) {
-      return showToast("Asset code and issuer are required.", "error");
+    if (!trustForm.issuer) {
+      return showToast("Issuer is required.", "error");
+    }
+    let code;
+    try {
+      code = validateAssetCode(trustForm.code);
+    } catch (err) {
+      return showToast(err.message, "error");
     }
     setLoading("trust");
-    const code = trustForm.code.toUpperCase();
     try {
       await changeTrustWithFreighter(
         publicKey,
-        trustForm.code,
+        code,
         trustForm.issuer,
         trustForm.limit || "1000000"
       );
@@ -124,26 +225,142 @@ export default function App() {
     }
   };
 
+  const handleRemoveTrust = async (asset) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (parseFloat(asset.balance) > 0) {
+      return showToast(
+        `${asset.code} still holds a balance. Move it to 0 before removing the trustline.`,
+        "error"
+      );
+    }
+
+    setLoading(`remove-${asset.key}`);
+    try {
+      await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
+      const next = await getAccountBalances(publicKey);
+      setBalances(next);
+      showToast(`${asset.code} trustline removed.`);
+    } catch (err) {
+      showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const handleSend = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!sendForm.destination || !sendForm.amount) {
-      return showToast("Destination and amount are required.", "error");
+    if (!sendForm.destination) {
+      return showToast("Destination is required.", "error");
     }
+    let amount;
+    try {
+      amount = validatePaymentAmount(sendForm.amount);
+    } catch (err) {
+      return showToast(err.message, "error");
+    }
+    if (
+      sendForm.memoType === "text" &&
+      new TextEncoder().encode(sendForm.memo).length > 28
+    ) {
+      return showToast("Text memos must be 28 UTF-8 bytes or fewer.", "error");
+    }
+
+    const selected = balances.find((b) => b.key === sendForm.assetKey);
+    if (!selected) {
+      return showToast("Choose an asset you hold a trustline for.", "error");
+    }
+    if (parseFloat(amount) > parseFloat(selected.balance)) {
+      return showToast(
+        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
+        "error"
+      );
+    }
+
+    const asset = selected.isNative
+      ? { isNative: true }
+      : { isNative: false, code: selected.code, issuer: selected.issuer };
+
     setLoading("send");
     try {
       const result = await sendPaymentWithFreighter(
         publicKey,
         sendForm.destination,
-        sendForm.amount,
+        amount,
+        asset,
+        sendForm.memoType,
         sendForm.memo
       );
       const next = await getAccountBalances(publicKey);
       setBalances(next);
-      setSendForm({ destination: "", amount: "", memo: "" });
-      showToast(`Payment submitted · ${result.hash.slice(0, 12)}…`);
+      setSendForm({
+        destination: "",
+        amount: "",
+        assetKey: "native",
+        memoType: "text",
+        memo: "",
+      });
+      showToast(
+        `Payment submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
     } catch (err) {
       showToast(err.message || "Payment failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handlePathPayment = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!pathForm.destination || !pathForm.amount || !pathForm.bound) {
+      return showToast("Destination, amount, and slippage bound are required.", "error");
+    }
+    if (pathForm.sendAssetType === "credit" && (!pathForm.sendCode || !pathForm.sendIssuer)) {
+      return showToast("Send asset code and issuer are required.", "error");
+    }
+    if (pathForm.destAssetType === "credit" && (!pathForm.destCode || !pathForm.destIssuer)) {
+      return showToast("Destination asset code and issuer are required.", "error");
+    }
+
+    setLoading("path");
+    setPathResult(null);
+    try {
+      const result = await pathPaymentWithFreighter({
+        publicKey,
+        destination: pathForm.destination,
+        mode: pathForm.mode,
+        sendAsset: {
+          isNative: pathForm.sendAssetType === "native",
+          code: pathForm.sendCode,
+          issuer: pathForm.sendIssuer,
+        },
+        destAsset: {
+          isNative: pathForm.destAssetType === "native",
+          code: pathForm.destCode,
+          issuer: pathForm.destIssuer,
+        },
+        amount: pathForm.amount,
+        destMin: pathForm.mode === "strictSend" ? pathForm.bound : undefined,
+        sendMax: pathForm.mode === "strictReceive" ? pathForm.bound : undefined,
+        path: pathForm.path,
+      });
+
+      setPathResult({
+        hash: result.hash,
+        explorerUrl: explorerTxUrl(result.hash),
+      });
+      try {
+        const next = await getAccountBalances(publicKey);
+        setBalances(next);
+      } catch {
+        /* balance refresh is best-effort */
+      }
+      showToast(`Path payment submitted · ${result.hash.slice(0, 12)}…`);
+    } catch (err) {
+      showToast(err.message || "Path payment failed.", "error");
     } finally {
       setLoading("");
     }
@@ -182,21 +399,140 @@ export default function App() {
     }
   };
 
+  const refreshLabState = useCallback(async () => {
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      setLabState(null);
+      setLabStateError(null);
+      return;
+    }
+    setLoading("labstate");
+    setLabStateError(null);
+    try {
+      const state = await readKitewellState(contractId, publicKey);
+      setLabState(state);
+    } catch (e) {
+      setLabState(null);
+      setLabStateError(
+        e.message || "Could not read the kitewell contract via Soroban RPC."
+      );
+    } finally {
+      setLoading("");
+    }
+  }, [labInfo, publicKey]);
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+    if (!registerForm.name.trim()) {
+      return showToast("Enter a builder name to register.", "error");
+    }
+    setLoading("register");
+    try {
+      const result = await registerBuilderWithFreighter(
+        publicKey,
+        contractId,
+        registerForm.name
+      );
+      setLastRegisterTx(result);
+      setRegisterForm({ name: "" });
+      showToast(
+        result.confirmed
+          ? `Registered on-chain · ${result.hash.slice(0, 12)}…`
+          : `Submitted · ${result.hash.slice(0, 12)}…`,
+        "success"
+      );
+      const state = await readKitewellState(contractId, publicKey);
+      setLabState(state);
+    } catch (err) {
+      showToast(err.message || "Contract invoke failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const activateTab = (tab) => {
+    setActiveTab(tab);
+    if (tab === "History") handleHistory();
+    if (tab === "Lab") {
+      loadLabInfo();
+      refreshLabState();
+    }
+    if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
+      refreshBalances();
+    }
+  };
+
+  const handleTabKeyDown = (event, index) => {
+    let nextIndex;
+
+    if (event.key === "ArrowRight") nextIndex = (index + 1) % TABS.length;
+    else if (event.key === "ArrowLeft") nextIndex = (index - 1 + TABS.length) % TABS.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = TABS.length - 1;
+    else return;
+
+    event.preventDefault();
+    activateTab(TABS[nextIndex]);
+    tabRefs.current[nextIndex]?.focus();
+  };
+
   return (
     <div className="app">
       <div className="aurora" aria-hidden="true" />
 
-      {toast && <div className={`toast toast--${toast.type}`}>{toast.message}</div>}
+      {toast && (
+        <div
+          className={`toast toast--${toast.type}`}
+          role={toast.type === "error" ? "alert" : "status"}
+          aria-live={toast.type === "error" ? "assertive" : "polite"}
+          aria-atomic="true"
+        >
+          <span>{toast.message}</span>
+          {toast.explorerUrl && (
+            <a
+              className="toast__link"
+              href={toast.explorerUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              View on explorer ↗
+            </a>
+          )}
+        </div>
+      )}
 
       <header className="header">
         <div className="header__brand">
           <KitewellMark />
           <div className="header__titles">
             <span className="header__name">Kitewell</span>
-            <span className="header__tag">Stellar Testnet lab</span>
+            <span className="header__tag">Stellar {activeNetwork.label} lab</span>
           </div>
         </div>
-        <span className="badge">Testnet</span>
+        <label className="network" htmlFor="network-select">
+          <span className="eyebrow">Network</span>
+          <select
+            id="network-select"
+            className="input input--compact"
+            value={networkId}
+            onChange={(e) => handleNetworkChange(e.target.value)}
+            aria-label="Stellar network"
+          >
+            {Object.values(NETWORKS).map((network) => (
+              <option key={network.id} value={network.id}>
+                {network.label}
+              </option>
+            ))}
+          </select>
+        </label>
       </header>
 
       <main className="main">
@@ -218,6 +554,7 @@ export default function App() {
                     onClick={refreshBalances}
                     disabled={loading === "balance"}
                     title="Refresh balances"
+                    aria-label="Refresh balances"
                     type="button"
                   >
                     {loading === "balance" ? <Spinner size={14} /> : "↻"}
@@ -226,7 +563,7 @@ export default function App() {
               </div>
               <div className="hero-card__key">
                 <span className="eyebrow">Public key</span>
-                <code>{shorten(publicKey)}</code>
+                <code>{shortenAddress(publicKey)}</code>
                 <button
                   className="icon-btn"
                   type="button"
@@ -234,7 +571,8 @@ export default function App() {
                     navigator.clipboard.writeText(publicKey);
                     showToast("Address copied.");
                   }}
-                  title="Copy"
+                  title="Copy public key"
+                  aria-label="Copy public key"
                 >
                   ⎘
                 </button>
@@ -273,25 +611,40 @@ export default function App() {
           )}
         </section>
 
-        <nav className="tabs" aria-label="Lab sections">
-          {TABS.map((t) => (
-            <button
-              key={t}
-              type="button"
-              className={`tab ${activeTab === t ? "tab--active" : ""}`}
-              onClick={() => {
-                setActiveTab(t);
-                if (t === "History") handleHistory();
-                if (t === "Lab") loadLabInfo();
-                if ((t === "Wallet" || t === "Assets") && publicKey) refreshBalances();
-              }}
-            >
-              {t}
-            </button>
-          ))}
+        <nav className="tabs" aria-label="Lab sections" role="tablist">
+          {TABS.map((t, index) => {
+            const isActive = activeTab === t;
+            const tabId = `tab-${t.toLowerCase()}`;
+
+            return (
+              <button
+                key={t}
+                ref={(element) => {
+                  tabRefs.current[index] = element;
+                }}
+                id={tabId}
+                type="button"
+                role="tab"
+                className={`tab ${isActive ? "tab--active" : ""}`}
+                aria-selected={isActive}
+                aria-controls={`panel-${t.toLowerCase()}`}
+                tabIndex={isActive ? 0 : -1}
+                onClick={() => activateTab(t)}
+                onKeyDown={(event) => handleTabKeyDown(event, index)}
+              >
+                {t}
+              </button>
+            );
+          })}
         </nav>
 
-        <section className="panel">
+        <section
+          className="panel"
+          id={`panel-${activeTab.toLowerCase()}`}
+          role="tabpanel"
+          aria-labelledby={`tab-${activeTab.toLowerCase()}`}
+          tabIndex={0}
+        >
           {activeTab === "Wallet" && (
             <div className="section">
               <h2>Connect wallet</h2>
@@ -335,6 +688,38 @@ export default function App() {
                     <span className="eyebrow">Connected address</span>
                     <code>{publicKey}</code>
                   </div>
+                  {accountDetails && (
+                    <div className="info-box">
+                      <span className="eyebrow">Account metadata</span>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">Sequence</span>
+                          <span className="metadata-value">{accountDetails.sequence}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Subentries</span>
+                          <span className="metadata-value">{accountDetails.subentryCount}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Thresholds</span>
+                          <span className="metadata-value">
+                            {accountDetails.thresholds?.low ? accountDetails.thresholds.low : "—"},
+                            {accountDetails.thresholds?.medium ? accountDetails.thresholds.medium : "—"},
+                            {accountDetails.thresholds?.high ? accountDetails.thresholds.high : "—"}
+                          </span>
+                        </div>
+                      </div>
+                      <a
+                        href={explorerAccountUrl(publicKey)}
+                        className="text-link"
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{ marginTop: 8, display: "inline-block" }}
+                      >
+                        StellarExpert ↗
+                      </a>
+                    </div>
+                  )}
                   <button className="btn btn--secondary" type="button" onClick={handleDisconnect}>
                     Disconnect
                   </button>
@@ -347,8 +732,17 @@ export default function App() {
             <div className="section">
               <h2>Fund with Friendbot</h2>
               <p className="muted">
-                Activate the account on Testnet and receive free XLM. Mainnet is never used.
+                Activate the account and receive free test XLM. Only available on Testnet.
               </p>
+              {!friendbotAvailable && (
+                <div className="info-box info-box--warning">
+                  <span className="eyebrow">Friendbot unavailable</span>
+                  <p className="muted">
+                    Friendbot is disabled on {activeNetwork.label}. Switch to Testnet to fund an
+                    account here, or fund it through a {activeNetwork.label} faucet.
+                  </p>
+                </div>
+              )}
               {publicKey && (
                 <div className="info-box">
                   <span className="eyebrow">Funding address</span>
@@ -359,7 +753,7 @@ export default function App() {
                 className="btn btn--primary"
                 type="button"
                 onClick={handleFund}
-                disabled={loading === "fund" || requireWallet}
+                disabled={loading === "fund" || requireWallet || !friendbotAvailable}
               >
                 {loading === "fund" ? (
                   <>
@@ -376,8 +770,8 @@ export default function App() {
             <div className="section">
               <h2>Balances & trustlines</h2>
               <p className="muted">
-                View holdings and open a trustline with Freighter{" "}
-                <code>signTransaction</code>.
+                View holdings, open a trustline, or remove an empty one with Freighter{" "}
+                <code>signTransaction</code>. Removing sets the limit to 0.
               </p>
 
               {balances.length > 0 ? (
@@ -388,15 +782,34 @@ export default function App() {
                         <strong>{b.code}</strong>
                         {!b.isNative && (
                           <span className="muted balance-row__issuer">
-                            {shorten(b.issuer)}
+                            {shortenAddress(b.issuer)}
                           </span>
                         )}
                       </div>
-                      <span>
-                        {parseFloat(b.balance).toLocaleString(undefined, {
-                          maximumFractionDigits: 7,
-                        })}
-                      </span>
+                      <div className="balance-row__actions">
+                        <span>
+                          {parseFloat(b.balance).toLocaleString(undefined, {
+                            maximumFractionDigits: 7,
+                          })}
+                        </span>
+                        {!b.isNative && (
+                          <button
+                            className="btn btn--secondary btn--sm"
+                            type="button"
+                            onClick={() => handleRemoveTrust(b)}
+                            disabled={loading === `remove-${b.key}`}
+                            title={
+                              parseFloat(b.balance) > 0
+                                ? "Balance must be 0 before removing this trustline"
+                                : `Remove the ${b.code} trustline`
+                            }
+                          >
+                            {loading === `remove-${b.key}`
+                              ? "Removing…"
+                              : "Remove"}
+                          </button>
+                        )}
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -410,8 +823,11 @@ export default function App() {
 
               <form onSubmit={handleTrust} className="form">
                 <h3 className="subhead">Add trustline</h3>
-                <label className="label">Asset code</label>
+                <label className="label" htmlFor="trust-asset-code">
+                  Asset code
+                </label>
                 <input
+                  id="trust-asset-code"
                   className="input"
                   value={trustForm.code}
                   onChange={(e) => setTrustForm({ ...trustForm, code: e.target.value })}
@@ -419,16 +835,22 @@ export default function App() {
                   maxLength={12}
                   required
                 />
-                <label className="label">Issuer</label>
+                <label className="label" htmlFor="trust-issuer">
+                  Issuer
+                </label>
                 <input
+                  id="trust-issuer"
                   className="input"
                   value={trustForm.issuer}
                   onChange={(e) => setTrustForm({ ...trustForm, issuer: e.target.value })}
                   placeholder="G…"
                   required
                 />
-                <label className="label">Limit</label>
+                <label className="label" htmlFor="trust-limit">
+                  Limit
+                </label>
                 <input
+                  id="trust-limit"
                   className="input"
                   type="number"
                   min="0"
@@ -455,13 +877,17 @@ export default function App() {
 
           {activeTab === "Send" && (
             <div className="section">
-              <h2>Send XLM</h2>
+              <h2>Send payment</h2>
               <p className="muted">
-                Builds a payment op, signs in Freighter, then submits to Horizon Testnet.
+                Builds a payment op for XLM or a credit asset you hold, signs in Freighter, then
+                submits to Horizon Testnet.
               </p>
               <form onSubmit={handleSend} className="form">
-                <label className="label">Destination</label>
+                <label className="label" htmlFor="send-destination">
+                  Destination
+                </label>
                 <input
+                  id="send-destination"
                   className="input"
                   type="text"
                   placeholder="G…"
@@ -469,8 +895,32 @@ export default function App() {
                   onChange={(e) => setSendForm({ ...sendForm, destination: e.target.value })}
                   required
                 />
-                <label className="label">Amount (XLM)</label>
+                <label className="label" htmlFor="send-asset">
+                  Asset
+                </label>
+                <select
+                  id="send-asset"
+                  className="input"
+                  value={sendForm.assetKey}
+                  onChange={(e) => setSendForm({ ...sendForm, assetKey: e.target.value })}
+                >
+                  <option value="native">XLM (native)</option>
+                  {balances
+                    .filter((b) => !b.isNative)
+                    .map((b) => (
+                      <option key={b.key} value={b.key}>
+                        {b.code} ·{" "}
+                        {parseFloat(b.balance).toLocaleString(undefined, {
+                          maximumFractionDigits: 4,
+                        })}
+                      </option>
+                    ))}
+                </select>
+                <label className="label" htmlFor="send-amount">
+                  Amount ({selectedSendAsset?.code ?? "XLM"})
+                </label>
                 <input
+                  id="send-amount"
                   className="input"
                   type="number"
                   step="0.0000001"
@@ -480,12 +930,36 @@ export default function App() {
                   onChange={(e) => setSendForm({ ...sendForm, amount: e.target.value })}
                   required
                 />
-                <label className="label">Memo (optional)</label>
+                <label className="label" htmlFor="send-memo-type">
+                  Memo type
+                </label>
+                <select
+                  id="send-memo-type"
+                  className="input"
+                  value={sendForm.memoType}
+                  onChange={(e) =>
+                    setSendForm({
+                      ...sendForm,
+                      memoType: e.target.value,
+                      memo: "",
+                    })
+                  }
+                >
+                  <option value="text">Text</option>
+                  <option value="id">ID</option>
+                  <option value="hash">Hash</option>
+                </select>
+                <label className="label" htmlFor="send-memo">
+                  Memo (optional)
+                </label>
                 <input
+                  id="send-memo"
                   className="input"
                   type="text"
-                  maxLength={28}
-                  placeholder="Up to 28 characters"
+                  maxLength={memoField.maxLength}
+                  pattern={memoField.pattern}
+                  inputMode={memoField.inputMode}
+                  placeholder={memoField.placeholder}
                   value={sendForm.memo}
                   onChange={(e) => setSendForm({ ...sendForm, memo: e.target.value })}
                 />
@@ -503,6 +977,189 @@ export default function App() {
                   )}
                 </button>
               </form>
+            </div>
+          )}
+
+          {activeTab === "Path" && (
+            <div className="section">
+              <h2>Path payment</h2>
+              <p className="muted">
+                Builds a <code>pathPaymentStrictSend</code> /{" "}
+                <code>pathPaymentStrictReceive</code> op, signs it in Freighter, then submits
+                it to Horizon Testnet.
+              </p>
+              <form onSubmit={handlePathPayment} className="form">
+                <label className="label" htmlFor="path-mode">
+                  Mode
+                </label>
+                <select
+                  id="path-mode"
+                  className="input"
+                  value={pathForm.mode}
+                  onChange={(e) => updatePathForm({ mode: e.target.value })}
+                >
+                  <option value="strictSend">Strict send — fix the amount sent</option>
+                  <option value="strictReceive">Strict receive — fix the amount received</option>
+                </select>
+
+                <label className="label" htmlFor="path-destination">
+                  Destination
+                </label>
+                <input
+                  id="path-destination"
+                  className="input"
+                  type="text"
+                  placeholder="G…"
+                  value={pathForm.destination}
+                  onChange={(e) => updatePathForm({ destination: e.target.value })}
+                  required
+                />
+
+                <label className="label" htmlFor="path-send-asset">
+                  Send asset
+                </label>
+                <select
+                  id="path-send-asset"
+                  className="input"
+                  value={pathForm.sendAssetType}
+                  onChange={(e) => updatePathForm({ sendAssetType: e.target.value })}
+                >
+                  <option value="native">XLM (native)</option>
+                  <option value="credit">Credit asset</option>
+                </select>
+                {pathForm.sendAssetType === "credit" && (
+                  <>
+                    <input
+                      className="input"
+                      type="text"
+                      placeholder="Asset code, e.g. USDC"
+                      maxLength={12}
+                      value={pathForm.sendCode}
+                      onChange={(e) => updatePathForm({ sendCode: e.target.value })}
+                      required
+                    />
+                    <input
+                      className="input"
+                      type="text"
+                      placeholder="Send asset issuer G…"
+                      value={pathForm.sendIssuer}
+                      onChange={(e) => updatePathForm({ sendIssuer: e.target.value })}
+                      required
+                    />
+                  </>
+                )}
+
+                <label className="label" htmlFor="path-dest-asset">
+                  Destination asset
+                </label>
+                <select
+                  id="path-dest-asset"
+                  className="input"
+                  value={pathForm.destAssetType}
+                  onChange={(e) => updatePathForm({ destAssetType: e.target.value })}
+                >
+                  <option value="native">XLM (native)</option>
+                  <option value="credit">Credit asset</option>
+                </select>
+                {pathForm.destAssetType === "credit" && (
+                  <>
+                    <input
+                      className="input"
+                      type="text"
+                      placeholder="Asset code, e.g. USDC"
+                      maxLength={12}
+                      value={pathForm.destCode}
+                      onChange={(e) => updatePathForm({ destCode: e.target.value })}
+                      required
+                    />
+                    <input
+                      className="input"
+                      type="text"
+                      placeholder="Destination asset issuer G…"
+                      value={pathForm.destIssuer}
+                      onChange={(e) => updatePathForm({ destIssuer: e.target.value })}
+                      required
+                    />
+                  </>
+                )}
+
+                <label className="label" htmlFor="path-amount">
+                  {pathModeField.amountLabel}
+                </label>
+                <input
+                  id="path-amount"
+                  className="input"
+                  type="number"
+                  step="0.0000001"
+                  min="0.0000001"
+                  placeholder="e.g. 10"
+                  value={pathForm.amount}
+                  onChange={(e) => updatePathForm({ amount: e.target.value })}
+                  required
+                />
+
+                <label className="label" htmlFor="path-bound">
+                  {pathModeField.boundLabel}
+                </label>
+                <input
+                  id="path-bound"
+                  className="input"
+                  type="number"
+                  step="0.0000001"
+                  min="0.0000001"
+                  placeholder="e.g. 9.5"
+                  value={pathForm.bound}
+                  onChange={(e) => updatePathForm({ bound: e.target.value })}
+                  required
+                />
+                <p className="muted">{pathModeField.boundHint}</p>
+
+                <label className="label" htmlFor="path-hops">
+                  Intermediate path (optional)
+                </label>
+                <input
+                  id="path-hops"
+                  className="input"
+                  type="text"
+                  placeholder="CODE:ISSUER, CODE:ISSUER"
+                  value={pathForm.path}
+                  onChange={(e) => updatePathForm({ path: e.target.value })}
+                />
+                <p className="muted">
+                  Leave empty to route through the direct order book. Intermediate hops add a
+                  fixed path to the operation.
+                </p>
+
+                <button
+                  className="btn btn--primary"
+                  type="submit"
+                  disabled={loading === "path" || requireWallet}
+                >
+                  {loading === "path" ? (
+                    <>
+                      <Spinner /> Signing in Freighter…
+                    </>
+                  ) : (
+                    "Sign & submit path payment"
+                  )}
+                </button>
+              </form>
+
+              {pathResult && (
+                <div className="info-box">
+                  <span className="eyebrow">Path payment submitted</span>
+                  <code>{pathResult.hash}</code>
+                  <a
+                    className="text-link"
+                    href={pathResult.explorerUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ marginTop: 6, display: "inline-block" }}
+                  >
+                    View on StellarExpert ↗
+                  </a>
+                </div>
+              )}
             </div>
           )}
 
@@ -558,6 +1215,97 @@ export default function App() {
                       Status: {labInfo.network.contract?.status}
                     </p>
                   </div>
+                  <div className="section__row">
+                    <div className="subhead">On-chain registry</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={refreshLabState}
+                      disabled={loading === "labstate"}
+                    >
+                      {loading === "labstate" ? (
+                        <>
+                          <Spinner /> Reading…
+                        </>
+                      ) : (
+                        "Refresh"
+                      )}
+                    </button>
+                  </div>
+                  {labState ? (
+                    <div className="info-box">
+                      <span className="eyebrow">Contract state</span>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">lab_name</span>
+                          <span className="metadata-value">{labState.labName ?? "—"}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">builder_count</span>
+                          <span className="metadata-value">{labState.builderCount ?? 0}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">get_builder (you)</span>
+                          <span className="metadata-value">
+                            {publicKey ? labState.builder ?? "Not registered" : "Connect to check"}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="muted">
+                      Reads lab_name, builder_count, and get_builder via Soroban RPC.
+                    </p>
+                  )}
+                  {labStateError && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Soroban RPC</span>
+                      <p className="muted">{labStateError}</p>
+                    </div>
+                  )}
+                  <form className="form" onSubmit={handleRegister}>
+                    <label className="label" htmlFor="builder-name">
+                      Builder name
+                    </label>
+                    <input
+                      id="builder-name"
+                      className="input"
+                      maxLength={64}
+                      placeholder="e.g. stellar-alice"
+                      value={registerForm.name}
+                      onChange={(e) =>
+                        setRegisterForm({ ...registerForm, name: e.target.value })
+                      }
+                    />
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "register" || requireWallet}
+                    >
+                      {loading === "register" ? (
+                        <>
+                          <Spinner /> Signing in Freighter…
+                        </>
+                      ) : (
+                        "Sign & register"
+                      )}
+                    </button>
+                    {!publicKey && <p className="muted">Connect Freighter to sign.</p>}
+                  </form>
+                  {lastRegisterTx && (
+                    <div className="info-box">
+                      <span className="eyebrow">Register tx</span>
+                      <code>{lastRegisterTx.hash}</code>
+                      <a
+                        href={explorerTxUrl(lastRegisterTx.hash)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-link"
+                      >
+                        Explorer ↗
+                      </a>
+                    </div>
+                  )}
                 </>
               )}
               {!labInfo && !labError && (
@@ -589,6 +1337,7 @@ export default function App() {
                 <div className="tx-list">
                   {transactions.map((tx) => {
                     const isOutgoing = tx.from === publicKey;
+                    const createdAt = formatCreatedAt(tx.created_at);
                     return (
                       <div
                         key={tx.id}
@@ -602,8 +1351,8 @@ export default function App() {
                         </div>
                         <div className="tx-item__addr muted">
                           {isOutgoing
-                            ? `To ${shorten(tx.to)}`
-                            : `From ${shorten(tx.from)}`}
+                            ? `To ${shortenAddress(tx.to)}`
+                            : `From ${shortenAddress(tx.from)}`}
                         </div>
                         <a
                           href={explorerTxUrl(tx.transaction_hash)}
@@ -613,6 +1362,14 @@ export default function App() {
                         >
                           Explorer ↗
                         </a>
+                        {createdAt && (
+                          <time
+                            className="tx-item__time"
+                            dateTime={tx.created_at}
+                          >
+                            {createdAt}
+                          </time>
+                        )}
                       </div>
                     );
                   })}
@@ -626,7 +1383,7 @@ export default function App() {
       </main>
 
       <footer className="footer">
-        <strong>Kitewell</strong> · Stellar Testnet · Freighter ·{" "}
+        <strong>Kitewell</strong> · Stellar {activeNetwork.label} · Freighter ·{" "}
         <a
           href="https://github.com/Kitewell-lab/Kitewell"
           target="_blank"
@@ -639,9 +1396,11 @@ export default function App() {
   );
 }
 
-function shorten(key) {
-  if (!key || key.length < 12) return key;
-  return `${key.slice(0, 6)}…${key.slice(-6)}`;
+function formatCreatedAt(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString();
 }
 
 function KitewellMark() {
