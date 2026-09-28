@@ -8,13 +8,6 @@ const COUNT: Symbol = symbol_short!("COUNT");
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const PAUSED: Symbol = symbol_short!("PAUSED");
 
-#[contracterror]
-pub enum Error {
-    AlreadyInit = 1,
-    NotAdmin = 2,
-    Paused = 3,
-}
-
 /// Contract errors.
 ///
 /// Pattern chosen: a `#[contracterror]` enum returned as `Result<_, Error>`.
@@ -27,6 +20,9 @@ pub enum Error {
 #[repr(u32)]
 pub enum Error {
     EmptyName = 1,
+    AlreadyInit = 2,
+    NotAdmin = 3,
+    Paused = 4,
 }
 
 #[contract]
@@ -80,6 +76,11 @@ impl Kitewell {
             return Err(Error::EmptyName);
         }
 
+        let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+        if paused {
+            return Err(Error::Paused);
+        }
+
         let key = (LAB, caller.clone());
         let is_new = !env.storage().persistent().has(&key);
         env.storage().persistent().set(&key, &name);
@@ -113,66 +114,6 @@ mod test {
         let id = env.register(Kitewell, ());
         let client = KitewellClient::new(&env, &id);
         assert_eq!(client.lab_name(), String::from_str(&env, "Kitewell"));
-    }
-
-    #[test]
-    fn init_sets_admin() {
-        let env = Env::default();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-
-        assert!(client.try_init(&admin).is_ok());
-    }
-
-    #[test]
-    fn init_fails_if_already_set() {
-        let env = Env::default();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-
-        client.init(&admin);
-        let err = client.try_init(&admin).unwrap();
-        assert_eq!(err, Err(Error::AlreadyInit));
-    }
-
-    #[test]
-    fn set_paused_works_as_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-
-        client.init(&admin);
-        assert!(client.try_set_paused(&admin, &true).is_ok());
-    }
-
-    #[test]
-    fn set_paused_rejects_non_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let other = Address::generate(&env);
-
-        client.init(&admin);
-        let err = client.try_set_paused(&other, &true).unwrap();
-        assert_eq!(err, Err(Error::NotAdmin));
-    }
-
-    #[test]
-    fn set_paused_rejects_before_init() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(Kitewell, ());
-        let client = KitewellClient::new(&env, &id);
-        let admin = Address::generate(&env);
-
-        let err = client.try_set_paused(&admin, &true).unwrap();
-        assert_eq!(err, Err(Error::NotAdmin));
     }
 
     #[test]
@@ -239,5 +180,104 @@ mod test {
             client.get_builder(&a),
             Some(String::from_str(&env, "cem-late"))
         );
+    }
+
+    #[test]
+    fn init_sets_admin() {
+        let env = Env::default();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+
+        assert!(client.try_init(&admin).is_ok());
+    }
+
+    #[test]
+    fn init_fails_if_already_set() {
+        let env = Env::default();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+
+        client.init(&admin);
+        assert_eq!(client.try_init(&admin), Err(Ok(Error::AlreadyInit)));
+    }
+
+    #[test]
+    fn set_paused_works_as_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+
+        client.init(&admin);
+        assert!(client.try_set_paused(&admin, &true).is_ok());
+    }
+
+    #[test]
+    fn set_paused_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+
+        client.init(&admin);
+        assert_eq!(
+            client.try_set_paused(&other, &true),
+            Err(Ok(Error::NotAdmin))
+        );
+    }
+
+    #[test]
+    fn set_paused_rejects_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_paused(&admin, &true),
+            Err(Ok(Error::NotAdmin))
+        );
+    }
+
+    #[test]
+    fn register_rejects_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let a = Address::generate(&env);
+
+        client.init(&admin);
+        client.set_paused(&admin, &true);
+
+        assert_eq!(
+            client.try_register(&a, &String::from_str(&env, "blocked")),
+            Err(Ok(Error::Paused))
+        );
+        assert_eq!(client.builder_count(), 0);
+    }
+
+    #[test]
+    fn register_resumes_after_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let a = Address::generate(&env);
+
+        client.init(&admin);
+        client.set_paused(&admin, &true);
+        client.set_paused(&admin, &false);
+
+        client.register(&a, &String::from_str(&env, "cem"));
+        assert_eq!(client.builder_count(), 1);
     }
 }
