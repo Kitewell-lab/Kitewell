@@ -301,4 +301,25 @@ mod test {
         client.register(&a, &String::from_str(&env, "cem"));
         assert_eq!(client.builder_count(), 1);
     }
+
+    #[test]
+    fn get_builder_unregistered_address_is_none() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let known = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        // Populate the registry so the miss is not just an empty contract.
+        client.register(&known, &String::from_str(&env, "cem"));
+        assert_eq!(
+            client.get_builder(&known),
+            Some(String::from_str(&env, "cem"))
+        );
+
+        // A never-registered address has no entry even alongside real ones.
+        assert_eq!(client.get_builder(&stranger), None);
+        assert_eq!(client.builder_count(), 1);
+    }
 }
