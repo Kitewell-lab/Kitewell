@@ -32,6 +32,36 @@ persistent `(KITEWELL, caller)` entry TTL with `extend_ttl(1000, 5000)` after
 writing the name. Reads never extend TTL, so a long-idle registry can still
 require a write to keep entries live.
 
+## Events
+
+The two state-changing methods each publish exactly one event, so an indexer can
+follow check-ins and pause changes without polling storage. Events are published
+only on success: a call that returns an error (`EmptyName`, `Paused`,
+`NotAdmin`) publishes nothing at all.
+
+| Event | Topics | Data | Published by |
+|-------|--------|------|--------------|
+| `register` | `("register", caller)` | `(name, is_new)` | every successful `register` |
+| `paused` | `("paused",)` | `paused` (`bool`) | every successful `set_paused` |
+
+**`register`** — topics `[Symbol("register"), Address(caller)]`, data
+`[String(name), Bool(is_new)]` (a two-element vector in this order). `caller`
+and `name` are the ones from that call, so on a re-register `name` is the newly
+stored nickname. `is_new` is `true` only when the caller had no stored entry
+before — exactly when `builder_count()` went up. Re-registering publishes the
+same event with `is_new = false`; the event therefore carries everything needed
+to keep a mirror of the registry in sync.
+
+**`paused`** — topics `[Symbol("paused")]` (a single topic, no address), data
+the new flag as a bare `Bool`. It is published for both pausing and unpausing,
+so a sequence of these events is enough to reconstruct the current pause state.
+
+`contracts/kitewell/tests/events.rs` asserts these topics and payloads
+exactly, including that a rejected call publishes nothing. Note that
+`env.events().all()` exposes only the events of the most recent contract
+invocation, which is why each assertion is taken right after the call it
+describes.
+
 ## Build
 
 Requires Rust. Unit tests:
