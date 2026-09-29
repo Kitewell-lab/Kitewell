@@ -6,6 +6,11 @@ On-chain builder check-in for the Kitewell Testnet experience.
 
 | Method | Description |
 |--------|-------------|
+| `init(admin)` | One-time initialiser; stores the admin address |
+| `get_admin()` | Returns the current admin, if initialised |
+| `propose_admin(admin, new_admin)` | Current admin proposes a successor |
+| `accept_admin(new_admin)` | Pending admin accepts and takes over |
+| `set_paused(admin, paused)` | Admin-only pause / unpause toggle |
 | `lab_name()` | Returns `"Kitewell"` |
 | `builder_count()` | Number of unique registered builders |
 | `register(caller, name)` | Auth-gated check-in; stores nickname |
@@ -16,8 +21,9 @@ On-chain builder check-in for the Kitewell Testnet experience.
 **Auth gate.** `register(caller, name)` calls `caller.require_auth()` before it
 touches storage, so every successful check-in must be signed by the `caller`
 address passed in. The read methods (`lab_name`, `builder_count`,
-`get_builder`) are permissionless and need no auth entry. There is no admin or
-pause role — do not assume one exists.
+`get_builder`, `get_admin`) are permissionless and need no auth entry. The
+admin-bearing methods (`init`, `set_paused`, `propose_admin`, `accept_admin`)
+are described below.
 
 **Count on first register.** `builder_count()` is incremented only the first
 time a given `caller` is seen: `register` checks whether the persistent
@@ -31,6 +37,29 @@ TTL. When a new builder is added it extends the instance storage TTL with
 persistent `(KITEWELL, caller)` entry TTL with `extend_ttl(1000, 5000)` after
 writing the name. Reads never extend TTL, so a long-idle registry can still
 require a write to keep entries live.
+
+## Admin transfer (two-step)
+
+`init(admin)` stores the admin once and cannot be called again. To hand control
+to a new address without a single irreversible call, use the two-step flow:
+
+1. **Propose.** The current admin calls
+   `propose_admin(admin, new_admin)`. It requires `admin.require_auth()` and
+   checks the signer against the stored `ADMIN`; on mismatch it returns
+   `NotAdmin` (3). On success `new_admin` is recorded as *pending* and the
+   current admin keeps full control. Proposing again simply overwrites the
+   pending address.
+2. **Accept.** The pending address calls `accept_admin(new_admin)`. It requires
+   `new_admin.require_auth()` and must match the pending address; a different
+   signer returns `NotAdmin` (3). If nothing is pending it returns the new
+   `NoPendingAdmin` (5). On success `new_admin` becomes the live `ADMIN` and the
+   pending slot is cleared.
+
+Because control only moves on the second step, a typo in the proposed address
+leaves the current admin in charge, and the old admin loses admin-only rights
+(such as `set_paused`) the moment the transfer completes. `get_admin()` reads
+the current admin (or `None` before `init`). Multisig admins and timelocks are
+out of scope.
 
 ## Build
 
