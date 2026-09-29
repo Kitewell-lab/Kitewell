@@ -2,17 +2,9 @@ import express from "express";
 import cors from "cors";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { mapBalances } from "./mapBalances.js";
+import { resolveNetwork } from "./networkConfig.js";
 
 const PORT = Number(process.env.PORT) || 8787;
-const HORIZON_URL =
-  process.env.HORIZON_URL || "https://horizon-testnet.stellar.org";
-const NETWORK = process.env.NETWORK || "TESTNET";
-const FRIENDBOT_URL =
-  process.env.FRIENDBOT_URL || "https://friendbot.stellar.org";
-const EXPLORER_BASE =
-  process.env.EXPLORER_BASE || "https://stellar.expert/explorer/testnet";
-const SOROBAN_RPC_URL =
-  process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 
 /** Per-IP rate limiting on /api/* (in-memory, no external store) */
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000;
@@ -20,6 +12,24 @@ const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 60;
 
 /** Optional: set after deploying contracts/kitewell on Testnet */
 const KITEWELL_CONTRACT_ID = process.env.KITEWELL_CONTRACT_ID || null;
+
+/** Network config comes from NETWORK + explicit URL overrides; unknown = fatal */
+let networkConfig;
+try {
+  networkConfig = resolveNetwork(process.env);
+} catch (err) {
+  console.error(`Kitewell backend cannot start: ${err.message}`);
+  process.exit(1);
+}
+
+const {
+  network: NETWORK,
+  passphrase: NETWORK_PASSPHRASE,
+  horizonUrl: HORIZON_URL,
+  friendbotUrl: FRIENDBOT_URL,
+  explorerBase: EXPLORER_BASE,
+  sorobanRpcUrl: SOROBAN_RPC_URL,
+} = networkConfig;
 
 const server = new StellarSdk.Horizon.Server(HORIZON_URL);
 const app = express();
@@ -98,7 +108,7 @@ app.get("/api/network", (_req, res) => {
     friendbotUrl: FRIENDBOT_URL,
     explorerBase: EXPLORER_BASE,
     sorobanRpcUrl: SOROBAN_RPC_URL,
-    passphrase: StellarSdk.Networks.TESTNET,
+    passphrase: NETWORK_PASSPHRASE,
     contract: {
       kitewell: KITEWELL_CONTRACT_ID,
       status: KITEWELL_CONTRACT_ID ? "configured" : "not_deployed",
