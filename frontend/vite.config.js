@@ -26,4 +26,7 @@ export default defineConfig({
       "/health": "http://localhost:8787",
     },
   },
+  test: {
+    environment: "node",
+  },
 });
