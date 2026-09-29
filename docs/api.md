@@ -103,6 +103,7 @@ Returns recent payments for an account, newest first.
 | Param | Default | Max | Description |
 |-------|---------|-----|-------------|
 | `limit` | 15 | 50 | Number of payments to return |
+| `cursor` | _(none)_ | — | Paging token to continue from; pass the previous response's `nextCursor` |
 
 **Success — 200**
 
@@ -120,15 +121,25 @@ Returns recent payments for an account, newest first.
       "created_at": "2025-01-15T12:00:00Z",
       "explorerUrl": "https://stellar.expert/explorer/testnet/tx/abc123…"
     }
-  ]
+  ],
+  "nextCursor": "9876543210-0"
 }
 ```
 
 Only records with `type === "payment"` are returned.
+
+**Pagination**
+
+`nextCursor` is the Horizon `paging_token` of the last **raw** record Horizon returned for this page (before non-payment records are filtered out), so nothing is skipped between pages. It is `null` when fewer than `limit` raw records came back, which means this was the last page. Request older payments by passing it straight back:
+
+```
+GET /api/payments/GABC…?limit=15&cursor=9876543210-0
+```
 
 **Errors**
 
 | Status | Body | When |
 |--------|------|------|
 | 400 | `{ "error": "Invalid Stellar public key" }` | Bad address format |
+| 400 | `{ "error": "Invalid cursor" }` | Horizon rejected the `cursor` (HTTP 400) |
 | 502 | `{ "error": "Could not load payments", "detail": "…" }` | Horizon unreachable |

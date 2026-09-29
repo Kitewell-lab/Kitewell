@@ -28,7 +28,7 @@ function testEnv(overrides = {}) {
 function stubHorizon({ account, accountError, payments, paymentsError } = {}) {
   const calls = {
     loadAccount: [],
-    payments: { forAccount: null, limit: null, order: null },
+    payments: { forAccount: null, limit: null, order: null, cursor: null },
   };
 
   return {
@@ -53,9 +53,26 @@ function stubHorizon({ account, accountError, payments, paymentsError } = {}) {
             calls.payments.order = value;
             return builder;
           },
+          cursor(value) {
+            calls.payments.cursor = value;
+            return builder;
+          },
           async call() {
             if (paymentsError) throw paymentsError;
-            return { records: payments ?? [] };
+
+            const all = payments ?? [];
+            let start = 0;
+            if (calls.payments.cursor) {
+              const index = all.findIndex(
+                (p) => p.paging_token === calls.payments.cursor,
+              );
+              // Horizon rejects a cursor it cannot resolve with a 400.
+              if (index === -1) throw horizonError(400, "Bad cursor");
+              start = index + 1;
+            }
+
+            const size = calls.payments.limit ?? 15;
+            return { records: all.slice(start, start + size) };
           },
         };
         return builder;
@@ -298,6 +315,7 @@ test("GET /api/payments/:address filters out non-payment records", async (t) => 
   assert.deepEqual(stub.calls.payments.forAccount, VALID_ADDRESS);
   assert.equal(stub.calls.payments.order, "desc");
   assert.equal(body.records.length, 2);
+  assert.equal(body.nextCursor, null, "a short page is the last page");
   assert.deepEqual(body.records, [
     {
       id: "2",
@@ -349,4 +367,115 @@ test("GET /api/payments/:address returns 502 when Horizon fails", async (t) => {
   assert.equal(status, 502);
   assert.equal(body.error, "Could not load payments");
   assert.equal(body.detail, "Horizon payments request failed");
+});
+
+/** Newest-first raw Horizon payment record, used by the pagination tests. */
+function paymentFixture(id, type = "payment") {
+  return {
+    id,
+    type,
+    paging_token: `token-${id}`,
+    from: "GFROM",
+    to: "GTO",
+    amount: "1.0000000",
+    asset_type: "native",
+    transaction_hash: `hash-${id}`,
+    created_at: `2026-01-0${id}T00:00:00Z`,
+  };
+}
+
+const PAGED_PAYMENTS = [
+  paymentFixture("5"),
+  paymentFixture("4"),
+  paymentFixture("3"),
+  paymentFixture("2"),
+  paymentFixture("1"),
+];
+
+test("GET /api/payments/:address returns a first page with a nextCursor", async (t) => {
+  const { get, stub } = await boot(t, {
+    horizon: stubHorizon({ payments: PAGED_PAYMENTS }),
+  });
+
+  const { status, body } = await get(`/api/payments/${VALID_ADDRESS}?limit=2`);
+
+  assert.equal(status, 200);
+  assert.equal(stub.calls.payments.cursor, null, "no cursor on the first page");
+  assert.deepEqual(
+    body.records.map((r) => r.id),
+    ["5", "4"],
+  );
+  assert.equal(
+    body.nextCursor,
+    "token-4",
+    "cursor is the paging_token of the last raw record",
+  );
+});
+
+test("GET /api/payments/:address forwards the cursor and returns the next page", async (t) => {
+  const { get, stub } = await boot(t, {
+    horizon: stubHorizon({ payments: PAGED_PAYMENTS }),
+  });
+
+  const { status, body } = await get(
+    `/api/payments/${VALID_ADDRESS}?limit=2&cursor=token-4`,
+  );
+
+  assert.equal(status, 200);
+  assert.equal(stub.calls.payments.cursor, "token-4");
+  assert.deepEqual(
+    body.records.map((r) => r.id),
+    ["3", "2"],
+  );
+  assert.equal(body.nextCursor, "token-2");
+});
+
+test("GET /api/payments/:address returns nextCursor null on the last page", async (t) => {
+  const { get, stub } = await boot(t, {
+    horizon: stubHorizon({ payments: PAGED_PAYMENTS }),
+  });
+
+  const { status, body } = await get(
+    `/api/payments/${VALID_ADDRESS}?limit=2&cursor=token-2`,
+  );
+
+  assert.equal(status, 200);
+  assert.equal(stub.calls.payments.cursor, "token-2");
+  assert.deepEqual(
+    body.records.map((r) => r.id),
+    ["1"],
+  );
+  assert.equal(body.nextCursor, null, "a short page ends paging");
+});
+
+test("GET /api/payments/:address pages from the last raw record, not the last payment", async (t) => {
+  // The last raw record of this page is not a payment, so it still has to
+  // drive the cursor — skipping it would drop every record after it.
+  const { get } = await boot(t, {
+    horizon: stubHorizon({
+      payments: [paymentFixture("9"), paymentFixture("8", "create_account")],
+    }),
+  });
+
+  const { status, body } = await get(`/api/payments/${VALID_ADDRESS}?limit=2`);
+
+  assert.equal(status, 200);
+  assert.deepEqual(
+    body.records.map((r) => r.id),
+    ["9"],
+  );
+  assert.equal(body.nextCursor, "token-8");
+});
+
+test("GET /api/payments/:address returns 400 Invalid cursor when Horizon rejects it", async (t) => {
+  const { get } = await boot(t, {
+    horizon: stubHorizon({ payments: PAGED_PAYMENTS }),
+  });
+
+  const { status, body } = await get(
+    `/api/payments/${VALID_ADDRESS}?cursor=not-a-cursor`,
+  );
+
+  assert.equal(status, 400);
+  assert.deepEqual(body, { error: "Invalid cursor" });
 });

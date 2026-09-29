@@ -161,18 +161,23 @@ export function createApp({ horizon, env = process.env } = {}) {
   app.get("/api/payments/:address", async (req, res) => {
     const { address } = req.params;
     const limit = Math.min(Number(req.query.limit) || 15, 50);
+    const cursor = req.query.cursor;
 
     if (!StellarSdk.StrKey.isValidEd25519PublicKey(address)) {
       return res.status(400).json({ error: "Invalid Stellar public key" });
     }
 
     try {
-      const payments = await server
+      let request = server
         .payments()
         .forAccount(address)
         .limit(limit)
-        .order("desc")
-        .call();
+        .order("desc");
+
+      // Paging backwards from the caller's cursor; omit it for the first page.
+      if (cursor) request = request.cursor(cursor);
+
+      const payments = await request.call();
 
       const records = payments.records
         .filter((p) => p.type === "payment")
@@ -188,8 +193,17 @@ export function createApp({ horizon, env = process.env } = {}) {
           explorerUrl: `${EXPLORER_BASE}/tx/${p.transaction_hash}`,
         }));
 
-      res.json({ records });
+      // A full page of raw records means there may be older ones; the cursor
+      // is the last raw record (pre-filter) so nothing is skipped between pages.
+      const lastRaw = payments.records[payments.records.length - 1];
+      const nextCursor =
+        payments.records.length < limit ? null : (lastRaw?.paging_token ?? null);
+
+      res.json({ records, nextCursor });
     } catch (err) {
+      if (err?.response?.status === 400) {
+        return res.status(400).json({ error: "Invalid cursor" });
+      }
       res.status(502).json({
         error: "Could not load payments",
         detail: err?.message,

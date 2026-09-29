@@ -42,11 +42,11 @@ beforeEach(() => {
 });
 
 describe("getTransactions API limit", () => {
-  it("forwards a custom limit to the payments API and returns its result", async () => {
-    const records = [{ id: "p1" }];
-    fetchPaymentsViaApi.mockResolvedValue(records);
+  it("forwards a custom limit to the payments API and returns its page", async () => {
+    const page = { records: [{ id: "p1" }], nextCursor: null };
+    fetchPaymentsViaApi.mockResolvedValue(page);
 
-    await expect(getTransactions("GTEST", 7)).resolves.toBe(records);
-    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 7);
+    await expect(getTransactions("GTEST", 7)).resolves.toBe(page);
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 7, undefined);
   });
 });

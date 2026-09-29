@@ -5,7 +5,7 @@ import { fetchPaymentsViaApi } from "./api";
  * Issue #75: lock the empty payments fallback.
  *
  * When a successful response body has no `records` key,
- * fetchPaymentsViaApi resolves with an empty array instead of throwing.
+ * fetchPaymentsViaApi resolves with an empty page instead of throwing.
  */
 
 afterEach(() => {
@@ -13,7 +13,7 @@ afterEach(() => {
 });
 
 describe("fetchPaymentsViaApi empty fallback", () => {
-  it("resolves to an empty array when records is missing", async () => {
+  it("resolves to an empty page when records is missing", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -22,6 +22,9 @@ describe("fetchPaymentsViaApi empty fallback", () => {
       })
     );
 
-    await expect(fetchPaymentsViaApi("GTEST")).resolves.toEqual([]);
+    await expect(fetchPaymentsViaApi("GTEST")).resolves.toEqual({
+      records: [],
+      nextCursor: null,
+    });
   });
 });
