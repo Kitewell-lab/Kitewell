@@ -3,8 +3,7 @@ import cors from "cors";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { mapBalances } from "./mapBalances.js";
 import { createRateLimiter } from "./rateLimit.js";
-
-const DEFAULT_HORIZON_URL = "https://horizon-testnet.stellar.org";
+import { resolveNetwork } from "./networkConfig.js";
 
 /**
  * Build the Kitewell Express app.
@@ -21,14 +20,14 @@ const DEFAULT_HORIZON_URL = "https://horizon-testnet.stellar.org";
  * @returns {import("express").Express} The configured app (not listening).
  */
 export function createApp({ horizon, env = process.env } = {}) {
-  const HORIZON_URL = env.HORIZON_URL || DEFAULT_HORIZON_URL;
-  const NETWORK = env.NETWORK || "TESTNET";
-  const FRIENDBOT_URL =
-    env.FRIENDBOT_URL || "https://friendbot.stellar.org";
-  const EXPLORER_BASE =
-    env.EXPLORER_BASE || "https://stellar.expert/explorer/testnet";
-  const SOROBAN_RPC_URL =
-    env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
+  const {
+    network: NETWORK,
+    passphrase: NETWORK_PASSPHRASE,
+    horizonUrl: HORIZON_URL,
+    friendbotUrl: FRIENDBOT_URL,
+    explorerBase: EXPLORER_BASE,
+    sorobanRpcUrl: SOROBAN_RPC_URL,
+  } = resolveNetwork(env);
 
   /** Per-IP rate limiting on /api/* (in-memory, no external store) */
   const RATE_LIMIT_WINDOW_MS = Number(env.RATE_LIMIT_WINDOW_MS) || 60_000;
@@ -86,7 +85,7 @@ export function createApp({ horizon, env = process.env } = {}) {
       friendbotUrl: FRIENDBOT_URL,
       explorerBase: EXPLORER_BASE,
       sorobanRpcUrl: SOROBAN_RPC_URL,
-      passphrase: StellarSdk.Networks.TESTNET,
+      passphrase: NETWORK_PASSPHRASE,
       contract: {
         kitewell: KITEWELL_CONTRACT_ID,
         status: KITEWELL_CONTRACT_ID ? "configured" : "not_deployed",
