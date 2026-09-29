@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { mapBalances } from "./mapBalances.js";
+import { createRateLimiter } from "./rateLimit.js";
 
 const DEFAULT_HORIZON_URL = "https://horizon-testnet.stellar.org";
 
@@ -58,46 +59,11 @@ export function createApp({ horizon, env = process.env } = {}) {
     next();
   }
 
-  /** Fixed-window per-IP rate limiter */
-  const ipBuckets = new Map(); // ip -> { count, resetAt }
-
-  function rateLimit(req, res, next) {
-    const key = req.ip || req.socket?.remoteAddress || "unknown";
-    const now = Date.now();
-    let bucket = ipBuckets.get(key);
-    if (!bucket || bucket.resetAt <= now) {
-      bucket = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
-      ipBuckets.set(key, bucket);
-    }
-    bucket.count += 1;
-
-    // Opportunistic cleanup so stale IPs don't grow the map unbounded.
-    if (ipBuckets.size > 5_000) {
-      for (const [k, b] of ipBuckets) {
-        if (b.resetAt <= now) ipBuckets.delete(k);
-      }
-    }
-
-    const remaining = Math.max(0, RATE_LIMIT_MAX - bucket.count);
-    res.setHeader("RateLimit-Limit", String(RATE_LIMIT_MAX));
-    res.setHeader("RateLimit-Remaining", String(remaining));
-    res.setHeader(
-      "RateLimit-Reset",
-      String(Math.ceil((bucket.resetAt - now) / 1000)),
-    );
-
-    if (bucket.count > RATE_LIMIT_MAX) {
-      res.setHeader(
-        "Retry-After",
-        String(Math.ceil((bucket.resetAt - now) / 1000)),
-      );
-      return res.status(429).json({
-        error: "Too many requests",
-        retryAfterMs: bucket.resetAt - now,
-      });
-    }
-    next();
-  }
+  /** Fixed-window per-IP rate limiter (own bucket map per app) */
+  const rateLimit = createRateLimiter({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    max: RATE_LIMIT_MAX,
+  });
 
   app.use(cors({ origin: true }));
   app.use(express.json());
