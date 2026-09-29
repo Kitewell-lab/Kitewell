@@ -62,11 +62,12 @@ describe("getTransactions off Testnet", () => {
       ],
     });
 
-    const records = await getTransactions("GTEST");
+    const { records, nextCursor } = await getTransactions("GTEST");
 
     expect(fetchPaymentsViaApi).not.toHaveBeenCalled();
     expect(paymentsCallMock).toHaveBeenCalledTimes(1);
     expect(records).toHaveLength(1);
     expect(records[0].transaction_hash).toBe("abc");
+    expect(nextCursor).toBeNull();
   });
 });

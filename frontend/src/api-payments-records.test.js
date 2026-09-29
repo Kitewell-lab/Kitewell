@@ -4,8 +4,9 @@ import { fetchPaymentsViaApi } from "./api";
 /**
  * Issue #74: lock the successful payments payload.
  *
- * On an ok response, fetchPaymentsViaApi resolves with `data.records` so the
- * UI receives the backend's payment rows unchanged.
+ * On an ok response, fetchPaymentsViaApi resolves with the backend's page —
+ * `records` plus the `nextCursor` paging token (issue #220) — so the UI
+ * receives the backend's payment rows unchanged.
  */
 
 afterEach(() => {
@@ -22,6 +23,9 @@ describe("fetchPaymentsViaApi records", () => {
       })
     );
 
-    await expect(fetchPaymentsViaApi("GTEST")).resolves.toEqual([{ id: "p1" }]);
+    await expect(fetchPaymentsViaApi("GTEST")).resolves.toEqual({
+      records: [{ id: "p1" }],
+      nextCursor: null,
+    });
   });
 });

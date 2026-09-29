@@ -46,11 +46,12 @@ afterEach(() => {
 });
 
 describe("empty backend transaction history", () => {
-  it("returns an empty list without querying Horizon", async () => {
-    fetchPaymentsViaApi.mockResolvedValue([]);
+  it("returns an empty page without querying Horizon", async () => {
+    const page = { records: [], nextCursor: null };
+    fetchPaymentsViaApi.mockResolvedValue(page);
 
-    await expect(getTransactions("GTEST")).resolves.toEqual([]);
-    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 15);
+    await expect(getTransactions("GTEST")).resolves.toEqual(page);
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 15, undefined);
     expect(paymentsCallMock).not.toHaveBeenCalled();
   });
 });
