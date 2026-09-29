@@ -9,21 +9,29 @@ On-chain builder check-in for the Kitewell Testnet experience.
 | `lab_name()` | Returns `"Kitewell"` |
 | `builder_count()` | Number of unique registered builders |
 | `register(caller, name)` | Auth-gated check-in; stores nickname |
+| `unregister(caller)` | Auth-gated check-out; removes the caller's row |
 | `get_builder(address)` | Lookup nickname |
 
 ## Behavior notes
 
-**Auth gate.** `register(caller, name)` calls `caller.require_auth()` before it
-touches storage, so every successful check-in must be signed by the `caller`
-address passed in. The read methods (`lab_name`, `builder_count`,
-`get_builder`) are permissionless and need no auth entry. There is no admin or
-pause role — do not assume one exists.
+**Auth gate.** `register(caller, name)` and `unregister(caller)` both call
+`caller.require_auth()` before they touch storage, so every check-in and
+check-out must be signed by the `caller` address passed in. The read methods
+(`lab_name`, `builder_count`, `get_builder`) are permissionless and need no
+auth entry.
 
 **Count on first register.** `builder_count()` is incremented only the first
 time a given `caller` is seen: `register` checks whether the persistent
 `(KITEWELL, caller)` entry already exists, writes the nickname, and bumps the
 instance counter only when the entry was missing. Calling `register` again for
 the same address overwrites the stored name without changing the count.
+
+**Count on unregister.** `unregister(caller)` removes the persistent
+`(KITEWELL, caller)` entry and decrements `builder_count()` by one (a
+saturating subtraction, so it can never go below zero). It is rejected with
+`NotRegistered` (`5`) when the caller has no entry, and with `Paused` (`4`)
+while the registry is paused, matching `register`. Because a removed builder is
+no longer counted, a later `register` for the same address counts as new again.
 
 **TTL extend on write.** `register` is the only method that extends storage
 TTL. When a new builder is added it extends the instance storage TTL with
