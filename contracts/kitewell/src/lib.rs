@@ -7,6 +7,7 @@ use soroban_sdk::{
 const LAB: Symbol = symbol_short!("KITEWELL");
 const COUNT: Symbol = symbol_short!("COUNT");
 const ADMIN: Symbol = symbol_short!("ADMIN");
+const PENDING_ADMIN: Symbol = symbol_short!("PENDING");
 const PAUSED: Symbol = symbol_short!("PAUSED");
 
 /// Contract errors.
@@ -24,6 +25,8 @@ pub enum Error {
     AlreadyInit = 2,
     NotAdmin = 3,
     Paused = 4,
+    NoPendingAdmin = 5,
+    NotRegistered = 6,
 }
 
 /// Emitted by every successful `register`.
@@ -60,6 +63,55 @@ impl Kitewell {
         }
         env.storage().instance().set(&ADMIN, &admin);
         Ok(())
+    }
+
+    /// Propose a successor admin. Current admin only.
+    ///
+    /// `admin` must be the stored admin and must sign the call. The successor
+    /// is recorded as *pending* only — it gains no rights until it calls
+    /// `accept_admin`, so a mistaken proposal never moves control on its own.
+    /// Proposing again overwrites any earlier pending admin.
+    pub fn propose_admin(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(Error::NotAdmin)?;
+        if admin != stored {
+            return Err(Error::NotAdmin);
+        }
+        env.storage().instance().set(&PENDING_ADMIN, &new_admin);
+        Ok(())
+    }
+
+    /// Accept a pending admin transfer. Must be called by the pending admin.
+    ///
+    /// The caller signs the call and must equal the address stored by
+    /// `propose_admin`; on success it becomes the live admin and the pending
+    /// slot is cleared.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN)
+            .ok_or(Error::NoPendingAdmin)?;
+        if new_admin != pending {
+            return Err(Error::NotAdmin);
+        }
+        env.storage().instance().set(&ADMIN, &new_admin);
+        env.storage().instance().remove(&PENDING_ADMIN);
+        Ok(())
+    }
+
+    /// Read the current admin, if `init` has run.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&ADMIN)
     }
 
     /// Admin-only pause / unpause toggle.
@@ -137,6 +189,35 @@ impl Kitewell {
             is_new,
         }
         .publish(&env);
+
+        Ok(())
+    }
+
+    /// Remove the caller's own check-in.
+    ///
+    /// Auth-gated to `caller`, and blocked while paused just like `register`.
+    /// Rejects an address that has no entry with `NotRegistered`, so the count
+    /// can never be decremented for a builder that was never counted. The
+    /// stored nickname is removed and `COUNT` goes down by one; re-registering
+    /// later therefore counts as a brand new builder again.
+    pub fn unregister(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+
+        let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+        if paused {
+            return Err(Error::Paused);
+        }
+
+        let key = (LAB, caller.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotRegistered);
+        }
+        env.storage().persistent().remove(&key);
+
+        // `COUNT` is only bumped together with a stored entry, so it is at
+        // least 1 here; saturating_sub keeps the never-below-zero invariant.
+        let count: u32 = env.storage().instance().get(&COUNT).unwrap_or(0);
+        env.storage().instance().set(&COUNT, &count.saturating_sub(1));
 
         Ok(())
     }
