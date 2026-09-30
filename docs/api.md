@@ -44,6 +44,46 @@ Returns network configuration and contract status.
 
 `contract.status` is `"configured"` when `KITEWELL_CONTRACT_ID` is set.
 
+Every other field is derived from `NETWORK` — see [Network configuration](#network-configuration). The same endpoint with `NETWORK=FUTURENET`:
+
+```json
+{
+  "network": "FUTURENET",
+  "horizonUrl": "https://horizon-futurenet.stellar.org",
+  "friendbotUrl": null,
+  "explorerBase": "https://stellar.expert/explorer/futurenet",
+  "sorobanRpcUrl": "https://rpc-futurenet.stellar.org",
+  "passphrase": "Test SDF Future Network ; October 2022",
+  "contract": {
+    "kitewell": null,
+    "status": "not_deployed"
+  }
+}
+```
+
+`friendbotUrl` is `null` on Futurenet, which has no Friendbot. Set `FRIENDBOT_URL` on that network to expose one.
+
+---
+
+## Network configuration
+
+`NETWORK` selects a preset; the passphrase and every URL follow it, so `/health` and `/api/network` can never report a passphrase that belongs to a different network than the URLs they return.
+
+| `NETWORK` | `passphrase` | `horizonUrl` | `friendbotUrl` | `explorerBase` | `sorobanRpcUrl` |
+|-----------|--------------|--------------|----------------|----------------|-----------------|
+| `TESTNET` (default) | Test SDF Network ; September 2015 | `https://horizon-testnet.stellar.org` | `https://friendbot.stellar.org` | `https://stellar.expert/explorer/testnet` | `https://soroban-testnet.stellar.org` |
+| `FUTURENET` | Test SDF Future Network ; October 2022 | `https://horizon-futurenet.stellar.org` | `null` | `https://stellar.expert/explorer/futurenet` | `https://rpc-futurenet.stellar.org` |
+
+- `NETWORK` is case-insensitive, and blank or unset means `TESTNET`.
+- An unsupported value aborts startup rather than silently serving Testnet:
+
+  ```text
+  Kitewell backend cannot start: Unsupported NETWORK "MAINNET". Supported networks: TESTNET, FUTURENET.
+  ```
+
+- `HORIZON_URL`, `FRIENDBOT_URL`, `EXPLORER_BASE`, and `SOROBAN_RPC_URL` each override the selected network's default. Blank values are ignored, so an empty variable cannot blank out a URL.
+- Resolution lives in `backend/src/networkConfig.js` (`resolveNetwork(env)`); see `backend/.env.example` for the variables.
+
 ---
 
 ## GET /api/account/:address
