@@ -1,14 +1,12 @@
-import { describe, it, expect } from "vitest";
-import * as StellarSdk from "@stellar/stellar-sdk";
-import { buildAsset } from "./stellar.js";
+import { describe, expect, it } from "vitest";
+import { buildAsset } from "./stellar";
 
-const VALID_ISSUER =
-  "GBQNCSSNKIXG77WHAYYPYV4JG7CB4SNLMZ26WV63MNJPNN3IP72LTZTA";
+const ISSUER = "GBQNCSSNKIXG77WHAYYPYV4JG7CB4SNLMZ26WV63MNJPNN3IP72LTZTA";
 
-describe("buildAsset — blank credit-asset code", () => {
-  it("throws for whitespace-only code", () => {
-    expect(() => buildAsset({ isNative: false, code: " ", issuer: VALID_ISSUER })).toThrow(
-      "Asset code is required for a credit asset."
-    );
+describe("buildAsset whitespace code", () => {
+  it("rejects a whitespace-only code as missing", () => {
+    expect(() =>
+      buildAsset({ isNative: false, code: "   ", issuer: ISSUER })
+    ).toThrow("Asset code is required for a credit asset.");
   });
 });
