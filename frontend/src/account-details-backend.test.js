@@ -32,8 +32,8 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   };
 });
 
-const { fetchPaymentsViaApi } = await import("./api");
-const { getTransactions } = await import("./stellar");
+const { fetchAccountViaApi } = await import("./api");
+const { getAccountDetails } = await import("./stellar");
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -41,12 +41,13 @@ beforeEach(() => {
   paymentsCallMock.mockReset();
 });
 
-describe("getTransactions API limit", () => {
-  it("forwards a custom limit to the payments API and returns its page", async () => {
-    const page = { records: [{ id: "p1" }], nextCursor: null };
-    fetchPaymentsViaApi.mockResolvedValue(page);
+describe("getAccountDetails backend success", () => {
+  it("returns the backend payload unchanged without calling Horizon", async () => {
+    const payload = { id: "GTEST", sequence: "9", custom: true };
+    fetchAccountViaApi.mockResolvedValue(payload);
 
-    await expect(getTransactions("GTEST", 7)).resolves.toBe(page);
-    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 7, undefined);
+    await expect(getAccountDetails("GTEST")).resolves.toBe(payload);
+    expect(fetchAccountViaApi).toHaveBeenCalledWith("GTEST");
+    expect(loadAccountMock).not.toHaveBeenCalled();
   });
 });

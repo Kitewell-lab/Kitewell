@@ -160,10 +160,20 @@ export async function getBalance(publicKey) {
   return xlm ? xlm.balance : "0";
 }
 
-export async function getTransactions(publicKey, limit = 15) {
+/**
+ * Load one page of payment history.
+ *
+ * @param {string} publicKey Account to page through.
+ * @param {number} [limit] Page size; Horizon caps it at 50 server-side.
+ * @param {string} [cursor] `nextCursor` from the previous page; omit for the
+ *   first page.
+ * @returns {Promise<{ records: object[], nextCursor: string|null }>} The
+ *   mapped records plus the cursor for the next page (null on the last page).
+ */
+export async function getTransactions(publicKey, limit = 15, cursor) {
   if (backendIsUsable()) {
     try {
-      return await fetchPaymentsViaApi(publicKey, limit);
+      return await fetchPaymentsViaApi(publicKey, limit, cursor);
     } catch {
       /* fall back to direct Horizon */
     }
@@ -176,16 +186,20 @@ export async function getTransactions(publicKey, limit = 15) {
     .order("desc")
     .call();
 
-  return payments.records
-    .filter((p) => p.type === "payment")
-    .map((p) => ({
-      id: p.id,
-      from: p.from,
-      to: p.to,
-      amount: p.amount,
-      asset_type: p.asset_type,
-      asset_code: p.asset_code || "XLM",
-      transaction_hash: p.transaction_hash,
-      created_at: p.created_at,
-    }));
+  return {
+    records: payments.records
+      .filter((p) => p.type === "payment")
+      .map((p) => ({
+        id: p.id,
+        from: p.from,
+        to: p.to,
+        amount: p.amount,
+        asset_type: p.asset_type,
+        asset_code: p.asset_code || "XLM",
+        transaction_hash: p.transaction_hash,
+        created_at: p.created_at,
+      })),
+    // Paging straight off Horizon is out of scope, so this path is the last page.
+    nextCursor: null,
+  };
 }
