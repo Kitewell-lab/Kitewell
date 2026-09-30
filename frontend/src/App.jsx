@@ -66,6 +66,7 @@ export default function App() {
   const [freighterInstalled, setFreighterInstalled] = useState(null);
   const [balances, setBalances] = useState([]);
   const [transactions, setTransactions] = useState([]);
+  const [nextCursor, setNextCursor] = useState(null);
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
   const [sendForm, setSendForm] = useState({
@@ -370,11 +371,27 @@ export default function App() {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     setLoading("history");
     try {
-      const txs = await getTransactions(publicKey);
-      setTransactions(txs);
-      if (txs.length === 0) showToast("No payments yet.", "info");
+      const page = await getTransactions(publicKey);
+      setTransactions(page.records);
+      setNextCursor(page.nextCursor);
+      if (page.records.length === 0) showToast("No payments yet.", "info");
     } catch {
       showToast("Could not load payment history.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleLoadMore = async () => {
+    if (!publicKey || !nextCursor) return;
+    setLoading("history-more");
+    try {
+      // Same page size as the first page; `undefined` keeps the default limit.
+      const page = await getTransactions(publicKey, undefined, nextCursor);
+      setTransactions((previous) => [...previous, ...page.records]);
+      setNextCursor(page.nextCursor);
+    } catch {
+      showToast("Could not load older payments.", "error");
     } finally {
       setLoading("");
     }
@@ -1376,6 +1393,24 @@ export default function App() {
                 </div>
               ) : (
                 !loading && <p className="muted">No payments yet.</p>
+              )}
+              {nextCursor && (
+                <div className="section__row">
+                  <button
+                    className="btn btn--secondary"
+                    type="button"
+                    onClick={handleLoadMore}
+                    disabled={loading === "history-more"}
+                  >
+                    {loading === "history-more" ? (
+                      <>
+                        <Spinner /> Loading…
+                      </>
+                    ) : (
+                      "Load more"
+                    )}
+                  </button>
+                </div>
               )}
             </div>
           )}

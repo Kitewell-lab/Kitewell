@@ -62,18 +62,21 @@ describe("Horizon transaction asset mapping", () => {
       ],
     });
 
-    await expect(getTransactions("GTEST")).resolves.toEqual([
-      {
-        id: "p1",
-        from: "GALICE",
-        to: "GTEST",
-        amount: "1.0000000",
-        asset_type: "credit_alphanum4",
-        asset_code: "USDC",
-        transaction_hash: "h1",
-        created_at: "2026-01-01T00:00:00Z",
-      },
-    ]);
+    await expect(getTransactions("GTEST")).resolves.toEqual({
+      records: [
+        {
+          id: "p1",
+          from: "GALICE",
+          to: "GTEST",
+          amount: "1.0000000",
+          asset_type: "credit_alphanum4",
+          asset_code: "USDC",
+          transaction_hash: "h1",
+          created_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+      nextCursor: null,
+    });
     expect(paymentsCallMock).toHaveBeenCalledTimes(1);
   });
 });

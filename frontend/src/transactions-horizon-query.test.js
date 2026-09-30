@@ -46,7 +46,10 @@ describe("getTransactions Horizon query", () => {
     fetchPaymentsViaApi.mockRejectedValue(new Error("backend down"));
     paymentsCallMock.mockResolvedValue({ records: [] });
 
-    await expect(getTransactions("GTEST", 4)).resolves.toEqual([]);
+    await expect(getTransactions("GTEST", 4)).resolves.toEqual({
+      records: [],
+      nextCursor: null,
+    });
 
     expect(forAccountMock).toHaveBeenCalledWith("GTEST");
     expect(limitMock).toHaveBeenCalledWith(4);

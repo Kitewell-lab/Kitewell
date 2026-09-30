@@ -28,7 +28,7 @@ export function mapBalance(balance) {
     code: balance.asset_code,
     issuer: balance.asset_issuer,
     balance: balance.balance,
-    limit: balance.limit,
+    limit: balance.limit ?? null,
     isNative: false,
   };
 }
