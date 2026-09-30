@@ -1,9 +1,8 @@
-import { describe, it, expect } from "vitest";
-import * as StellarSdk from "@stellar/stellar-sdk";
-import { buildAsset } from "./stellar.js";
+import { describe, expect, it } from "vitest";
+import { buildAsset } from "./stellar";
 
-describe("buildAsset — native descriptor ignores credit fields", () => {
-  it("returns native asset without validating code or issuer", () => {
+describe("buildAsset native short-circuit", () => {
+  it("returns native XLM and ignores the credit fields", () => {
     const asset = buildAsset({ isNative: true, code: "", issuer: "not-a-key" });
     expect(asset.isNative()).toBe(true);
   });
