@@ -19,11 +19,14 @@ export async function fetchAccountViaApi(publicKey) {
   return data;
 }
 
-export async function fetchPaymentsViaApi(publicKey, limit = 15) {
+export async function fetchPaymentsViaApi(publicKey, limit = 15, cursor) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+
   const res = await fetch(
-    `${API_BASE}/api/payments/${publicKey}?limit=${limit}`
+    `${API_BASE}/api/payments/${publicKey}?${params.toString()}`
   );
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Payments fetch failed");
-  return data.records || [];
+  return { records: data.records || [], nextCursor: data.nextCursor ?? null };
 }

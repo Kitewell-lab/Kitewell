@@ -79,3 +79,15 @@ test("mapBalances tolerates empty and malformed input", () => {
   assert.equal(result.length, 1);
   assert.equal(result[0].key, "native");
 });
+
+test("mapBalance stores a missing credit limit as null", () => {
+  const result = mapBalance({
+    asset_type: "credit_alphanum4",
+    asset_code: "USDC",
+    asset_issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+    balance: "1.0000000",
+  });
+
+  assert.equal(result.limit, null);
+  assert.equal(result.code, "USDC");
+});
