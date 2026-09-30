@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, symbol_short, Address, Env, String, Symbol,
+    contract, contracterror, contractevent, contractimpl, symbol_short, Address, Env, String,
+    Symbol,
 };
 
 const LAB: Symbol = symbol_short!("KITEWELL");
@@ -26,6 +27,28 @@ pub enum Error {
     Paused = 4,
     NoPendingAdmin = 5,
     NotRegistered = 6,
+}
+
+/// Emitted by every successful `register`.
+///
+/// Topics: `("register", caller)`, data: `(name, is_new)` — `is_new` is true
+/// only for the caller's first check-in, so an indexer can follow the builder
+/// count without re-reading state.
+#[contractevent(topics = ["register"], data_format = "vec")]
+pub struct Register {
+    #[topic]
+    pub caller: Address,
+    pub name: String,
+    pub is_new: bool,
+}
+
+/// Emitted by every successful `set_paused`.
+///
+/// Topics: `("paused",)`, data: the new pause flag, so both pausing and
+/// unpausing are visible off-chain.
+#[contractevent(topics = ["paused"], data_format = "single-value")]
+pub struct Paused {
+    pub paused: bool,
 }
 
 #[contract]
@@ -92,6 +115,9 @@ impl Kitewell {
     }
 
     /// Admin-only pause / unpause toggle.
+    ///
+    /// On success it publishes the `paused` event: topic `("paused",)`, data
+    /// the new `paused` flag. A rejected caller publishes nothing.
     pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
         admin.require_auth();
         let stored: Address = env
@@ -103,6 +129,12 @@ impl Kitewell {
             return Err(Error::NotAdmin);
         }
         env.storage().instance().set(&PAUSED, &paused);
+
+        // Off-chain observers (indexers, the Lab tab) follow pause changes
+        // through this event. Published after the write and after every check,
+        // so a rejected caller announces nothing.
+        Paused { paused }.publish(&env);
+
         Ok(())
     }
 
@@ -119,6 +151,10 @@ impl Kitewell {
     /// Check in a builder nickname for `caller`. Overwrites previous name.
     ///
     /// Rejects an empty nickname, so a stored builder always has a name.
+    ///
+    /// On success it publishes the `register` event: topics
+    /// `("register", caller)`, data `(name, is_new)` where `is_new` is true
+    /// only when this was the caller's first check-in.
     pub fn register(env: Env, caller: Address, name: String) -> Result<(), Error> {
         caller.require_auth();
 
@@ -144,6 +180,15 @@ impl Kitewell {
         }
 
         env.storage().persistent().extend_ttl(&key, 1000, 5000);
+
+        // Emitted only after every check passed and storage was written, so a
+        // rejected check-in (empty name, paused) publishes nothing.
+        Register {
+            caller: caller.clone(),
+            name,
+            is_new,
+        }
+        .publish(&env);
 
         Ok(())
     }
