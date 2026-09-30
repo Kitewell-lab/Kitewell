@@ -25,6 +25,7 @@ pub enum Error {
     NotAdmin = 3,
     Paused = 4,
     NoPendingAdmin = 5,
+    NotRegistered = 6,
 }
 
 #[contract]
@@ -143,6 +144,35 @@ impl Kitewell {
         }
 
         env.storage().persistent().extend_ttl(&key, 1000, 5000);
+
+        Ok(())
+    }
+
+    /// Remove the caller's own check-in.
+    ///
+    /// Auth-gated to `caller`, and blocked while paused just like `register`.
+    /// Rejects an address that has no entry with `NotRegistered`, so the count
+    /// can never be decremented for a builder that was never counted. The
+    /// stored nickname is removed and `COUNT` goes down by one; re-registering
+    /// later therefore counts as a brand new builder again.
+    pub fn unregister(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+
+        let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+        if paused {
+            return Err(Error::Paused);
+        }
+
+        let key = (LAB, caller.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotRegistered);
+        }
+        env.storage().persistent().remove(&key);
+
+        // `COUNT` is only bumped together with a stored entry, so it is at
+        // least 1 here; saturating_sub keeps the never-below-zero invariant.
+        let count: u32 = env.storage().instance().get(&COUNT).unwrap_or(0);
+        env.storage().instance().set(&COUNT, &count.saturating_sub(1));
 
         Ok(())
     }
