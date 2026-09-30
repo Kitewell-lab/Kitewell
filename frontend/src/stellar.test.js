@@ -268,7 +268,7 @@ describe("balance mapping", () => {
 });
 
 describe("getTransactions", () => {
-  it("returns backend payment records when the API works", async () => {
+  it("returns the backend payment page when the API works", async () => {
     const records = [
       {
         id: "p1",
@@ -281,10 +281,11 @@ describe("getTransactions", () => {
         created_at: "2026-01-01T00:00:00Z",
       },
     ];
-    fetchPaymentsViaApi.mockResolvedValue(records);
+    const page = { records, nextCursor: "cursor-1" };
+    fetchPaymentsViaApi.mockResolvedValue(page);
 
-    await expect(getTransactions("GTEST")).resolves.toEqual(records);
-    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 15);
+    await expect(getTransactions("GTEST")).resolves.toEqual(page);
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 15, undefined);
   });
 
   it("filters to payments and defaults non-native asset codes to XLM on fallback", async () => {
@@ -305,18 +306,22 @@ describe("getTransactions", () => {
       ],
     });
 
-    await expect(getTransactions("GTEST")).resolves.toEqual([
-      {
-        id: "p1",
-        from: "GALICE",
-        to: "GTEST",
-        amount: "1.0000000",
-        asset_type: "native",
-        asset_code: "XLM",
-        transaction_hash: "h1",
-        created_at: "2026-01-01T00:00:00Z",
-      },
-    ]);
+    await expect(getTransactions("GTEST")).resolves.toEqual({
+      records: [
+        {
+          id: "p1",
+          from: "GALICE",
+          to: "GTEST",
+          amount: "1.0000000",
+          asset_type: "native",
+          asset_code: "XLM",
+          transaction_hash: "h1",
+          created_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+      // Paging straight off Horizon is out of scope, so this path ends here.
+      nextCursor: null,
+    });
     expect(paymentsCallMock).toHaveBeenCalledTimes(1);
   });
 });
