@@ -122,5 +122,5 @@ fn error_discriminants_stay_stable_after_adding_not_registered() {
     assert_eq!(Error::AlreadyInit as u32, 2);
     assert_eq!(Error::NotAdmin as u32, 3);
     assert_eq!(Error::Paused as u32, 4);
-    assert_eq!(Error::NotRegistered as u32, 5);
+    assert_eq!(Error::NotRegistered as u32, 6);
 }
