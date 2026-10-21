@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { buildPathPaymentPayload } from "./pathPaymentQuote";
 
 const DESTINATION = "GDESTINATION12345678901234567890123456789012345678901234";
-const ISSUER = "GAWU5QOHUDUU7OHTZM3SSFZGXM3DEGNTTSPLHHT67WN2UVKCYNERQHEW";
 
 describe("buildPathPaymentPayload - missing required fields", () => {
   const baseState = {

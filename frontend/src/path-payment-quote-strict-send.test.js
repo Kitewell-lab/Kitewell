@@ -4,7 +4,6 @@ import { buildPathPaymentPayload } from "./pathPaymentQuote";
 const DESTINATION = "GDESTINATION12345678901234567890123456789012345678901234";
 const ISSUER_USDC = "GAWU5QOHUDUU7OHTZM3SSFZGXM3DEGNTTSPLHHT67WN2UVKCYNERQHEW";
 const ISSUER_EUR = "GD7FLC7GH76D7A3NWZEGEOWM5GI6EAANS3QVEU4SDB7DCALCEMRWYLCS";
-const ISSUER_OTHER = "GCOT7P7F7B23CYX72EUBUIHSCE272XIDIRQ3X467S4QRAAOGWHJXSJKJ";
 
 describe("buildPathPaymentPayload - strictSend happy path", () => {
   it("builds strictSend payload with native send asset and credit dest asset", () => {
