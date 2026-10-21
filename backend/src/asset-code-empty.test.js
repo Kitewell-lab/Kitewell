@@ -1,0 +1,7 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { isNativeAssetCode, isValidAssetCode } from "./assetCodeValidate.js";
+test("rejects an empty string", () => {
+  assert.equal(isValidAssetCode(""), false);
+});
