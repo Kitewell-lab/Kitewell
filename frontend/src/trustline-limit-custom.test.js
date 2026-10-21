@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatTrustlineLimit, DEFAULT_TRUSTLINE_LIMIT, MAX_TRUSTLINE_LIMIT } from "./trustlineLimitFormat";
+import { formatTrustlineLimit, MAX_TRUSTLINE_LIMIT } from "./trustlineLimitFormat";
 
 describe("formatTrustlineLimit - custom numeric limits", () => {
   it("formats integer string to 7 decimal places", () => {
