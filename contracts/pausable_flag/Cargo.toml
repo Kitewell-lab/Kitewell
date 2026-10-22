@@ -1,0 +1,18 @@
+[package]
+name = "pausable-flag"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Standalone pausable flag primitive — reusable Soroban guard contract"
+
+[lib]
+crate-type = ["rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "28.0.0-rc.2"
+
+[dev-dependencies]
+soroban-sdk = { version = "28.0.0-rc.2", features = ["testutils"] }
+
+[workspace]
