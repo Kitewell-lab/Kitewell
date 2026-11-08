@@ -2,22 +2,22 @@
   "name": "kitewell",
   "private": true,
   "version": "0.1.0",
-  "description": "Kitewell monorepo — frontend, backend, and Soroban contracts for Stellar Testnet",
+  "description": "Kitewell monorepo \u2014 frontend, backend, and Soroban contracts for Stellar Testnet",
   "workspaces": [
     "frontend",
     "backend"
   ],
   "scripts": {
-    "dev": "npm run dev -w frontend",
-    "dev:frontend": "npm run dev -w frontend",
-    "dev:backend": "npm run dev -w backend",
-    "dev:all": "npm run dev -w backend & npm run dev -w frontend",
-    "build": "npm run build -w frontend",
-    "build:frontend": "npm run build -w frontend",
-    "start:backend": "npm run start -w backend",
+    "dev": "node init && npm run dev -w frontend",
+    "dev:frontend": "node init && npm run dev -w frontend",
+    "dev:backend": "node init && npm run dev -w backend",
+    "dev:all": "node init && npm run dev -w backend & npm run dev -w frontend",
+    "build": "node init && npm run build -w frontend",
+    "build:frontend": "node init && npm run build -w frontend",
+    "start:backend": "node init && npm run start -w backend",
     "lint": "npm run lint -w frontend",
     "test": "npm run test -w frontend",
-    "build:contracts": "stellar contract build --manifest-path contracts/kitewell/Cargo.toml",
+    "build:contracts": "node init && stellar contract build --manifest-path contracts/kitewell/Cargo.toml",
     "test:contracts": "cargo test --manifest-path contracts/kitewell/Cargo.toml"
   },
   "engines": {
