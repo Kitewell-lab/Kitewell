@@ -95,6 +95,12 @@ export default function App() {
   const [labError, setLabError] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
+  const [rpcHealth, setRpcHealth] = useState({
+    ok: null,
+    description: "checking",
+    latestLedger: null,
+    error: null,
+  });
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
@@ -175,6 +181,7 @@ export default function App() {
       setAccountDetails(null);
       showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
       if (publicKey) refreshBalances();
+      checkRpc();
     } catch (e) {
       showToast(e.message || "Could not switch network.", "error");
     }
@@ -416,6 +423,29 @@ export default function App() {
     }
   };
 
+  const checkRpc = useCallback(async () => {
+    setRpcHealth((prev) => ({ ...prev, description: "checking" }));
+    try {
+      const result = await checkSorobanRpcHealth();
+      setRpcHealth(result);
+    } catch (error) {
+      setRpcHealth((prev) => ({
+        ...prev,
+        ok: false,
+        description: "unreachable",
+        latestLedger: null,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }, []);
+
+  useEffect(() => {
+    checkRpc();
+    // Recheck whenever the user switches networks: the new Horizon/Soroban RPC
+    // may be up while the old one is down.
+    checkRpc();
+  }, [checkRpc, getActiveNetwork().id]);
+
   const refreshLabState = useCallback(async () => {
     const contractId = labInfo?.network?.contract?.kitewell;
     if (!contractId) {
@@ -423,6 +453,20 @@ export default function App() {
       setLabStateError(null);
       return;
     }
+
+    // The Soroban RPC must be reachable before the Lab tab simulates or
+    // deploys anything. The backend's Horizon requests are intentionally
+    // unaffected: classic payments only need the Horizon server, not the RPC.
+    if (!sorobanRpcReady) {
+      setLabState(null);
+      setLabStateError(
+        sorobanRpcLastError ||
+          `Soroban RPC unreachable (${sorobanRpcDescription}). ` +
+          "Switch networks and refresh to recheck."
+      );
+      return;
+    }
+
     setLoading("labstate");
     setLabStateError(null);
     try {
@@ -436,7 +480,7 @@ export default function App() {
     } finally {
       setLoading("");
     }
-  }, [labInfo, publicKey]);
+  }, [labInfo, publicKey, sorobanRpcLatestLedger, sorobanRpcReady, sorobanRpcLastError]);
 
   const handleRegister = async (e) => {
     e.preventDefault();
@@ -480,6 +524,7 @@ export default function App() {
     if (tab === "History") handleHistory();
     if (tab === "Lab") {
       loadLabInfo();
+      checkRpc();
       refreshLabState();
     }
     if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
@@ -1274,11 +1319,49 @@ export default function App() {
                       Reads lab_name, builder_count, and get_builder via Soroban RPC.
                     </p>
                   )}
-                  {labStateError && (
+                  {labInfo && (
+                    <div className="info-box">
+                      <span className="eyebrow">Soroban RPC</span>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">Status</span>
+                          <span className="metadata-value">
+                            {rpcHealth.ok
+                              ? `reachable · ledger ${rpcHealth.latestLedger ?? "—"}`
+                              : `unreachable · ${rpcHealth.description}`}
+                          </span>
+                        </div>
+                        {rpcHealth.latestLedger !== null && (
+                          <div>
+                            <span className="metadata-label">Latest ledger</span>
+                            <span className="metadata-value">
+                              {rpcHealth.latestLedger}
+                            </span>
+                          </div>
+                        )}
+                        {rpcHealth.error && (
+                          <div>
+                            <span className="metadata-label">Error</span>
+                            <span className="metadata-value">
+                              {rpcHealth.error}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  {!rpcHealth.ok && (
                     <div className="info-box info-box--warning">
                       <span className="eyebrow">Soroban RPC</span>
-                      <p className="muted">{labStateError}</p>
+                      <p className="muted">
+                        Soroban RPC unreachable: {rpcHealth.description}. The Lab
+                        tab cannot simulate or deploy until it is reachable.
+                        Switching networks and refreshing rechecks the RPC.
+                      </p>
                     </div>
+                  )}
+                  {!(labInfo || labError) && (
+                    <p className="muted">Open this tab to probe the backend.</p>
                   )}
                   <form className="form" onSubmit={handleRegister}>
                     <label className="label" htmlFor="builder-name">

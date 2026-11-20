@@ -19,9 +19,92 @@ function currentPassphrase() {
 const MAX_MEMO_TEXT_BYTES = 28;
 const MAX_U64 = 18446744073709551615n;
 
-/** Public Stellar RPC endpoint for Soroban reads + invokes (Testnet). */
+/**
+ * The Soroban RPC server the Lab tab reads and simulates against.
+ * The Lab tab probes this server before enabling any Soroban reads.
+ */
 export const SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
 const sorobanRpc = new StellarSdk.rpc.Server(SOROBAN_RPC_URL);
+
+export const SOROBAN_RPC_HEADERS = {
+  accept: "application/json,"
+};
+
+/**
+ * The Soroban RPC is reachable when a getHealth invocation returns SUCCESS.
+ * Any timeout, network error, or non-SUCCESS status marks it unreachable,
+ * which disables the Lab tab's simulate/deploy paths until it recovers.
+ */
+export let sorobanRpcReady = false;
+export let sorobanRpcDescription = "unknown";
+export let sorobanRpcLatestLedger = null;
+export let sorobanRpcLastError = null;
+
+export async function checkSorobanRpcHealth(timeoutMs = 3000) {
+  // The Soroban RPC must answer getHealth within the timeout before any read,
+  // simulate, or deploy path is enabled. A timeout is unreachable, not a hung
+  // tab, so every failing case here is reported back to the Lab tab.
+  const base = SOROBAN_RPC_URL.replace(/\/$/, "");
+
+  let healthResult = null;
+  let healthStatus = null;
+  let healthError = null;
+
+  try {
+    const healthRes = await fetch(
+      `${base}/rpc/method?request={"method":"getHealth"}`,
+      { headers: SOROBAN_RPC_HEADERS }
+    );
+
+    if (!healthRes.ok) {
+      healthStatus = healthRes.status;
+      throw new Error(`Soroban RPC returned HTTP ${healthRes.status}`);
+    }
+
+    healthResult = await healthRes.json();
+    healthStatus = healthResult.result?.body?.status;
+  } catch (error) {
+    healthStatus = null;
+    healthError = error instanceof Error ? error.message : String(error);
+  }
+
+  sorobanRpcLastError = healthError;
+  sorobanRpcDescription =
+    healthStatus === "SUCCESS"
+      ? "reachable"
+      : healthStatus === "TIMEOUT"
+        ? "timeout"
+        : `unreachable (${healthError || `HTTP ${healthStatus}`})`;
+  sorobanRpcReady = healthStatus === "SUCCESS";
+
+  // Best-effort ledger read for the reachable case. A failure here cannot
+  // demote the RPC: the server already answered getHealth.
+  let latestLedger = null;
+  if (sorobanRpcReady) {
+    try {
+      const ledgerRes = await fetch(
+        `${base}/rpc/method?request={"method":"getLatestLedger"}`,
+        { headers: SOROBAN_RPC_HEADERS }
+      );
+
+      if (ledgerRes.ok) {
+        const ledgerResult = await ledgerRes.json();
+        latestLedger = ledgerResult.result?.body ?? null;
+      }
+    } catch {
+      /* Keep the last-known ledger when the ledger read fails briefly. */
+    }
+  }
+
+  sorobanRpcLatestLedger = latestLedger;
+
+  return {
+    ok: sorobanRpcReady,
+    description: sorobanRpcDescription,
+    latestLedger: sorobanRpcLatestLedger,
+    error: sorobanRpcLastError,
+  };
+}
 
 /** Read-only invokes need a funded-looking source; the zero address works. */
 const ZERO_ADDRESS =
