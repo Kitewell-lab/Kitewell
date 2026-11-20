@@ -7,7 +7,12 @@ import {
   changeTrustWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  submitFailureResult,
 } from "./freighter";
+import {
+  createFailedSubmitLog,
+  downloadFailedSubmitLog,
+} from "./failedSubmitLog";
 import { shortenAddress } from "./addressFormat";
 import {
   fundWithFriendbot,
@@ -99,10 +104,27 @@ export default function App() {
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
+  const [failedSubmits, setFailedSubmits] = useState([]);
+  const failedSubmitLogRef = useRef(createFailedSubmitLog());
 
   const showToast = (message, type = "success", explorerUrl = null) => {
     setToast({ message, type, explorerUrl });
     setTimeout(() => setToast(null), 4200);
+  };
+
+  /** Append a failed submit to the in-memory session list (not localStorage). */
+  const trackFailedSubmit = (operationType, error) => {
+    failedSubmitLogRef.current.record({
+      operationType,
+      network: getActiveNetworkId(),
+      result: submitFailureResult(error),
+    });
+    setFailedSubmits(failedSubmitLogRef.current.list());
+  };
+
+  const handleDownloadFailedSubmits = () => {
+    if (failedSubmits.length === 0) return;
+    downloadFailedSubmitLog(failedSubmitLogRef.current);
   };
 
   const xlmBalance = balances.find((b) => b.isNative)?.balance ?? null;
@@ -159,6 +181,8 @@ export default function App() {
   };
 
   const handleDisconnect = () => {
+    failedSubmitLogRef.current.clear();
+    setFailedSubmits([]);
     setPublicKey(null);
     setBalances([]);
     setTransactions([]);
@@ -220,6 +244,7 @@ export default function App() {
       setTrustForm({ code: "", issuer: "", limit: "1000000" });
       showToast(`Trustline for ${code} submitted.`);
     } catch (err) {
+      trackFailedSubmit("changeTrust", err);
       showToast(err.message || "Change trust failed.", "error");
     } finally {
       setLoading("");
@@ -242,6 +267,7 @@ export default function App() {
       setBalances(next);
       showToast(`${asset.code} trustline removed.`);
     } catch (err) {
+      trackFailedSubmit("changeTrust", err);
       showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
     } finally {
       setLoading("");
@@ -307,6 +333,7 @@ export default function App() {
         explorerTxUrl(result.hash)
       );
     } catch (err) {
+      trackFailedSubmit("payment", err);
       showToast(err.message || "Payment failed.", "error");
     } finally {
       setLoading("");
@@ -361,6 +388,7 @@ export default function App() {
       }
       showToast(`Path payment submitted · ${result.hash.slice(0, 12)}…`);
     } catch (err) {
+      trackFailedSubmit("pathPayment", err);
       showToast(err.message || "Path payment failed.", "error");
     } finally {
       setLoading("");
@@ -469,6 +497,7 @@ export default function App() {
       const state = await readKitewellState(contractId, publicKey);
       setLabState(state);
     } catch (err) {
+      trackFailedSubmit("register", err);
       showToast(err.message || "Contract invoke failed.", "error");
     } finally {
       setLoading("");
@@ -1328,6 +1357,24 @@ export default function App() {
               {!labInfo && !labError && (
                 <p className="muted">Open this tab to probe the backend.</p>
               )}
+              <div className="info-box">
+                <span className="eyebrow">Failed submits</span>
+                <p className="muted">
+                  {failedSubmits.length === 0
+                    ? "No failed submits this session yet."
+                    : `${failedSubmits.length} failed submission${
+                        failedSubmits.length === 1 ? "" : "s"
+                      } this session. Cleared on disconnect or reload — not stored in localStorage.`}
+                </p>
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={handleDownloadFailedSubmits}
+                  disabled={failedSubmits.length === 0}
+                >
+                  Download failed JSON
+                </button>
+              </div>
             </div>
           )}
 

@@ -7,6 +7,19 @@ import {
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
 import { buildAsset, parsePathAssets } from "./stellar";
+import { parseHorizonError } from "./horizonErrorParse";
+import {
+  HORIZON_FAILURE_CODE,
+  freighterCancelledError,
+  horizonFailureError,
+} from "./submitFailure";
+
+export {
+  FREIGHTER_CANCELLED_CODE,
+  HORIZON_FAILURE_CODE,
+  CANCELLED_RESULT,
+  submitFailureResult,
+} from "./submitFailure";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -229,7 +242,8 @@ async function signWithFreighter(unsignedXdr, publicKey) {
   });
 
   if (signResult.error || !signResult.signedTxXdr) {
-    throw new Error(
+    // Tag as cancelled so the failed-submit list does not treat this as Horizon.
+    throw freighterCancelledError(
       signResult.error?.message || "Transaction signing was rejected in Freighter."
     );
   }
@@ -242,7 +256,20 @@ async function signWithFreighter(unsignedXdr, publicKey) {
 
 async function signAndSubmit(transaction, publicKey) {
   const signedTx = await signWithFreighter(transaction.toXDR(), publicKey);
-  return getServer().submitTransaction(signedTx);
+  try {
+    return await getServer().submitTransaction(signedTx);
+  } catch (error) {
+    const body = error?.response?.data;
+    if (body && typeof body === "object") {
+      try {
+        const { reason } = parseHorizonError(body);
+        throw horizonFailureError(reason, error);
+      } catch (maybeWrapped) {
+        if (maybeWrapped?.code === HORIZON_FAILURE_CODE) throw maybeWrapped;
+      }
+    }
+    throw error;
+  }
 }
 
 /**
