@@ -4,10 +4,52 @@ import {
   getActiveNetwork,
   getActiveNetworkId,
   isFriendbotAvailable,
+  NETWORKS,
 } from "./network";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
+}
+
+export async function getLatestLedger(networkId = getActiveNetworkId()) {
+  const network = NETWORKS[networkId];
+  if (!network) {
+    throw new Error(`Unsupported network: ${networkId}`);
+  }
+
+  const response = await new StellarSdk.Horizon.Server(network.horizonUrl)
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const ledger = response.records?.[0];
+  if (!ledger) {
+    throw new Error("Horizon returned no latest ledger.");
+  }
+
+  const sequence = Number(ledger.sequence);
+  const closedAt = Date.parse(ledger.closed_at);
+  const baseFee = String(ledger.base_fee_in_stroops ?? "");
+  const baseReserve = String(ledger.base_reserve_in_stroops ?? "");
+  if (!Number.isSafeInteger(sequence) || sequence < 1) {
+    throw new Error("Latest ledger has an invalid sequence.");
+  }
+  if (!Number.isFinite(closedAt)) {
+    throw new Error("Latest ledger has an invalid close time.");
+  }
+  if (!/^\d+$/.test(baseFee)) {
+    throw new Error("Latest ledger has an invalid base fee.");
+  }
+  if (!/^[1-9]\d*$/.test(baseReserve)) {
+    throw new Error("Latest ledger has an invalid base reserve.");
+  }
+
+  return {
+    sequence,
+    closedAt: new Date(closedAt).toISOString(),
+    baseFeeInStroops: baseFee,
+    baseReserveInStroops: baseReserve,
+  };
 }
 
 /** The Kitewell backend is configured for Testnet, so skip it elsewhere. */

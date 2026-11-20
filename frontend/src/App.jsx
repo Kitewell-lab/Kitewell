@@ -26,6 +26,7 @@ import {
   setActiveNetwork,
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
+import LatestLedgerHeader from "./LatestLedgerHeader";
 import "./App.css";
 
 const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
@@ -550,6 +551,7 @@ export default function App() {
             ))}
           </select>
         </label>
+        <LatestLedgerHeader networkId={networkId} />
       </header>
 
       <main className="main">
