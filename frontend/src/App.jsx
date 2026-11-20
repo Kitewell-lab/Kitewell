@@ -26,9 +26,19 @@ import {
   setActiveNetwork,
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
+import { decodeTransactionEnvelope } from "./txInspector";
 import "./App.css";
 
-const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
+const TABS = [
+  "Wallet",
+  "Fund",
+  "Assets",
+  "Send",
+  "Path",
+  "History",
+  "Inspect",
+  "Lab",
+];
 const PATH_MODE_FIELDS = {
   strictSend: {
     amountLabel: "Amount to send",
@@ -97,6 +107,9 @@ export default function App() {
   const [labStateError, setLabStateError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
+  const [inspectForm, setInspectForm] = useState({ xdr: "" });
+  const [inspectResult, setInspectResult] = useState(null);
+  const [inspectError, setInspectError] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
@@ -173,6 +186,8 @@ export default function App() {
       setBalances([]);
       setTransactions([]);
       setAccountDetails(null);
+      setInspectResult(null);
+      setInspectError(null);
       showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
       if (publicKey) refreshBalances();
     } catch (e) {
@@ -472,6 +487,19 @@ export default function App() {
       showToast(err.message || "Contract invoke failed.", "error");
     } finally {
       setLoading("");
+    }
+  };
+
+  const handleInspect = (event) => {
+    event.preventDefault();
+    setInspectError(null);
+    setInspectResult(null);
+    try {
+      setInspectResult(
+        decodeTransactionEnvelope(inspectForm.xdr, activeNetwork.passphrase)
+      );
+    } catch (e) {
+      setInspectError(e.message || "XDR could not be read.");
     }
   };
 
@@ -1180,6 +1208,50 @@ export default function App() {
             </div>
           )}
 
+          {activeTab === "Inspect" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Inspect transaction</h2>
+              </div>
+              <p className="muted">
+                Paste a base64 transaction envelope to read it before signing. It is
+                decoded locally on {activeNetwork.label}; nothing is submitted.
+              </p>
+              <form className="form" onSubmit={handleInspect}>
+                <label className="label" htmlFor="inspect-xdr">
+                  Transaction envelope (base64 XDR)
+                </label>
+                <textarea
+                  id="inspect-xdr"
+                  className="input"
+                  rows={5}
+                  spellCheck={false}
+                  placeholder="AAAAAgAAAAA..."
+                  value={inspectForm.xdr}
+                  onChange={(e) =>
+                    setInspectForm({ ...inspectForm, xdr: e.target.value })
+                  }
+                />
+                <button className="btn btn--primary" type="submit">
+                  Decode
+                </button>
+              </form>
+              {inspectError && (
+                <div className="info-box info-box--warning" role="alert">
+                  <span className="eyebrow">Could not decode</span>
+                  <p className="muted">{inspectError}</p>
+                </div>
+              )}
+              {inspectResult && <DecodedEnvelope decoded={inspectResult} />}
+              {!inspectResult && !inspectError && (
+                <p className="muted">
+                  The source, fee, sequence, memo, time bounds, and one block per
+                  operation will appear here.
+                </p>
+              )}
+            </div>
+          )}
+
           {activeTab === "Lab" && (
             <div className="section">
               <div className="section__row">
@@ -1428,6 +1500,86 @@ export default function App() {
         </a>
       </footer>
     </div>
+  );
+}
+
+function DecodedEnvelope({ decoded }) {
+  const networkLabel = decoded.network?.label || decoded.network?.passphrase;
+  const transaction = decoded.isFeeBump ? decoded.inner : decoded;
+
+  return (
+    <div className="inspect-result">
+      <div className="info-box">
+        <span className="eyebrow">Decoded on</span>
+        <code>{networkLabel || "Selected network"}</code>
+      </div>
+      {decoded.isFeeBump && (
+        <div className="info-box">
+          <span className="eyebrow">Fee-bump · fee source</span>
+          <code>{decoded.feeSource}</code>
+          <p className="muted" style={{ marginTop: 6 }}>
+            Outer fee: {decoded.fee} stroops
+          </p>
+        </div>
+      )}
+      <div className="subhead">
+        {decoded.isFeeBump ? "Inner transaction" : "Transaction"}
+      </div>
+      <TransactionDetails transaction={transaction} />
+    </div>
+  );
+}
+
+function TransactionDetails({ transaction }) {
+  const memo = transaction.memo
+    ? `${transaction.memo.type}: ${transaction.memo.value}`
+    : "None";
+  const timeBounds = transaction.timeBounds
+    ? `${transaction.timeBounds.minTime} – ${transaction.timeBounds.maxTime}`
+    : "None";
+
+  return (
+    <>
+      <div className="info-box">
+        <div className="metadata-grid">
+          <div>
+            <span className="metadata-label">Source</span>
+            <span className="metadata-value">{transaction.source}</span>
+          </div>
+          <div>
+            <span className="metadata-label">Fee</span>
+            <span className="metadata-value">{transaction.fee} stroops</span>
+          </div>
+          <div>
+            <span className="metadata-label">Sequence</span>
+            <span className="metadata-value">{transaction.sequence}</span>
+          </div>
+          <div>
+            <span className="metadata-label">Memo</span>
+            <span className="metadata-value">{memo}</span>
+          </div>
+          <div>
+            <span className="metadata-label">Time bounds</span>
+            <span className="metadata-value">{timeBounds}</span>
+          </div>
+        </div>
+      </div>
+      {transaction.operations.map((operation) => (
+        <div className="info-box" key={operation.index}>
+          <span className="eyebrow">
+            Operation {operation.index + 1} · {operation.type}
+          </span>
+          <div className="metadata-grid">
+            {operation.fields.map((field) => (
+              <div key={field.key}>
+                <span className="metadata-label">{field.label}</span>
+                <span className="metadata-value">{field.value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </>
   );
 }
 

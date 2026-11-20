@@ -75,7 +75,7 @@ Deploy steps: [contracts/README.md](./contracts/README.md). After deploy, set `K
 npm test
 ```
 
-Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explorer URLs, asset/path parsing, Friendbot funding, balance/payment mapping, backend → Horizon fallback) with mocked Horizon SDK and API calls — CI-friendly, no Freighter wallet or network access required. `frontend/src/path-payment.test.js` covers amount normalization and path-payment operation building. `frontend/src/freighter.test.js` covers the Lab-tab Soroban registry reads and `register` invoke.
+Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explorer URLs, asset/path parsing, Friendbot funding, balance/payment mapping, backend → Horizon fallback) with mocked Horizon SDK and API calls — CI-friendly, no Freighter wallet or network access required. `frontend/src/path-payment.test.js` covers amount normalization and path-payment operation building. `frontend/src/freighter.test.js` covers the Lab-tab Soroban registry reads and `register` invoke. `frontend/src/txInspector.test.js` covers decoding a payment envelope, a truncated XDR, the wrong-network passphrase error, and fee-bump inner transactions.
 
 ## Screenshots
 
@@ -101,6 +101,9 @@ The Testnet lab UI, using the existing assets in [`screenshots/`](./screenshots)
 - Balances + `changeTrust` (open a trustline or remove an empty one)
 - XLM + credit-asset payments (asset picked from balances) + history
 - Path payments (`pathPaymentStrictSend` / `pathPaymentStrictReceive`)
+- Read-only XDR inspector: paste a base64 transaction envelope to review its source, fee,
+  sequence, memo, time bounds, and operations before signing (fee-bump aware). Nothing is
+  submitted.
 - Backend-backed account/payment reads (Horizon fallback)
 - Lab panel for API + contract status
 - Lab tab Soroban registry: Freighter-signed `register(caller, name)` check-in + `lab_name` / `builder_count` / `get_builder` reads
