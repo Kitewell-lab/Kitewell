@@ -7,6 +7,9 @@ import {
   changeTrustWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  readContractTTL,
+  extendInstanceTTL,
+  extendCodeTTL,
 } from "./freighter";
 import { shortenAddress } from "./addressFormat";
 import {
@@ -95,6 +98,8 @@ export default function App() {
   const [labError, setLabError] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
+  const [labTTL, setLabTTL] = useState(null);
+  const [labTTLError, setLabTTLError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
@@ -437,6 +442,72 @@ export default function App() {
       setLoading("");
     }
   }, [labInfo, publicKey]);
+
+  const refreshLabTTL = useCallback(async () => {
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      setLabTTL(null);
+      setLabTTLError(null);
+      return;
+    }
+    setLoading("labttl");
+    setLabTTLError(null);
+    try {
+      const ttlData = await readContractTTL(contractId);
+      setLabTTL(ttlData);
+    } catch (e) {
+      setLabTTL(null);
+      setLabTTLError(e.message || "Could not read contract TTL.");
+    } finally {
+      setLoading("");
+    }
+  }, [labInfo]);
+
+  const handleExtendInstanceTTL = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast("No contract id configured.", "error");
+    }
+    if (!labTTL || !labTTL.currentLedger) {
+      return showToast("Refresh TTL info first.", "error");
+    }
+
+    const extendTo = labTTL.currentLedger + 100000;
+    setLoading("extend-instance");
+    try {
+      const result = await extendInstanceTTL(publicKey, contractId, extendTo);
+      showToast(`Instance TTL extended to ledger ${result.deadline}.`, "success");
+      await refreshLabTTL();
+    } catch (err) {
+      showToast(err.message || "Failed to extend instance TTL.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleExtendCodeTTL = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast("No contract id configured.", "error");
+    }
+    if (!labTTL || !labTTL.wasmHash || !labTTL.currentLedger) {
+      return showToast("Refresh TTL info first.", "error");
+    }
+
+    const extendTo = labTTL.currentLedger + 100000;
+    setLoading("extend-code");
+    try {
+      const result = await extendCodeTTL(publicKey, labTTL.wasmHash, extendTo, labTTL.currentLedger);
+      showToast(`Code TTL extended to ledger ${result.deadline}.`, "success");
+      await refreshLabTTL();
+    } catch (err) {
+      showToast(err.message || "Failed to extend code TTL.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
 
   const handleRegister = async (e) => {
     e.preventDefault();
@@ -1278,6 +1349,91 @@ export default function App() {
                     <div className="info-box info-box--warning">
                       <span className="eyebrow">Soroban RPC</span>
                       <p className="muted">{labStateError}</p>
+                    </div>
+                  )}
+                  <div className="section__row">
+                    <div className="subhead">Contract TTL</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={refreshLabTTL}
+                      disabled={loading === "labttl" || !labInfo.network.contract?.kitewell}
+                    >
+                      {loading === "labttl" ? (
+                        <>
+                          <Spinner /> Reading…
+                        </>
+                      ) : (
+                        "Refresh TTL"
+                      )}
+                    </button>
+                  </div>
+                  {labTTL ? (
+                    <div className="info-box">
+                      <span className="eyebrow">TTL Information</span>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">Current ledger</span>
+                          <span className="metadata-value">{labTTL.currentLedger}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Instance TTL</span>
+                          <span className="metadata-value">
+                            {labTTL.instanceTTL ? `Ledger ${labTTL.instanceTTL}` : "—"}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Code TTL</span>
+                          <span className="metadata-value">
+                            {labTTL.codeTTL ? `Ledger ${labTTL.codeTTL}` : "—"}
+                          </span>
+                        </div>
+                        {labTTL.wasmHash && (
+                          <div>
+                            <span className="metadata-label">Wasm hash</span>
+                            <span className="metadata-value" style={{ fontSize: "0.8em" }}>
+                              {labTTL.wasmHash.slice(0, 16)}...
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+                        <button
+                          className="btn btn--secondary btn--sm"
+                          type="button"
+                          onClick={handleExtendInstanceTTL}
+                          disabled={
+                            loading === "extend-instance" ||
+                            !publicKey ||
+                            !labInfo.network.contract?.kitewell
+                          }
+                        >
+                          {loading === "extend-instance" ? "Extending…" : "Extend instance"}
+                        </button>
+                        <button
+                          className="btn btn--secondary btn--sm"
+                          type="button"
+                          onClick={handleExtendCodeTTL}
+                          disabled={
+                            loading === "extend-code" ||
+                            !publicKey ||
+                            !labInfo.network.contract?.kitewell ||
+                            !labTTL.wasmHash
+                          }
+                        >
+                          {loading === "extend-code" ? "Extending…" : "Extend code"}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="muted">
+                      Reads instance TTL, code TTL, and wasm hash via Soroban RPC.
+                    </p>
+                  )}
+                  {labTTLError && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">TTL Error</span>
+                      <p className="muted">{labTTLError}</p>
                     </div>
                   )}
                   <form className="form" onSubmit={handleRegister}>
