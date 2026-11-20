@@ -7,6 +7,8 @@ import {
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
 import { buildAsset, parsePathAssets } from "./stellar";
+import { parseHorizonError } from "./horizonErrorParse";
+import { formatTrustlineLimit } from "./trustlineLimitFormat";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -427,4 +429,155 @@ export async function changeTrustWithFreighter(
     .build();
 
   return signAndSubmit(transaction, publicKey);
+}
+
+/** Stellar's protocol limit for operations in one transaction. */
+export const MAX_COMPOSED_OPERATIONS = 100;
+
+const MAX_MANAGE_DATA_NAME_BYTES = 64;
+const MAX_MANAGE_DATA_VALUE_BYTES = 64;
+
+function assertComposedEntries(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error("Add at least one operation before signing.");
+  }
+  if (entries.length > MAX_COMPOSED_OPERATIONS) {
+    throw new Error(
+      `A transaction can contain at most ${MAX_COMPOSED_OPERATIONS} operations.`
+    );
+  }
+}
+
+/**
+ * Turn one composer row into an SDK operation.
+ *
+ * Supported types: `payment`, `changeTrust`, and `manageData`. Validation
+ * happens here so the composer can reject a bad row before the wallet opens.
+ */
+export function buildComposedOperation(entry = {}) {
+  if (entry.type === "payment") {
+    if (!StellarSdk.StrKey.isValidEd25519PublicKey(entry.destination)) {
+      throw new Error("Destination must be a valid Stellar public key (G…).");
+    }
+
+    return StellarSdk.Operation.payment({
+      destination: entry.destination,
+      asset: resolvePaymentAsset(entry.asset),
+      amount: normalizeAmount(entry.amount),
+    });
+  }
+
+  if (entry.type === "changeTrust") {
+    const code = String(entry.code ?? "").trim().toUpperCase();
+    if (!code || code.length > 12) {
+      throw new Error("Asset code must be 1–12 characters.");
+    }
+    if (!StellarSdk.StrKey.isValidEd25519PublicKey(entry.issuer)) {
+      throw new Error("Issuer must be a valid Stellar public key (G…).");
+    }
+
+    return StellarSdk.Operation.changeTrust({
+      asset: new StellarSdk.Asset(code, entry.issuer),
+      limit: formatTrustlineLimit(entry.limit).formatted,
+    });
+  }
+
+  if (entry.type === "manageData") {
+    const name = String(entry.name ?? "").trim();
+    if (!name) {
+      throw new Error("Data entry name is required.");
+    }
+    if (new TextEncoder().encode(name).length > MAX_MANAGE_DATA_NAME_BYTES) {
+      throw new Error("Data entry name must be 64 UTF-8 bytes or fewer.");
+    }
+
+    const value = String(entry.value ?? "");
+    if (new TextEncoder().encode(value).length > MAX_MANAGE_DATA_VALUE_BYTES) {
+      throw new Error("Data entry value must be 64 UTF-8 bytes or fewer.");
+    }
+
+    return StellarSdk.Operation.manageData({ name, value });
+  }
+
+  throw new Error(`Unsupported operation type: ${entry.type}`);
+}
+
+/**
+ * Build one transaction containing every composer row, in list order.
+ * The 100-operation protocol cap and per-row validation are enforced here.
+ */
+export function buildComposedTransaction(sourceAccount, entries) {
+  assertComposedEntries(entries);
+
+  const builder = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  });
+
+  for (const entry of entries) {
+    builder.addOperation(buildComposedOperation(entry));
+  }
+
+  return builder.setTimeout(180).build();
+}
+
+function horizonErrorBody(error) {
+  const body = error?.response?.data ?? error?.response;
+  return body && typeof body === "object" ? body : null;
+}
+
+/**
+ * Horizon's zero-based index of the first failed operation in a submit error,
+ * or null when the response does not name one.
+ */
+export function getFailedOperationIndex(error) {
+  const body = horizonErrorBody(error);
+  const codes = body?.extras?.result_codes?.operations;
+  if (!Array.isArray(codes)) return null;
+
+  const index = codes.findIndex((code) => code && code !== "op_success");
+  return index === -1 ? null : index;
+}
+
+function withFailedOperationIndex(error) {
+  const index = getFailedOperationIndex(error);
+  if (index == null) return error;
+
+  const body = horizonErrorBody(error);
+  let reason = "transaction failed";
+  try {
+    reason = parseHorizonError(body).reason;
+  } catch {
+    /* keep the generic reason */
+  }
+
+  const wrapped = new Error(`Operation index ${index} failed: ${reason}`);
+  wrapped.operationIndex = index;
+  wrapped.cause = error;
+  return wrapped;
+}
+
+/**
+ * Sign the whole operation list once in Freighter and submit it to Horizon.
+ * Empty lists and lists over 100 operations are rejected before Freighter is
+ * opened. A failed submit carries `operationIndex` when Horizon names one.
+ */
+export async function submitComposedOperations(publicKey, entries) {
+  assertComposedEntries(entries);
+
+  // Validate every row before touching the wallet or the network.
+  entries.forEach((entry) => buildComposedOperation(entry));
+
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = buildComposedTransaction(sourceAccount, entries);
+
+  try {
+    return await signAndSubmit(transaction, publicKey);
+  } catch (error) {
+    throw withFailedOperationIndex(error);
+  }
 }

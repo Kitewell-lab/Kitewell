@@ -75,7 +75,7 @@ Deploy steps: [contracts/README.md](./contracts/README.md). After deploy, set `K
 npm test
 ```
 
-Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explorer URLs, asset/path parsing, Friendbot funding, balance/payment mapping, backend → Horizon fallback) with mocked Horizon SDK and API calls — CI-friendly, no Freighter wallet or network access required. `frontend/src/path-payment.test.js` covers amount normalization and path-payment operation building. `frontend/src/freighter.test.js` covers the Lab-tab Soroban registry reads and `register` invoke.
+Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explorer URLs, asset/path parsing, Friendbot funding, balance/payment mapping, backend → Horizon fallback) with mocked Horizon SDK and API calls — CI-friendly, no Freighter wallet or network access required. `frontend/src/path-payment.test.js` covers amount normalization and path-payment operation building. `frontend/src/freighter.test.js` covers the Lab-tab Soroban registry reads and `register` invoke. `frontend/src/compose-transaction.test.js` covers ordered multi-operation building, one-signature submission, the empty/over-100 guards, and the Horizon failed-operation index.
 
 ## Screenshots
 
@@ -101,6 +101,8 @@ The Testnet lab UI, using the existing assets in [`screenshots/`](./screenshots)
 - Balances + `changeTrust` (open a trustline or remove an empty one)
 - XLM + credit-asset payments (asset picked from balances) + history
 - Path payments (`pathPaymentStrictSend` / `pathPaymentStrictReceive`)
+- Multi-operation composer: combine payment, change-trust, and manage-data operations,
+  reorder or remove rows, then sign once for one hash (up to 100 operations)
 - Backend-backed account/payment reads (Horizon fallback)
 - Lab panel for API + contract status
 - Lab tab Soroban registry: Freighter-signed `register(caller, name)` check-in + `lab_name` / `builder_count` / `get_builder` reads

@@ -7,6 +7,9 @@ import {
   changeTrustWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  submitComposedOperations,
+  buildComposedOperation,
+  MAX_COMPOSED_OPERATIONS,
 } from "./freighter";
 import { shortenAddress } from "./addressFormat";
 import {
@@ -28,7 +31,16 @@ import {
 import { validateAssetCode } from "./validateAssetCode";
 import "./App.css";
 
-const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
+const TABS = [
+  "Wallet",
+  "Fund",
+  "Assets",
+  "Send",
+  "Path",
+  "History",
+  "Compose",
+  "Lab",
+];
 const PATH_MODE_FIELDS = {
   strictSend: {
     amountLabel: "Amount to send",
@@ -97,6 +109,21 @@ export default function App() {
   const [labStateError, setLabStateError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
+  const [composeForm, setComposeForm] = useState({
+    type: "payment",
+    destination: "",
+    amount: "",
+    assetKey: "native",
+    code: "",
+    issuer: "",
+    limit: "1000000",
+    name: "",
+    value: "",
+  });
+  const [composeOps, setComposeOps] = useState([]);
+  const [composeResult, setComposeResult] = useState(null);
+  const [composeError, setComposeError] = useState(null);
+  const composeId = useRef(0);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
@@ -112,6 +139,7 @@ export default function App() {
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
   const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
+  const selectedComposeAsset = balances.find((b) => b.key === composeForm.assetKey);
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -173,6 +201,8 @@ export default function App() {
       setBalances([]);
       setTransactions([]);
       setAccountDetails(null);
+      setComposeResult(null);
+      setComposeError(null);
       showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
       if (publicKey) refreshBalances();
     } catch (e) {
@@ -470,6 +500,107 @@ export default function App() {
       setLabState(state);
     } catch (err) {
       showToast(err.message || "Contract invoke failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleComposeAdd = (event) => {
+    event.preventDefault();
+    if (composeOps.length >= MAX_COMPOSED_OPERATIONS) {
+      return showToast(
+        `A transaction can contain at most ${MAX_COMPOSED_OPERATIONS} operations.`,
+        "error"
+      );
+    }
+
+    const entry = { type: composeForm.type };
+    if (composeForm.type === "payment") {
+      const selected = balances.find((b) => b.key === composeForm.assetKey);
+      entry.destination = composeForm.destination.trim();
+      entry.amount = composeForm.amount;
+      entry.asset =
+        selected && !selected.isNative
+          ? { isNative: false, code: selected.code, issuer: selected.issuer }
+          : { isNative: true };
+    } else if (composeForm.type === "changeTrust") {
+      entry.code = composeForm.code.trim();
+      entry.issuer = composeForm.issuer.trim();
+      entry.limit = composeForm.limit;
+    } else {
+      entry.name = composeForm.name.trim();
+      entry.value = composeForm.value;
+    }
+
+    try {
+      buildComposedOperation(entry);
+    } catch (err) {
+      return showToast(err.message, "error");
+    }
+
+    composeId.current += 1;
+    setComposeOps((previous) => [...previous, { ...entry, id: composeId.current }]);
+    setComposeForm((previous) => ({
+      ...previous,
+      destination: "",
+      amount: "",
+      code: "",
+      issuer: "",
+      limit: "1000000",
+      name: "",
+      value: "",
+    }));
+    setComposeResult(null);
+    setComposeError(null);
+  };
+
+  const moveComposeOperation = (index, offset) => {
+    setComposeOps((previous) => {
+      const target = index + offset;
+      if (target < 0 || target >= previous.length) return previous;
+      const next = [...previous];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+    setComposeResult(null);
+    setComposeError(null);
+  };
+
+  const removeComposeOperation = (index) => {
+    setComposeOps((previous) => previous.filter((_, i) => i !== index));
+    setComposeResult(null);
+    setComposeError(null);
+  };
+
+  const handleComposeSubmit = async () => {
+    if (composeOps.length === 0) {
+      setComposeError("Add at least one operation before signing.");
+      return;
+    }
+    if (!publicKey) {
+      return showToast("Connect Freighter first.", "error");
+    }
+
+    setLoading("compose");
+    setComposeError(null);
+    setComposeResult(null);
+    try {
+      const result = await submitComposedOperations(publicKey, composeOps);
+      setComposeResult({
+        hash: result.hash,
+        explorerUrl: explorerTxUrl(result.hash),
+      });
+      setComposeOps([]);
+      showToast(`Composed transaction submitted · ${result.hash.slice(0, 12)}…`);
+      try {
+        const next = await getAccountBalances(publicKey);
+        setBalances(next);
+      } catch {
+        /* balance refresh is best-effort */
+      }
+    } catch (err) {
+      setComposeError(err.message || "Composed transaction failed.");
+      showToast(err.message || "Composed transaction failed.", "error");
     } finally {
       setLoading("");
     }
@@ -1180,6 +1311,261 @@ export default function App() {
             </div>
           )}
 
+          {activeTab === "Compose" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Multi-operation composer</h2>
+                <span className="muted">
+                  {composeOps.length} / {MAX_COMPOSED_OPERATIONS}
+                </span>
+              </div>
+              <p className="muted">
+                Add payment, change trust, and manage data operations, reorder them,
+                then sign once. Every operation lands in one transaction with one fee
+                and one hash.
+              </p>
+
+              <form className="form" onSubmit={handleComposeAdd}>
+                <label className="label" htmlFor="compose-type">
+                  Operation type
+                </label>
+                <select
+                  id="compose-type"
+                  className="input"
+                  value={composeForm.type}
+                  onChange={(e) =>
+                    setComposeForm({ ...composeForm, type: e.target.value })
+                  }
+                >
+                  <option value="payment">Payment</option>
+                  <option value="changeTrust">Change trust</option>
+                  <option value="manageData">Manage data</option>
+                </select>
+
+                {composeForm.type === "payment" && (
+                  <>
+                    <label className="label" htmlFor="compose-destination">
+                      Destination
+                    </label>
+                    <input
+                      id="compose-destination"
+                      className="input"
+                      type="text"
+                      placeholder="G…"
+                      value={composeForm.destination}
+                      onChange={(e) =>
+                        setComposeForm({
+                          ...composeForm,
+                          destination: e.target.value,
+                        })
+                      }
+                    />
+                    <label className="label" htmlFor="compose-asset">
+                      Asset
+                    </label>
+                    <select
+                      id="compose-asset"
+                      className="input"
+                      value={composeForm.assetKey}
+                      onChange={(e) =>
+                        setComposeForm({ ...composeForm, assetKey: e.target.value })
+                      }
+                    >
+                      <option value="native">XLM (native)</option>
+                      {balances
+                        .filter((b) => !b.isNative)
+                        .map((b) => (
+                          <option key={b.key} value={b.key}>
+                            {b.code}
+                          </option>
+                        ))}
+                    </select>
+                    <label className="label" htmlFor="compose-amount">
+                      Amount ({selectedComposeAsset?.code ?? "XLM"})
+                    </label>
+                    <input
+                      id="compose-amount"
+                      className="input"
+                      type="number"
+                      step="0.0000001"
+                      min="0.0000001"
+                      placeholder="e.g. 10"
+                      value={composeForm.amount}
+                      onChange={(e) =>
+                        setComposeForm({ ...composeForm, amount: e.target.value })
+                      }
+                    />
+                  </>
+                )}
+
+                {composeForm.type === "changeTrust" && (
+                  <>
+                    <label className="label" htmlFor="compose-code">
+                      Asset code
+                    </label>
+                    <input
+                      id="compose-code"
+                      className="input"
+                      type="text"
+                      maxLength={12}
+                      placeholder="USDC"
+                      value={composeForm.code}
+                      onChange={(e) =>
+                        setComposeForm({ ...composeForm, code: e.target.value })
+                      }
+                    />
+                    <label className="label" htmlFor="compose-issuer">
+                      Issuer
+                    </label>
+                    <input
+                      id="compose-issuer"
+                      className="input"
+                      type="text"
+                      placeholder="G…"
+                      value={composeForm.issuer}
+                      onChange={(e) =>
+                        setComposeForm({ ...composeForm, issuer: e.target.value })
+                      }
+                    />
+                    <label className="label" htmlFor="compose-limit">
+                      Limit
+                    </label>
+                    <input
+                      id="compose-limit"
+                      className="input"
+                      type="text"
+                      placeholder="1000000"
+                      value={composeForm.limit}
+                      onChange={(e) =>
+                        setComposeForm({ ...composeForm, limit: e.target.value })
+                      }
+                    />
+                  </>
+                )}
+
+                {composeForm.type === "manageData" && (
+                  <>
+                    <label className="label" htmlFor="compose-data-name">
+                      Data entry name
+                    </label>
+                    <input
+                      id="compose-data-name"
+                      className="input"
+                      type="text"
+                      placeholder="invoice"
+                      value={composeForm.name}
+                      onChange={(e) =>
+                        setComposeForm({ ...composeForm, name: e.target.value })
+                      }
+                    />
+                    <label className="label" htmlFor="compose-data-value">
+                      Value (optional)
+                    </label>
+                    <input
+                      id="compose-data-value"
+                      className="input"
+                      type="text"
+                      placeholder="Leave empty to delete the entry"
+                      value={composeForm.value}
+                      onChange={(e) =>
+                        setComposeForm({ ...composeForm, value: e.target.value })
+                      }
+                    />
+                  </>
+                )}
+
+                <button className="btn btn--secondary" type="submit">
+                  Add operation
+                </button>
+              </form>
+
+              <div className="subhead">Operations</div>
+              {composeOps.length === 0 ? (
+                <p className="muted">No operations yet. Add one above.</p>
+              ) : (
+                composeOps.map((operation, index) => (
+                  <div className="info-box" key={operation.id}>
+                    <div className="section__row">
+                      <span>
+                        <strong>{index + 1}.</strong>{" "}
+                        {describeComposeOperation(operation)}
+                      </span>
+                      <span>
+                        <button
+                          className="btn btn--secondary"
+                          type="button"
+                          onClick={() => moveComposeOperation(index, -1)}
+                          disabled={index === 0}
+                          aria-label={`Move operation ${index + 1} up`}
+                        >
+                          ↑
+                        </button>{" "}
+                        <button
+                          className="btn btn--secondary"
+                          type="button"
+                          onClick={() => moveComposeOperation(index, 1)}
+                          disabled={index === composeOps.length - 1}
+                          aria-label={`Move operation ${index + 1} down`}
+                        >
+                          ↓
+                        </button>{" "}
+                        <button
+                          className="btn btn--secondary"
+                          type="button"
+                          onClick={() => removeComposeOperation(index)}
+                          aria-label={`Remove operation ${index + 1}`}
+                        >
+                          Remove
+                        </button>
+                      </span>
+                    </div>
+                  </div>
+                ))
+              )}
+
+              <div className="section__row">
+                <button
+                  className="btn btn--primary"
+                  type="button"
+                  onClick={handleComposeSubmit}
+                  disabled={
+                    loading === "compose" ||
+                    composeOps.length === 0 ||
+                    requireWallet
+                  }
+                >
+                  {loading === "compose" ? (
+                    <>
+                      <Spinner /> Signing in Freighter…
+                    </>
+                  ) : (
+                    "Sign & submit all"
+                  )}
+                </button>
+              </div>
+              {composeError && (
+                <div className="info-box info-box--warning" role="alert">
+                  <span className="eyebrow">Composed transaction failed</span>
+                  <p className="muted">{composeError}</p>
+                </div>
+              )}
+              {composeResult && (
+                <div className="info-box">
+                  <span className="eyebrow">Submitted · one transaction</span>
+                  <code>{composeResult.hash}</code>
+                  <a
+                    href={composeResult.explorerUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-link"
+                  >
+                    Explorer ↗
+                  </a>
+                </div>
+              )}
+            </div>
+          )}
+
           {activeTab === "Lab" && (
             <div className="section">
               <div className="section__row">
@@ -1429,6 +1815,24 @@ export default function App() {
       </footer>
     </div>
   );
+}
+
+function describeComposeOperation(operation) {
+  if (operation.type === "payment") {
+    const asset = operation.asset?.isNative
+      ? "XLM"
+      : `${operation.asset?.code}:${shortenAddress(operation.asset?.issuer)}`;
+    return `Payment · ${operation.amount} ${asset} to ${shortenAddress(
+      operation.destination
+    )}`;
+  }
+
+  if (operation.type === "changeTrust") {
+    return `Change trust · ${operation.code} · limit ${operation.limit}`;
+  }
+
+  const value = operation.value ? ` = ${operation.value}` : " (delete)";
+  return `Manage data · ${operation.name}${value}`;
 }
 
 function formatCreatedAt(value) {
