@@ -26,6 +26,7 @@ import {
   setActiveNetwork,
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
+import TransactionFailureNotice from "./TransactionFailureNotice";
 import "./App.css";
 
 const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
@@ -69,6 +70,7 @@ export default function App() {
   const [nextCursor, setNextCursor] = useState(null);
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
+  const [transactionFailure, setTransactionFailure] = useState(null);
   const [sendForm, setSendForm] = useState({
     destination: "",
     amount: "",
@@ -205,8 +207,10 @@ export default function App() {
     try {
       code = validateAssetCode(trustForm.code);
     } catch (err) {
+      setTransactionFailure(null);
       return showToast(err.message, "error");
     }
+    setTransactionFailure(null);
     setLoading("trust");
     try {
       await changeTrustWithFreighter(
@@ -220,6 +224,7 @@ export default function App() {
       setTrustForm({ code: "", issuer: "", limit: "1000000" });
       showToast(`Trustline for ${code} submitted.`);
     } catch (err) {
+      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || "Change trust failed.", "error");
     } finally {
       setLoading("");
@@ -235,6 +240,7 @@ export default function App() {
       );
     }
 
+    setTransactionFailure(null);
     setLoading(`remove-${asset.key}`);
     try {
       await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
@@ -242,6 +248,7 @@ export default function App() {
       setBalances(next);
       showToast(`${asset.code} trustline removed.`);
     } catch (err) {
+      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
     } finally {
       setLoading("");
@@ -282,6 +289,7 @@ export default function App() {
       ? { isNative: true }
       : { isNative: false, code: selected.code, issuer: selected.issuer };
 
+    setTransactionFailure(null);
     setLoading("send");
     try {
       const result = await sendPaymentWithFreighter(
@@ -307,6 +315,7 @@ export default function App() {
         explorerTxUrl(result.hash)
       );
     } catch (err) {
+      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || "Payment failed.", "error");
     } finally {
       setLoading("");
@@ -327,6 +336,7 @@ export default function App() {
     }
 
     setLoading("path");
+    setTransactionFailure(null);
     setPathResult(null);
     try {
       const result = await pathPaymentWithFreighter({
@@ -361,6 +371,7 @@ export default function App() {
       }
       showToast(`Path payment submitted · ${result.hash.slice(0, 12)}…`);
     } catch (err) {
+      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || "Path payment failed.", "error");
     } finally {
       setLoading("");
@@ -452,6 +463,7 @@ export default function App() {
       return showToast("Enter a builder name to register.", "error");
     }
     setLoading("register");
+    setTransactionFailure(null);
     try {
       const result = await registerBuilderWithFreighter(
         publicKey,
@@ -627,6 +639,8 @@ export default function App() {
             </div>
           )}
         </section>
+
+        <TransactionFailureNotice failure={transactionFailure} />
 
         <nav className="tabs" aria-label="Lab sections" role="tablist">
           {TABS.map((t, index) => {
