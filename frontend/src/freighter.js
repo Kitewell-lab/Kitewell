@@ -6,7 +6,12 @@ import {
 } from "@stellar/freighter-api";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
-import { buildAsset, parsePathAssets } from "./stellar";
+import {
+  buildAsset,
+  parsePathAssets,
+  buildSetOptionsBody,
+  MAX_ASSET_CODE_LENGTH,
+} from "./stellar";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -427,4 +432,273 @@ export async function changeTrustWithFreighter(
     .build();
 
   return signAndSubmit(transaction, publicKey);
+}
+
+/**
+ * Update an issuer's home domain and/or auth flags with `setOptions`, signed by
+ * the connected account. Validation (including the immutable confirmation
+ * gate) lives in `buildSetOptionsBody`, so an unsafe combination never reaches
+ * Freighter.
+ */
+export async function setAccountOptionsWithFreighter(publicKey, options = {}) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  const body = buildSetOptionsBody(options);
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(StellarSdk.Operation.setOptions(body))
+    .setTimeout(180)
+    .build();
+
+  return signAndSubmit(transaction, publicKey);
+}
+
+/**
+ * Authorize or revoke one holder's trustline with `allowTrust`.
+ *
+ * The asset issuer is the source account of an allowTrust op, so the connected
+ * account must match `assetIssuer`; otherwise we would be trying to control an
+ * asset somebody else issued.
+ */
+export async function allowTrustWithFreighter(
+  publicKey,
+  { holder, assetCode, assetIssuer, authorize } = {}
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (assetIssuer !== publicKey) {
+    throw new Error("Only the issuer can authorize or revoke this asset.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(holder)) {
+    throw new Error("Holder must be a valid Stellar public key (G…).");
+  }
+
+  const code = (assetCode || "").trim().toUpperCase();
+  if (!code || code.length > MAX_ASSET_CODE_LENGTH) {
+    throw new Error(`Asset code must be 1–${MAX_ASSET_CODE_LENGTH} characters.`);
+  }
+
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.allowTrust({
+        trustor: holder,
+        assetCode: code,
+        authorize: Boolean(authorize),
+      })
+    )
+    .setTimeout(180)
+    .build();
+
+  // Deliberately do not pre-check the holder's balance: if a revoke is invalid
+  // (e.g. the trustline still holds a balance), Horizon's error is surfaced.
+  return signAndSubmit(transaction, publicKey);
+}
+
+/**
+ * Read the configured contract instance's TTL from Soroban RPC.
+ *
+ * @returns {{ latestLedger: number, liveUntilLedgerSeq: number|null,
+ *   ledgersRemaining: number }}
+ */
+export async function readContractInstanceTtl(contractId) {
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const response = await sorobanRpc.getLedgerEntries(contract.getFootprint());
+  const latestLedger = response.latestLedger ?? 0;
+  const liveUntilLedgerSeq = response.entries?.[0]?.liveUntilLedgerSeq ?? null;
+
+  return {
+    latestLedger,
+    liveUntilLedgerSeq,
+    ledgersRemaining: liveUntilLedgerSeq
+      ? Math.max(0, liveUntilLedgerSeq - latestLedger)
+      : 0,
+  };
+}
+
+/**
+ * Submit an `extendFootprintTtl` operation for the contract instance. This
+ * never invokes register / pause / unregister — it only lengthens the
+ * instance's ledger lifetime.
+ *
+ * `options.currentDeadline` lets callers reuse the TTL they already read; when
+ * omitted the helper reads it itself so the local guard always holds.
+ */
+export async function extendContractTtlWithFreighter(
+  publicKey,
+  contractId,
+  extendTo,
+  options = {}
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
+  }
+
+  const target = Number(extendTo);
+  if (!Number.isSafeInteger(target) || target <= 0) {
+    throw new Error("Extend to a valid positive ledger number.");
+  }
+
+  const currentDeadline =
+    options.currentDeadline ??
+    (await readContractInstanceTtl(contractId)).liveUntilLedgerSeq ??
+    0;
+  if (target <= currentDeadline) {
+    throw new Error(
+      `New deadline must be later than the current one (${currentDeadline}).`
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const sorobanData = new StellarSdk.SorobanDataBuilder()
+    .setFootprint([contract.getFootprint()], [])
+    .setResourceFee("100")
+    .build();
+
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+    sorobanData,
+  })
+    .addOperation(StellarSdk.Operation.extendFootprintTtl({ extendTo: target }))
+    .setTimeout(180)
+    .build();
+
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `TTL extension rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return {
+        hash: sendResult.hash,
+        liveUntilLedgerSeq: target,
+        confirmed: true,
+      };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(
+        `TTL extension failed on-chain. Tx hash: ${sendResult.hash}`
+      );
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  return {
+    hash: sendResult.hash,
+    liveUntilLedgerSeq: target,
+    confirmed: false,
+  };
+}
+
+/** Accept either a real RPC ScVal or an already-native fixture value. */
+function nativeOrValue(value) {
+  if (value && typeof value === "object" && typeof value.switch === "function") {
+    try {
+      return StellarSdk.scValToNative(value);
+    } catch {
+      return value;
+    }
+  }
+  return value;
+}
+
+function eventContractId(event) {
+  const id = event?.contractId;
+  if (!id) return null;
+  if (typeof id === "string") return id;
+  if (typeof id.contractId === "function") return id.contractId();
+  if (typeof id.toString === "function") return id.toString();
+  return String(id);
+}
+
+/**
+ * Turn raw Soroban RPC contract events into the two Lab-facing shapes:
+ * `register` (caller / name / isNew) and `paused` (new flag). Events from any
+ * other contract are dropped, as are event types we do not display.
+ */
+export function mapKitewellEvents(rawEvents = [], contractId) {
+  return (rawEvents || [])
+    .filter((event) => !contractId || eventContractId(event) === contractId)
+    .map((event) => {
+      const topic = event.topic || [];
+      const kind = topic[0] ? nativeOrValue(topic[0]) : null;
+      const value = event.value ? nativeOrValue(event.value) : null;
+      const common = {
+        id: event.id ?? `${event.ledger ?? event.ledgerSeq ?? 0}-${kind}`,
+        ledger: event.ledger ?? event.ledgerSeq ?? null,
+      };
+
+      if (kind === "register") {
+        const [name, isNew] = Array.isArray(value) ? value : [null, null];
+        return {
+          ...common,
+          type: "register",
+          caller: topic[1] ? nativeOrValue(topic[1]) : null,
+          name: name ?? null,
+          isNew: Boolean(isNew),
+        };
+      }
+      if (kind === "paused") {
+        return { ...common, type: "paused", paused: Boolean(value) };
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Fetch a page of events for the configured contract. With no cursor the tail
+ * starts at `startLedger` (the ledger open at tab-open time), so the full
+ * history is never downloaded.
+ */
+export async function readKitewellEvents(contractId, options = {}) {
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
+  }
+
+  const { cursor, startLedger, limit = 100 } = options;
+  const request = {
+    limit,
+    filters: [{ type: "contract", contractIds: [contractId] }],
+  };
+  if (cursor) request.cursor = cursor;
+  else if (startLedger) request.startLedger = startLedger;
+  else {
+    // First open: begin at the latest ledger rather than replaying history.
+    const latest = await sorobanRpc.getLatestLedger();
+    request.startLedger = latest.sequence;
+  }
+
+  const response = await sorobanRpc.getEvents(request);
+
+  return {
+    events: mapKitewellEvents(response.events || [], contractId),
+    cursor: response.cursor ?? null,
+    latestLedger: response.latestLedger ?? null,
+  };
 }

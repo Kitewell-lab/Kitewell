@@ -7,6 +7,11 @@ import {
   changeTrustWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  setAccountOptionsWithFreighter,
+  allowTrustWithFreighter,
+  readContractInstanceTtl,
+  extendContractTtlWithFreighter,
+  readKitewellEvents,
 } from "./freighter";
 import { shortenAddress } from "./addressFormat";
 import {
@@ -16,6 +21,8 @@ import {
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
+  getAccountAuthConfig,
+  getIssuedAssetTrustlines,
 } from "./stellar";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
@@ -28,7 +35,18 @@ import {
 import { validateAssetCode } from "./validateAssetCode";
 import "./App.css";
 
-const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
+const TABS = [
+  "Wallet",
+  "Fund",
+  "Assets",
+  "Issuer",
+  "Send",
+  "Path",
+  "History",
+  "Lab",
+];
+const IMMUTABLE_CONFIRMATION = "IMMUTABLE";
+const EVENT_POLL_MS = 6000;
 const PATH_MODE_FIELDS = {
   strictSend: {
     amountLabel: "Amount to send",
@@ -100,6 +118,29 @@ export default function App() {
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
+  // Issuer auth flags + trustlines the connected account issued.
+  const [issuerConfig, setIssuerConfig] = useState(null);
+  const [issuerConfigError, setIssuerConfigError] = useState(null);
+  const [issuerForm, setIssuerForm] = useState({
+    homeDomain: "",
+    authRequired: false,
+    authRevocable: false,
+    authImmutable: false,
+    confirmation: "",
+  });
+  const [issuedTrustlines, setIssuedTrustlines] = useState([]);
+  const [issuedTrustlinesError, setIssuedTrustlinesError] = useState(null);
+
+  // Contract instance TTL + event tail in the Lab tab.
+  const [ttlInfo, setTtlInfo] = useState(null);
+  const [ttlError, setTtlError] = useState(null);
+  const [ttlForm, setTtlForm] = useState({ extendTo: "" });
+  const [ttlResult, setTtlResult] = useState(null);
+  const [labEvents, setLabEvents] = useState([]);
+  const [labEventsError, setLabEventsError] = useState(null);
+  const eventCursorRef = useRef(null);
+  const eventStartLedgerRef = useRef(null);
+
   const showToast = (message, type = "success", explorerUrl = null) => {
     setToast({ message, type, explorerUrl });
     setTimeout(() => setToast(null), 4200);
@@ -112,6 +153,7 @@ export default function App() {
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
   const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
+  const configuredContractId = labInfo?.network?.contract?.kitewell;
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -163,6 +205,8 @@ export default function App() {
     setBalances([]);
     setTransactions([]);
     setAccountDetails(null);
+    setIssuerConfig(null);
+    setIssuedTrustlines([]);
     showToast("Disconnected.");
   };
 
@@ -404,20 +448,23 @@ export default function App() {
     setLabError(null);
     try {
       const [health, network] = await Promise.all([fetchHealth(), fetchNetworkInfo()]);
-      setLabInfo({ health, network });
+      const info = { health, network };
+      setLabInfo(info);
+      return info;
     } catch (e) {
       setLabInfo(null);
       setLabError(
         e.message ||
           "Backend offline. Start it with: npm run dev:backend"
       );
+      return null;
     } finally {
       setLoading("");
     }
   };
 
-  const refreshLabState = useCallback(async () => {
-    const contractId = labInfo?.network?.contract?.kitewell;
+  const refreshLabState = useCallback(async (explicitContractId) => {
+    const contractId = explicitContractId ?? labInfo?.network?.contract?.kitewell;
     if (!contractId) {
       setLabState(null);
       setLabStateError(null);
@@ -475,13 +522,190 @@ export default function App() {
     }
   };
 
+  const refreshIssuerPanel = useCallback(async () => {
+    if (!publicKey) return;
+    setLoading("issuer");
+    try {
+      const config = await getAccountAuthConfig(publicKey);
+      setIssuerConfig(config);
+      setIssuerConfigError(null);
+      setIssuerForm({
+        homeDomain: config.homeDomain || "",
+        authRequired: config.authRequired,
+        authRevocable: config.authRevocable,
+        authImmutable: config.authImmutable,
+        confirmation: "",
+      });
+    } catch (err) {
+      setIssuerConfig(null);
+      setIssuerConfigError(err.message || "Could not read account flags.");
+    }
+
+    try {
+      setIssuedTrustlines(await getIssuedAssetTrustlines(publicKey));
+      setIssuedTrustlinesError(null);
+    } catch (err) {
+      setIssuedTrustlines([]);
+      setIssuedTrustlinesError(err.message || "Could not read issued trustlines.");
+    }
+    setLoading("");
+  }, [publicKey]);
+
+  const handleSetIssuerOptions = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("issuer-update");
+    try {
+      await setAccountOptionsWithFreighter(publicKey, {
+        current: issuerConfig || {},
+        homeDomain: issuerForm.homeDomain,
+        authRequired: issuerForm.authRequired,
+        authRevocable: issuerForm.authRevocable,
+        authImmutable: issuerForm.authImmutable,
+        immutableConfirmation: issuerForm.confirmation,
+      });
+      showToast("Account flags updated.");
+      // A successful update refreshes both the flags and the account balances.
+      await refreshIssuerPanel();
+      await refreshBalances();
+    } catch (err) {
+      showToast(err.message || "Could not update account flags.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleAllowTrust = async (entry, authorize) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`allow-${entry.key}`);
+    try {
+      await allowTrustWithFreighter(publicKey, {
+        holder: entry.holder,
+        assetCode: entry.assetCode,
+        assetIssuer: entry.assetIssuer,
+        authorize,
+      });
+      showToast(
+        `${authorize ? "Authorized" : "Revoked"} ${shortenAddress(entry.holder)} for ${entry.assetCode}.`
+      );
+      await refreshIssuerPanel();
+    } catch (err) {
+      showToast(err.message || "Could not update the trustline.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const refreshTtlInfo = useCallback(
+    async (explicitContractId) => {
+      const contractId = explicitContractId ?? configuredContractId;
+      if (!contractId) {
+        setTtlInfo(null);
+        setTtlError(null);
+        return;
+      }
+      setLoading("ttl");
+      setTtlError(null);
+      try {
+        const info = await readContractInstanceTtl(contractId);
+        setTtlInfo(info);
+        setTtlForm({
+          extendTo: String((info.liveUntilLedgerSeq || info.latestLedger || 0) + 5000),
+        });
+      } catch (err) {
+        setTtlInfo(null);
+        setTtlError(err.message || "Could not read the instance TTL.");
+      } finally {
+        setLoading("");
+      }
+    },
+    [configuredContractId]
+  );
+
+  const handleExtendTtl = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!configuredContractId) {
+      return showToast("No contract id configured — deploy first.", "error");
+    }
+    setLoading("ttl-extend");
+    try {
+      const result = await extendContractTtlWithFreighter(
+        publicKey,
+        configuredContractId,
+        ttlForm.extendTo,
+        { currentDeadline: ttlInfo?.liveUntilLedgerSeq ?? undefined }
+      );
+      setTtlResult({
+        hash: result.hash,
+        liveUntilLedgerSeq: result.liveUntilLedgerSeq,
+      });
+      showToast(
+        result.confirmed
+          ? `TTL extended to ledger ${result.liveUntilLedgerSeq}.`
+          : `TTL extension submitted · ${result.hash.slice(0, 12)}…`
+      );
+      await refreshTtlInfo(configuredContractId);
+    } catch (err) {
+      showToast(err.message || "Could not extend the instance TTL.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const pollLabEvents = useCallback(async (contractId) => {
+    if (!contractId) return;
+    try {
+      const result = await readKitewellEvents(contractId, {
+        cursor: eventCursorRef.current || undefined,
+        startLedger: eventStartLedgerRef.current || undefined,
+      });
+      if (eventStartLedgerRef.current === null && result.latestLedger) {
+        eventStartLedgerRef.current = result.latestLedger;
+      }
+      if (result.cursor) eventCursorRef.current = result.cursor;
+      setLabEvents((previous) => {
+        const byId = new Map(previous.map((event) => [event.id, event]));
+        result.events.forEach((event) => byId.set(event.id, event));
+        return [...byId.values()];
+      });
+      setLabEventsError(null);
+    } catch (err) {
+      setLabEventsError(err.message || "Could not read contract events.");
+    }
+  }, []);
+
+  // Start the tail at the ledger open when the Lab tab is first shown, and
+  // poll for new register / pause events while it stays open.
+  useEffect(() => {
+    if (activeTab !== "Lab" || !configuredContractId) {
+      if (activeTab !== "Lab") {
+        eventCursorRef.current = null;
+        eventStartLedgerRef.current = null;
+      }
+      return undefined;
+    }
+    eventCursorRef.current = null;
+    eventStartLedgerRef.current = null;
+    pollLabEvents(configuredContractId);
+    const timer = setInterval(
+      () => pollLabEvents(configuredContractId),
+      EVENT_POLL_MS
+    );
+    return () => clearInterval(timer);
+  }, [activeTab, configuredContractId, pollLabEvents]);
+
   const activateTab = (tab) => {
     setActiveTab(tab);
     if (tab === "History") handleHistory();
     if (tab === "Lab") {
-      loadLabInfo();
-      refreshLabState();
+      loadLabInfo().then((info) => {
+        const contractId = info?.network?.contract?.kitewell;
+        refreshLabState(contractId);
+        refreshTtlInfo(contractId);
+      });
     }
+    if (tab === "Issuer") refreshIssuerPanel();
     if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
       refreshBalances();
     }
@@ -889,6 +1113,251 @@ export default function App() {
                   )}
                 </button>
               </form>
+            </div>
+          )}
+
+          {activeTab === "Issuer" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Issuer controls</h2>
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={refreshIssuerPanel}
+                  disabled={loading === "issuer" || requireWallet}
+                >
+                  {loading === "issuer" ? (
+                    <>
+                      <Spinner /> Loading…
+                    </>
+                  ) : (
+                    "Refresh"
+                  )}
+                </button>
+              </div>
+              <p className="muted">
+                Reads auth flags from Horizon and signs <code>setOptions</code> /{" "}
+                <code>allowTrust</code> with Freighter.
+              </p>
+
+              {requireWallet ? (
+                <p className="muted">Connect Freighter to manage an issuer.</p>
+              ) : (
+                <>
+                  {issuerConfigError && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Account flags</span>
+                      <p className="muted">{issuerConfigError}</p>
+                    </div>
+                  )}
+
+                  {issuerConfig && (
+                    <form className="form" onSubmit={handleSetIssuerOptions}>
+                      <div className="info-box">
+                        <span className="eyebrow">Current account flags</span>
+                        <div className="metadata-grid">
+                          <div>
+                            <span className="metadata-label">Home domain</span>
+                            <span className="metadata-value">
+                              {issuerConfig.homeDomain || "—"}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Auth required</span>
+                            <span className="metadata-value">
+                              {String(issuerConfig.authRequired)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Auth revocable</span>
+                            <span className="metadata-value">
+                              {String(issuerConfig.authRevocable)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Auth immutable</span>
+                            <span className="metadata-value">
+                              {String(issuerConfig.authImmutable)}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <label className="label" htmlFor="issuer-home-domain">
+                        Home domain (32 bytes max)
+                      </label>
+                      <input
+                        id="issuer-home-domain"
+                        className="input"
+                        type="text"
+                        value={issuerForm.homeDomain}
+                        onChange={(e) =>
+                          setIssuerForm({
+                            ...issuerForm,
+                            homeDomain: e.target.value,
+                          })
+                        }
+                        disabled={issuerConfig.authImmutable}
+                      />
+
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={issuerForm.authRequired}
+                          onChange={(e) =>
+                            setIssuerForm({
+                              ...issuerForm,
+                              authRequired: e.target.checked,
+                            })
+                          }
+                          disabled={issuerConfig.authImmutable}
+                        />
+                        Auth required — holders need approval
+                      </label>
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={issuerForm.authRevocable}
+                          onChange={(e) =>
+                            setIssuerForm({
+                              ...issuerForm,
+                              authRevocable: e.target.checked,
+                            })
+                          }
+                          disabled={issuerConfig.authImmutable}
+                        />
+                        Auth revocable — the issuer can revoke holders
+                      </label>
+
+                      {!issuerConfig.authImmutable && (
+                        <div className="info-box info-box--warning">
+                          <span className="eyebrow">Irreversible</span>
+                          <p className="muted">
+                            Auth immutable can never be turned off. It is a
+                            separate control from the two flags above.
+                          </p>
+                        </div>
+                      )}
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={issuerConfig.authImmutable || issuerForm.authImmutable}
+                          onChange={(e) =>
+                            setIssuerForm({
+                              ...issuerForm,
+                              authImmutable: e.target.checked,
+                              confirmation: "",
+                            })
+                          }
+                          disabled={issuerConfig.authImmutable}
+                        />
+                        Auth immutable (one-way)
+                      </label>
+
+                      {issuerForm.authImmutable && !issuerConfig.authImmutable && (
+                        <>
+                          <label
+                            className="label"
+                            htmlFor="immutable-confirmation"
+                          >
+                            Type {IMMUTABLE_CONFIRMATION} to confirm
+                          </label>
+                          <input
+                            id="immutable-confirmation"
+                            className="input"
+                            type="text"
+                            value={issuerForm.confirmation}
+                            onChange={(e) =>
+                              setIssuerForm({
+                                ...issuerForm,
+                                confirmation: e.target.value,
+                              })
+                            }
+                            placeholder={IMMUTABLE_CONFIRMATION}
+                          />
+                        </>
+                      )}
+
+                      <button
+                        className="btn btn--primary"
+                        type="submit"
+                        disabled={
+                          loading === "issuer-update" ||
+                          issuerConfig.authImmutable ||
+                          (issuerForm.authImmutable &&
+                            issuerForm.confirmation !== IMMUTABLE_CONFIRMATION)
+                        }
+                      >
+                        {loading === "issuer-update" ? (
+                          <>
+                            <Spinner /> Signing…
+                          </>
+                        ) : (
+                          "Sign setOptions"
+                        )}
+                      </button>
+                      {issuerConfig.authImmutable && (
+                        <p className="muted">
+                          Flags are locked on-chain — auth immutable is already
+                          set.
+                        </p>
+                      )}
+                    </form>
+                  )}
+
+                  <h3 className="subhead">Trustlines you issued</h3>
+                  {issuedTrustlinesError && (
+                    <div className="info-box info-box--warning">
+                      <p className="muted">{issuedTrustlinesError}</p>
+                    </div>
+                  )}
+                  {issuedTrustlines.length > 0 ? (
+                    <ul className="balance-list">
+                      {issuedTrustlines.map((entry) => (
+                        <li key={entry.key} className="balance-row">
+                          <div>
+                            <strong>{entry.assetCode}</strong>
+                            <span className="muted balance-row__issuer">
+                              {shortenAddress(entry.holder)} · {entry.balance}
+                            </span>
+                          </div>
+                          <div className="balance-row__actions">
+                            <span className="muted">
+                              {entry.isAuthorized === null
+                                ? "status unknown"
+                                : entry.isAuthorized
+                                  ? "authorized"
+                                  : "not authorized"}
+                            </span>
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              type="button"
+                              onClick={() => handleAllowTrust(entry, true)}
+                              disabled={loading === `allow-${entry.key}`}
+                            >
+                              Authorize
+                            </button>
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              type="button"
+                              onClick={() => handleAllowTrust(entry, false)}
+                              disabled={loading === `allow-${entry.key}`}
+                            >
+                              Revoke
+                            </button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    !issuedTrustlinesError && (
+                      <p className="muted">
+                        No accounts hold an asset issued by this address.
+                      </p>
+                    )
+                  )}
+                </>
+              )}
             </div>
           )}
 
@@ -1322,6 +1791,162 @@ export default function App() {
                         Explorer ↗
                       </a>
                     </div>
+                  )}
+
+                  <div className="section__row">
+                    <div className="subhead">Contract instance TTL</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={() => refreshTtlInfo()}
+                      disabled={loading === "ttl" || !configuredContractId}
+                    >
+                      {loading === "ttl" ? (
+                        <>
+                          <Spinner /> Reading…
+                        </>
+                      ) : (
+                        "Refresh"
+                      )}
+                    </button>
+                  </div>
+                  {!configuredContractId && (
+                    <p className="muted">
+                      No contract id configured — set one in the backend to read
+                      or extend its TTL.
+                    </p>
+                  )}
+                  {ttlError && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Soroban RPC</span>
+                      <p className="muted">{ttlError}</p>
+                    </div>
+                  )}
+                  {ttlInfo && (
+                    <div className="info-box">
+                      <span className="eyebrow">Instance lifetime</span>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">Latest ledger</span>
+                          <span className="metadata-value">
+                            {ttlInfo.latestLedger}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Expires at ledger</span>
+                          <span className="metadata-value">
+                            {ttlInfo.liveUntilLedgerSeq ?? "—"}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">
+                            Ledgers remaining
+                          </span>
+                          <span className="metadata-value">
+                            {ttlInfo.ledgersRemaining}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <form className="form" onSubmit={handleExtendTtl}>
+                    <label className="label" htmlFor="ttl-deadline">
+                      Extend to ledger
+                    </label>
+                    <input
+                      id="ttl-deadline"
+                      className="input"
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={ttlForm.extendTo}
+                      onChange={(e) =>
+                        setTtlForm({ extendTo: e.target.value })
+                      }
+                      disabled={!ttlInfo}
+                    />
+                    <p className="muted">
+                      Must be later than the current deadline. This sends only
+                      an <code>extendFootprintTtl</code> op — never register,
+                      pause, or unregister.
+                    </p>
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={
+                        loading === "ttl-extend" ||
+                        requireWallet ||
+                        !configuredContractId ||
+                        !ttlInfo ||
+                        !ttlForm.extendTo
+                      }
+                    >
+                      {loading === "ttl-extend" ? (
+                        <>
+                          <Spinner /> Signing in Freighter…
+                        </>
+                      ) : (
+                        "Extend TTL"
+                      )}
+                    </button>
+                  </form>
+                  {ttlResult && (
+                    <div className="info-box">
+                      <span className="eyebrow">New deadline</span>
+                      <code>
+                        Ledger {ttlResult.liveUntilLedgerSeq} ·{" "}
+                        {ttlResult.hash}
+                      </code>
+                    </div>
+                  )}
+
+                  <div className="section__row">
+                    <div className="subhead">Contract event tail</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={() => pollLabEvents(configuredContractId)}
+                      disabled={!configuredContractId}
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                  {!configuredContractId && (
+                    <p className="muted">
+                      No contract id configured — no events to show.
+                    </p>
+                  )}
+                  {labEventsError && (
+                    <div className="info-box info-box--warning">
+                      <p className="muted">{labEventsError}</p>
+                    </div>
+                  )}
+                  {labEvents.length > 0 ? (
+                    <ul className="balance-list">
+                      {labEvents.map((event) => (
+                        <li key={event.id} className="balance-row">
+                          <div>
+                            <strong>{event.type}</strong>
+                            <span className="muted balance-row__issuer">
+                              ledger {event.ledger}
+                            </span>
+                          </div>
+                          <div className="muted">
+                            {event.type === "register"
+                              ? `${event.name ?? "—"} · ${shortenAddress(event.caller)} · ${
+                                  event.isNew ? "new builder" : "existing"
+                                }`
+                              : `paused = ${String(event.paused)}`}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    !labEventsError && (
+                      <p className="muted">
+                        No register or pause events since this tab opened.
+                      </p>
+                    )
                   )}
                 </>
               )}

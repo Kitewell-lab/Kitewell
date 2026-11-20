@@ -25,6 +25,137 @@ export function explorerTxUrl(hash) {
 
 export const MAX_ASSET_CODE_LENGTH = 12;
 
+/** Stellar account flag bits (from Stellar's `AccountFlags`). */
+export const ACCOUNT_FLAG_BITS = {
+  authRequired: 1,
+  authRevocable: 2,
+  authImmutable: 4,
+};
+
+/** Auth immutable is irreversible, so the UI demands an explicit confirmation. */
+export const IMMUTABLE_CONFIRMATION = "IMMUTABLE";
+export const MAX_HOME_DOMAIN_BYTES = 32;
+
+/**
+ * Normalize the account flag fields Horizon exposes (snake_case) into the
+ * camelCase shape the UI works with.
+ */
+export function mapAccountAuthConfig(account = {}) {
+  const flags = account.flags || {};
+  return {
+    authRequired: Boolean(flags.auth_required ?? flags.authRequired),
+    authRevocable: Boolean(flags.auth_revocable ?? flags.authRevocable),
+    authImmutable: Boolean(flags.auth_immutable ?? flags.authImmutable),
+    homeDomain: account.home_domain ?? account.homeDomain ?? "",
+  };
+}
+
+/**
+ * Read the current issuer flags + home domain straight from Horizon. The
+ * backend account cache does not carry flags, so this path always goes direct.
+ */
+export async function getAccountAuthConfig(publicKey) {
+  const account = await getServer().loadAccount(publicKey);
+  return mapAccountAuthConfig(account);
+}
+
+/**
+ * Pure validator/build step for a `setOptions` operation body.
+ *
+ * Flags are expressed as changes relative to `current`, so toggle controls can
+ * send only the bits that actually change. Turning immutable on needs the
+ * literal confirmation word, and turning it off is refused outright once it is
+ * reported as set — it cannot be undone on-chain.
+ */
+export function buildSetOptionsBody({
+  current = {},
+  homeDomain,
+  authRequired,
+  authRevocable,
+  authImmutable,
+  immutableConfirmation = "",
+} = {}) {
+  const currentRequired = Boolean(current.authRequired);
+  const currentRevocable = Boolean(current.authRevocable);
+  const currentImmutable = Boolean(current.authImmutable);
+
+  const wantRequired =
+    authRequired === undefined ? currentRequired : Boolean(authRequired);
+  const wantRevocable =
+    authRevocable === undefined ? currentRevocable : Boolean(authRevocable);
+  const wantImmutable =
+    authImmutable === undefined ? currentImmutable : Boolean(authImmutable);
+
+  if (currentImmutable && !wantImmutable) {
+    throw new Error("Auth immutable cannot be turned off once it is set.");
+  }
+
+  let setFlags = 0;
+  let clearFlags = 0;
+
+  if (wantRequired !== currentRequired) {
+    const bit = ACCOUNT_FLAG_BITS.authRequired;
+    if (wantRequired) setFlags |= bit;
+    else clearFlags |= bit;
+  }
+  if (wantRevocable !== currentRevocable) {
+    const bit = ACCOUNT_FLAG_BITS.authRevocable;
+    if (wantRevocable) setFlags |= bit;
+    else clearFlags |= bit;
+  }
+  if (wantImmutable && !currentImmutable) {
+    if (immutableConfirmation !== IMMUTABLE_CONFIRMATION) {
+      throw new Error("Type IMMUTABLE to confirm turning on auth immutable.");
+    }
+    setFlags |= ACCOUNT_FLAG_BITS.authImmutable;
+  }
+
+  let normalizedHomeDomain;
+  if (homeDomain !== undefined && homeDomain !== null) {
+    normalizedHomeDomain = String(homeDomain).trim();
+    if (
+      new TextEncoder().encode(normalizedHomeDomain).length >
+      MAX_HOME_DOMAIN_BYTES
+    ) {
+      throw new Error(
+        `Home domain must be ${MAX_HOME_DOMAIN_BYTES} bytes or fewer.`
+      );
+    }
+  }
+
+  return {
+    ...(normalizedHomeDomain !== undefined
+      ? { homeDomain: normalizedHomeDomain }
+      : {}),
+    ...(setFlags ? { setFlags } : {}),
+    ...(clearFlags ? { clearFlags } : {}),
+  };
+}
+
+/**
+ * List trustlines for assets issued by `publicKey` using Horizon's
+ * accounts-for-asset endpoint (`/assets?asset_issuer=…`). An issuer that has no
+ * holders simply gets an empty list.
+ */
+export async function getIssuedAssetTrustlines(publicKey) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  const response = await getServer().assets().forIssuer(publicKey).limit(200).call();
+
+  return (response.records || []).map((record) => ({
+    key: `${record.asset_code}:${record.account}`,
+    assetCode: record.asset_code,
+    assetIssuer: record.asset_issuer,
+    holder: record.account,
+    balance: record.balance ?? "0",
+    limit: record.limit ?? null,
+    isAuthorized:
+      typeof record.is_authorized === "boolean" ? record.is_authorized : null,
+  }));
+}
+
 /**
  * Convert a simple UI asset descriptor into an SDK Asset.
  * Native XLM is `{ isNative: true }`; a credit asset is
