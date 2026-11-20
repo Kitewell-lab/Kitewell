@@ -77,6 +77,7 @@ export default function App() {
     memo: "",
   });
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
+  const [limitChangeForm, setLimitChangeForm] = useState({});
   const [pathForm, setPathForm] = useState({
     mode: "strictSend",
     destination: "",
@@ -243,6 +244,41 @@ export default function App() {
       showToast(`${asset.code} trustline removed.`);
     } catch (err) {
       showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleChangeLimit = async (asset) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    const newLimit = limitChangeForm[asset.key];
+    if (!newLimit || newLimit.trim() === "") {
+      return showToast("Enter a new limit.", "error");
+    }
+
+    const limitNum = parseFloat(newLimit);
+    if (isNaN(limitNum) || limitNum < 0) {
+      return showToast("Limit must be a non-negative number.", "error");
+    }
+
+    const balance = parseFloat(asset.balance);
+    if (limitNum < balance) {
+      return showToast(
+        `Limit (${newLimit}) cannot be below current balance (${asset.balance}).`,
+        "error"
+      );
+    }
+
+    setLoading(`limit-${asset.key}`);
+    try {
+      await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, newLimit);
+      const next = await getAccountBalances(publicKey);
+      setBalances(next);
+      setLimitChangeForm({ ...limitChangeForm, [asset.key]: "" });
+      showToast(`${asset.code} trustline limit updated to ${newLimit}.`);
+    } catch (err) {
+      showToast(err.message || `Could not change ${asset.code} trustline limit.`, "error");
     } finally {
       setLoading("");
     }
@@ -794,39 +830,67 @@ export default function App() {
               {balances.length > 0 ? (
                 <ul className="balance-list">
                   {balances.map((b) => (
-                    <li key={b.key} className="balance-row">
-                      <div>
-                        <strong>{b.code}</strong>
-                        {!b.isNative && (
-                          <span className="muted balance-row__issuer">
-                            {shortenAddress(b.issuer)}
+                    <li key={b.key} className="balance-row" style={{ flexDirection: "column", alignItems: "flex-start", gap: "8px" }}>
+                      <div style={{ display: "flex", width: "100%", justifyContent: "space-between" }}>
+                        <div>
+                          <strong>{b.code}</strong>
+                          {!b.isNative && (
+                            <span className="muted balance-row__issuer">
+                              {shortenAddress(b.issuer)}
+                            </span>
+                          )}
+                        </div>
+                        <div className="balance-row__actions">
+                          <span>
+                            {parseFloat(b.balance).toLocaleString(undefined, {
+                              maximumFractionDigits: 7,
+                            })}
                           </span>
-                        )}
+                          {!b.isNative && (
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              type="button"
+                              onClick={() => handleRemoveTrust(b)}
+                              disabled={loading === `remove-${b.key}`}
+                              title={
+                                parseFloat(b.balance) > 0
+                                  ? "Balance must be 0 before removing this trustline"
+                                  : `Remove the ${b.code} trustline`
+                              }
+                            >
+                              {loading === `remove-${b.key}`
+                                ? "Removing…"
+                                : "Remove"}
+                            </button>
+                          )}
+                        </div>
                       </div>
-                      <div className="balance-row__actions">
-                        <span>
-                          {parseFloat(b.balance).toLocaleString(undefined, {
-                            maximumFractionDigits: 7,
-                          })}
-                        </span>
-                        {!b.isNative && (
+                      {!b.isNative && (
+                        <div style={{ display: "flex", gap: "8px", width: "100%", alignItems: "center", fontSize: "0.9em" }}>
+                          <span className="muted">
+                            Limit: {b.limit ? parseFloat(b.limit).toLocaleString(undefined, { maximumFractionDigits: 7 }) : "—"}
+                          </span>
+                          <input
+                            className="input"
+                            type="number"
+                            placeholder="New limit"
+                            value={limitChangeForm[b.key] || ""}
+                            onChange={(e) =>
+                              setLimitChangeForm({ ...limitChangeForm, [b.key]: e.target.value })
+                            }
+                            style={{ flex: 1, maxWidth: "200px" }}
+                            disabled={loading === `limit-${b.key}`}
+                          />
                           <button
                             className="btn btn--secondary btn--sm"
                             type="button"
-                            onClick={() => handleRemoveTrust(b)}
-                            disabled={loading === `remove-${b.key}`}
-                            title={
-                              parseFloat(b.balance) > 0
-                                ? "Balance must be 0 before removing this trustline"
-                                : `Remove the ${b.code} trustline`
-                            }
+                            onClick={() => handleChangeLimit(b)}
+                            disabled={loading === `limit-${b.key}` || !limitChangeForm[b.key]}
                           >
-                            {loading === `remove-${b.key}`
-                              ? "Removing…"
-                              : "Remove"}
+                            {loading === `limit-${b.key}` ? "Changing…" : "Change"}
                           </button>
-                        )}
-                      </div>
+                        </div>
+                      )}
                     </li>
                   ))}
                 </ul>
