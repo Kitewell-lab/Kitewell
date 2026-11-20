@@ -16,6 +16,7 @@ import {
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
+  resolveFederationAddress,
 } from "./stellar";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
@@ -99,6 +100,7 @@ export default function App() {
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
+  const [resolvedFederation, setResolvedFederation] = useState(null);
 
   const showToast = (message, type = "success", explorerUrl = null) => {
     setToast({ message, type, explorerUrl });
@@ -283,10 +285,18 @@ export default function App() {
       : { isNative: false, code: selected.code, issuer: selected.issuer };
 
     setLoading("send");
+    let paymentDestination;
+    try {
+      paymentDestination = await resolveFederationAddress(sendForm.destination);
+    } catch (err) {
+      setLoading("");
+      return showToast(err.message || "Federation lookup failed.", "error");
+    }
+
     try {
       const result = await sendPaymentWithFreighter(
         publicKey,
-        sendForm.destination,
+        paymentDestination,
         amount,
         asset,
         sendForm.memoType,
@@ -500,6 +510,32 @@ export default function App() {
     activateTab(TABS[nextIndex]);
     tabRefs.current[nextIndex]?.focus();
   };
+
+  useEffect(() => {
+    const destination = sendForm.destination.trim();
+    if (!destination || !destination.includes("*")) {
+      setResolvedFederation(null);
+      return;
+    }
+
+    let cancelled = false;
+    setLoading("resolve");
+    setResolvedFederation(null);
+    resolveFederationAddress(destination)
+      .then((account) => {
+        if (!cancelled) setResolvedFederation(account);
+      })
+      .catch((err) => {
+        if (!cancelled) showToast(err.message || "Federation lookup failed.", "error");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading("");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sendForm.destination]);
 
   return (
     <div className="app">
@@ -994,6 +1030,16 @@ export default function App() {
                   )}
                 </button>
               </form>
+
+              {resolvedFederation && (
+                <div className="info-box">
+                  <span className="eyebrow">Resolved federation address</span>
+                  <code>{resolvedFederation}</code>
+                  <p className="muted" style={{ marginTop: 4 }}>
+                    Destination account resolved before signing.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 

@@ -6,7 +6,7 @@ import {
 } from "@stellar/freighter-api";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
-import { buildAsset, parsePathAssets } from "./stellar";
+import { buildAsset, parsePathAssets, resolveFederationAddress } from "./stellar";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -296,6 +296,13 @@ export async function sendPaymentWithFreighter(
   memo = ""
 ) {
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
+    if (typeof destination !== "string" || !destination.includes("*")) {
+      throw new Error("Destination must be a valid Stellar public key (G…).");
+    }
+  }
+
+  const resolvedDestination = await resolveFederationAddress(destination);
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(resolvedDestination)) {
     throw new Error("Destination must be a valid Stellar public key (G…).");
   }
 
@@ -306,7 +313,7 @@ export async function sendPaymentWithFreighter(
     networkPassphrase: currentPassphrase(),
   }).addOperation(
     StellarSdk.Operation.payment({
-      destination,
+      destination: resolvedDestination,
       asset: resolvePaymentAsset(asset),
       amount: amount.toString(),
     })
@@ -368,7 +375,7 @@ export async function pathPaymentWithFreighter({
     ? StellarSdk.Operation.pathPaymentStrictReceive({
         sendAsset: sourceAsset,
         sendMax: boundValue,
-        destination,
+        destination: resolvedDestination,
         destAsset: destinationAsset,
         destAmount: amountValue,
         path: intermediatePath,
@@ -376,7 +383,7 @@ export async function pathPaymentWithFreighter({
     : StellarSdk.Operation.pathPaymentStrictSend({
         sendAsset: sourceAsset,
         sendAmount: amountValue,
-        destination,
+        destination: resolvedDestination,
         destAsset: destinationAsset,
         destMin: boundValue,
         path: intermediatePath,
@@ -427,4 +434,39 @@ export async function changeTrustWithFreighter(
     .build();
 
   return signAndSubmit(transaction, publicKey);
+}
+
+/**
+ * Resolve a federation address (e.g. "alice*stellar.org") into a Stellar
+ * public key, using the configured resolver.
+ *
+ * @returns {string|null} Valid Stellar public key (G…) or null if unresolved.
+ */
+export async function resolveAddress(federationId) {
+  if (!federationId) return null;
+  const [name, domain] = federationId.split("*", 2);
+  if (!name || !domain) return null;
+
+  // Resolve via Soroban RPC, falling back to the legacy Horizon endpoint.
+  try {
+    const result = await sorobanRpc.resolveFederation(name, domain);
+    if (result && result.address) return result.address;
+  } catch (err) {
+    console.warn("Soroban federation resolution failed:", err);
+  }
+
+  try {
+    const response = await getServer().fetch(
+      `/federation?type=name&id=${encodeURIComponent(federationId)}`,
+      { cache: "no-store" }
+    );
+    const data = await response.json();
+    if (data._embedded?.records?.[0]?.account_id) {
+      return data._embedded.records[0].account_id;
+    }
+  } catch (err) {
+    console.warn("Horizon federation resolution failed:", err);
+  }
+
+  return null;
 }
