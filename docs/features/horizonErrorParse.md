@@ -1,15 +1,26 @@
 # Horizon Error Parse
 
-A pure, standalone frontend utility for parsing Horizon error responses into human-readable reasons.
+A pure, standalone frontend utility for parsing Horizon error responses into
+human-readable reasons and indexed operation failures.
 
 ## Overview
 
-When a Stellar transaction fails, Horizon returns an error response with detailed result codes in `extras.result_codes`. This module extracts those codes and maps them to human-readable error messages, making it easy to display meaningful error messages to users.
+When a Stellar transaction fails, Horizon returns result codes in
+`extras.result_codes`. This module maps known operation codes to explanations,
+retains zero-based operation indexes, and leaves unknown codes unexplained so
+the UI can show the raw code without guessing.
 
 ## Installation
 
 ```js
-import { parseHorizonError, isTransactionFailedError, getOperationResultCodes, getTransactionResultCode } from "./horizonErrorParse";
+import {
+  getOperationResultCodes,
+  getTransactionFailure,
+  getTransactionResultCode,
+  isTransactionFailedError,
+  parseHorizonError,
+  parseTransactionFailure,
+} from "./horizonErrorParse";
 ```
 
 ## API
@@ -196,6 +207,36 @@ getTransactionResultCode(error);
 
 ---
 
+### `parseTransactionFailure(errorResponse)`
+
+Extract indexed, non-success operation results from either a Horizon submit
+error (`extras.result_codes`) or a transaction record with `result_codes`.
+
+**Returns** `null` when no result-code object is present, otherwise:
+
+```js
+{
+  operations: [
+    { index: 0, code: "op_underfunded", explanation: "Sending account does not have enough balance." }
+  ],
+  transactionCode: "tx_failed",
+  transactionExplanation: "Transaction failed during execution."
+}
+```
+
+Operation indexes are zero-based. `op_success` and `op_not_attempted` are
+omitted. Unknown codes retain their `code` and have `explanation: null`.
+An empty `operations` list indicates a transaction-level failure with no
+operation index.
+
+### `getTransactionFailure(errorOrResponse)`
+
+Unwrap an SDK error's `response.data` (or `response.body`) and pass the body to
+`parseTransactionFailure`. This returns only safe result-code data; it does not
+include envelope or result XDR.
+
+---
+
 ## Supported Result Codes
 
 ### Operation Codes (Mapped to Human-Readable Messages)
@@ -207,15 +248,24 @@ getTransactionResultCode(error);
 | `op_no_issuer` | Asset issuer does not exist. |
 | `op_not_authorized` | Destination account is not authorized to hold the asset. |
 | `op_line_full` | Destination account trustline limit would be exceeded. |
+| `op_src_no_trust` | Sending account does not trust the asset (missing trustline). |
+| `op_src_not_authorized` | Sending account is not authorized to hold the asset. |
 | `op_no_path` | No path found between source and destination assets. |
 | `op_too_few_offers` | Insufficient liquidity on the order book for the path. |
 | `op_under_destmin` | Strict send path would receive less than destMin. |
 | `op_over_sendmax` | Strict receive path would exceed sendMax. |
 | `op_offer_cross_self` | Path would cross an offer from the same account. |
+| `op_sell_no_issuer` | Selling asset issuer does not exist. |
+| `op_buy_no_issuer` | Buying asset issuer does not exist. |
+| `op_sell_not_authorized` | Account not authorized to sell the asset. |
+| `op_buy_not_authorized` | Account not authorized to buy the asset. |
 | `op_low_reserve` | Account does not have enough reserve for a new trustline. |
 | `op_invalid_limit` | Trustline limit is invalid. |
 | `op_trust_not_allowed` | Asset does not allow trustlines (auth_required not set). |
 | `op_already_exist` | Destination account already exists. |
+| `tx_insufficient_balance` | Account has insufficient balance for the operation. |
+| `tx_no_trust` | Missing required trustline. |
+| `tx_too_few_offers` | Insufficient order book liquidity. |
 
 ### Transaction Codes (Mapped to Human-Readable Messages)
 
@@ -268,6 +318,8 @@ Test files (one behavior per file):
 | `horizon-error-create-account-codes.test.js` | Create account specific codes |
 | `horizon-error-helper-functions.test.js` | `isTransactionFailedError`, `getOperationResultCodes`, `getTransactionResultCode` |
 | `horizon-error-edge-cases.test.js` | Status as string, null operations, empty object |
+| `horizon-operation-failure.test.js` | Indexed known/unknown operation results and safe extraction |
+| `transaction-failure-notice.test.js` | Operation failure notice, transaction-level errors, and success with no notice |
 
 ---
 
@@ -287,30 +339,16 @@ Test files (one behavior per file):
 ## Integration Example
 
 ```js
-// In your transaction submission wrapper
-import { parseHorizonError } from "./horizonErrorParse";
+import { getTransactionFailure } from "./horizonErrorParse";
 
-async function submitTransaction(signedXdr) {
-  try {
-    const response = await horizonServer.submitTransaction(signedXdr);
-    return response;
-  } catch (error) {
-    // Parse Horizon error response
-    if (error.response?.data) {
-      const parsed = parseHorizonError(error.response.data);
-      // Show user-friendly message
-      throw new Error(parsed.reason);
-    }
-    // Re-throw non-Horizon errors
-    throw error;
-  }
-}
-
-// In your UI component
 try {
-  await submitPayment(...);
+  await submitTransaction();
 } catch (error) {
-  // error.message is now human-readable
-  showToast(error.message, "error");
+  const failure = getTransactionFailure(error);
+  if (failure) {
+    setTransactionFailure(failure);
+  } else {
+    throw error; // Preserve errors without Horizon result codes.
+  }
 }
 ```

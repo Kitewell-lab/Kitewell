@@ -7,6 +7,7 @@ import {
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
 import { buildAsset, parsePathAssets } from "./stellar";
+import { getTransactionFailure } from "./horizonErrorParse";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -242,7 +243,16 @@ async function signWithFreighter(unsignedXdr, publicKey) {
 
 async function signAndSubmit(transaction, publicKey) {
   const signedTx = await signWithFreighter(transaction.toXDR(), publicKey);
-  return getServer().submitTransaction(signedTx);
+  try {
+    return await getServer().submitTransaction(signedTx);
+  } catch (error) {
+    const transactionFailure = getTransactionFailure(error);
+    if (!transactionFailure) throw error;
+
+    const failureError = new Error("Transaction failed on the network.");
+    failureError.transactionFailure = transactionFailure;
+    throw failureError;
+  }
 }
 
 /**
