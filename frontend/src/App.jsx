@@ -16,6 +16,8 @@ import {
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
+  isHorizonSlowdownError,
+  HORIZON_SLOWDOWN_MESSAGE,
 } from "./stellar";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
@@ -98,11 +100,25 @@ export default function App() {
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
+  const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
+  const [horizonNotice, setHorizonNotice] = useState(null);
 
   const showToast = (message, type = "success", explorerUrl = null) => {
     setToast({ message, type, explorerUrl });
     setTimeout(() => setToast(null), 4200);
+  };
+
+  const beginHorizonRead = () => {
+    horizonAbortRef.current?.abort();
+    const controller = new AbortController();
+    horizonAbortRef.current = controller;
+    return controller.signal;
+  };
+
+  const cancelHorizonReads = () => {
+    horizonAbortRef.current?.abort();
+    horizonAbortRef.current = null;
   };
 
   const xlmBalance = balances.find((b) => b.isNative)?.balance ?? null;
@@ -117,21 +133,37 @@ export default function App() {
     checkFreighterInstalled().then(setFreighterInstalled);
   }, []);
 
+  useEffect(() => () => cancelHorizonReads(), []);
+
   const refreshBalances = useCallback(async () => {
     if (!publicKey) return;
     setLoading("balance");
+    const signal = beginHorizonRead();
     try {
-      const next = await getAccountBalances(publicKey);
+      const next = await getAccountBalances(publicKey, { signal });
       setBalances(next);
+      setHorizonNotice(null);
       try {
-        const details = await getAccountDetails(publicKey);
+        const details = await getAccountDetails(publicKey, { signal });
         setAccountDetails(details);
-      } catch {
+      } catch (detailsError) {
+        if (detailsError?.name === "AbortError") return;
+        if (isHorizonSlowdownError(detailsError)) {
+          setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
+          showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+        }
         setAccountDetails(null);
       }
-    } catch {
+    } catch (error) {
+      if (error?.name === "AbortError") return;
       setBalances([]);
-      showToast("Account not found on Testnet yet. Fund it with Friendbot.", "error");
+      if (isHorizonSlowdownError(error)) {
+        setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
+        showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+      } else {
+        setHorizonNotice(null);
+        showToast("Account not found on Testnet yet. Fund it with Friendbot.", "error");
+      }
     } finally {
       setLoading("");
     }
@@ -168,6 +200,8 @@ export default function App() {
 
   const handleNetworkChange = (id) => {
     try {
+      cancelHorizonReads();
+      setHorizonNotice(null);
       const next = setActiveNetwork(id);
       setNetworkId(id);
       setBalances([]);
@@ -370,13 +404,21 @@ export default function App() {
   const handleHistory = async () => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     setLoading("history");
+    const signal = beginHorizonRead();
     try {
-      const page = await getTransactions(publicKey);
+      const page = await getTransactions(publicKey, 15, undefined, { signal });
       setTransactions(page.records);
       setNextCursor(page.nextCursor);
+      setHorizonNotice(null);
       if (page.records.length === 0) showToast("No payments yet.", "info");
-    } catch {
-      showToast("Could not load payment history.", "error");
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      if (isHorizonSlowdownError(error)) {
+        setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
+        showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+      } else {
+        showToast("Could not load payment history.", "error");
+      }
     } finally {
       setLoading("");
     }
@@ -385,13 +427,23 @@ export default function App() {
   const handleLoadMore = async () => {
     if (!publicKey || !nextCursor) return;
     setLoading("history-more");
+    const signal = beginHorizonRead();
     try {
       // Same page size as the first page; `undefined` keeps the default limit.
-      const page = await getTransactions(publicKey, undefined, nextCursor);
+      const page = await getTransactions(publicKey, undefined, nextCursor, {
+        signal,
+      });
       setTransactions((previous) => [...previous, ...page.records]);
       setNextCursor(page.nextCursor);
-    } catch {
-      showToast("Could not load older payments.", "error");
+      setHorizonNotice(null);
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      if (isHorizonSlowdownError(error)) {
+        setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
+        showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+      } else {
+        showToast("Could not load older payments.", "error");
+      }
     } finally {
       setLoading("");
     }
@@ -560,6 +612,11 @@ export default function App() {
                 <span className="status-dot" />
                 Connected via Freighter
               </div>
+              {horizonNotice && (
+                <p className="muted" role="status">
+                  {horizonNotice}
+                </p>
+              )}
               <div className="hero-card__balance">
                 <span className="eyebrow">XLM balance</span>
                 <span className="hero-card__amount">
