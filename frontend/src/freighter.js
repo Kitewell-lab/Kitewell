@@ -2,10 +2,11 @@ import {
   isConnected,
   setAllowed,
   getAddress,
+  getNetwork,
   signTransaction,
 } from "@stellar/freighter-api";
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { getActiveNetwork } from "./network";
+import { findNetworkByPassphrase, getActiveNetwork } from "./network";
 import { buildAsset, parsePathAssets } from "./stellar";
 
 function getServer() {
@@ -220,8 +221,40 @@ export async function connectFreighterWallet() {
   return addressResult.address;
 }
 
+/**
+ * Block signing when Freighter's network does not match the lab selection.
+ * Checked on every sign attempt so switching either side clears the block
+ * without a reload.
+ */
+export async function assertFreighterNetworkMatches() {
+  const lab = getActiveNetwork();
+  const freighter = await getNetwork();
+
+  if (freighter?.error) {
+    throw new Error(
+      freighter.error.message || "Could not read the network from Freighter."
+    );
+  }
+
+  const freighterPassphrase = freighter?.networkPassphrase;
+  if (!freighterPassphrase || freighterPassphrase === lab.passphrase) {
+    return;
+  }
+
+  const freighterLabel =
+    findNetworkByPassphrase(freighterPassphrase)?.label ||
+    freighter.network ||
+    "unknown";
+
+  throw new Error(
+    `Freighter is on ${freighterLabel} but the lab is on ${lab.label}. Switch either side to match before signing.`
+  );
+}
+
 /** Ask Freighter to sign raw XDR and return the parsed signed transaction. */
 async function signWithFreighter(unsignedXdr, publicKey) {
+  await assertFreighterNetworkMatches();
+
   const passphrase = currentPassphrase();
   const signResult = await signTransaction(unsignedXdr, {
     networkPassphrase: passphrase,

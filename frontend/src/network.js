@@ -70,3 +70,11 @@ export function setActiveNetwork(id) {
 export function isFriendbotAvailable() {
   return Boolean(getActiveNetwork().friendbotUrl);
 }
+
+/** Look up a known network by its Stellar passphrase, or null if unknown. */
+export function findNetworkByPassphrase(passphrase) {
+  return (
+    Object.values(NETWORKS).find((network) => network.passphrase === passphrase) ||
+    null
+  );
+}
