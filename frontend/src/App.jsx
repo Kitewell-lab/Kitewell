@@ -2,21 +2,31 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import {
   checkFreighterInstalled,
   connectFreighterWallet,
+  createAccountWithFreighter,
   sendPaymentWithFreighter,
   pathPaymentWithFreighter,
   changeTrustWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  TRANSACTION_FEE_STROOPS,
 } from "./freighter";
 import { shortenAddress } from "./addressFormat";
 import {
   fundWithFriendbot,
   getAccountBalances,
   getAccountDetails,
+  getLatestBaseReserve,
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
 } from "./stellar";
+import {
+  calculateMinimumBalance,
+  formatStroops,
+  minimumBalanceInStroops,
+  parseXlmToStroops,
+  remainsAboveMinimum,
+} from "./accountReserve";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
 import {
@@ -77,6 +87,13 @@ export default function App() {
     memo: "",
   });
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
+  const [createAccountForm, setCreateAccountForm] = useState({
+    destination: "",
+    startingBalance: "",
+  });
+  const [baseReserveInStroops, setBaseReserveInStroops] = useState(null);
+  const [reserveError, setReserveError] = useState(null);
+  const [reserveSubentryCount, setReserveSubentryCount] = useState("0");
   const [pathForm, setPathForm] = useState({
     mode: "strictSend",
     destination: "",
@@ -112,6 +129,20 @@ export default function App() {
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
   const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
+  const transactionFee = formatStroops(TRANSACTION_FEE_STROOPS);
+
+  const refreshReserve = useCallback(async () => {
+    try {
+      const baseReserve = await getLatestBaseReserve();
+      setBaseReserveInStroops(baseReserve);
+      setReserveError(null);
+    } catch (error) {
+      setBaseReserveInStroops(null);
+      setReserveError(
+        error.message || "Could not load the latest ledger reserve from Horizon."
+      );
+    }
+  }, []);
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -126,16 +157,20 @@ export default function App() {
       try {
         const details = await getAccountDetails(publicKey);
         setAccountDetails(details);
+        if (Number.isInteger(details.subentryCount)) {
+          setReserveSubentryCount(String(details.subentryCount));
+        }
       } catch {
         setAccountDetails(null);
       }
+      await refreshReserve();
     } catch {
       setBalances([]);
       showToast("Account not found on Testnet yet. Fund it with Friendbot.", "error");
     } finally {
       setLoading("");
     }
-  }, [publicKey]);
+  }, [publicKey, refreshReserve]);
 
   const handleConnect = async () => {
     setLoading("connect");
@@ -144,12 +179,24 @@ export default function App() {
       setPublicKey(address);
       setBalances([]);
       setTransactions([]);
+      setAccountDetails(null);
+      setReserveSubentryCount("0");
+      await refreshReserve();
       showToast("Freighter connected.");
       try {
         const next = await getAccountBalances(address);
         setBalances(next);
       } catch {
         /* unfunded until Friendbot */
+      }
+      try {
+        const details = await getAccountDetails(address);
+        setAccountDetails(details);
+        if (Number.isInteger(details.subentryCount)) {
+          setReserveSubentryCount(String(details.subentryCount));
+        }
+      } catch {
+        setAccountDetails(null);
       }
     } catch (e) {
       showToast(e.message || "Failed to connect Freighter.", "error");
@@ -173,8 +220,12 @@ export default function App() {
       setBalances([]);
       setTransactions([]);
       setAccountDetails(null);
+      setBaseReserveInStroops(null);
+      setReserveError(null);
+      setReserveSubentryCount("0");
       showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
       if (publicKey) refreshBalances();
+      else if (activeTab === "Assets") refreshReserve();
     } catch (e) {
       showToast(e.message || "Could not switch network.", "error");
     }
@@ -190,6 +241,30 @@ export default function App() {
       showToast("Funded with Testnet XLM via Friendbot.");
     } catch (e) {
       showToast(e.message || "Funding failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleCreateAccount = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("create-account");
+    try {
+      const result = await createAccountWithFreighter(
+        publicKey,
+        createAccountForm.destination,
+        createAccountForm.startingBalance
+      );
+      setCreateAccountForm({ destination: "", startingBalance: "" });
+      await refreshBalances();
+      showToast(
+        `Account created · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (error) {
+      showToast(error.message || "Account creation failed.", "error");
     } finally {
       setLoading("");
     }
@@ -398,6 +473,62 @@ export default function App() {
   };
 
   const requireWallet = !publicKey;
+  const actualSubentryCount = accountDetails?.subentryCount;
+  const sourceMinimumStroops =
+    baseReserveInStroops != null && Number.isInteger(actualSubentryCount)
+      ? minimumBalanceInStroops(baseReserveInStroops, actualSubentryCount)
+      : null;
+  const trustlineAlreadyExists = balances.some(
+    (balance) =>
+      !balance.isNative &&
+      balance.code === trustForm.code.trim().toUpperCase() &&
+      balance.issuer === trustForm.issuer.trim()
+  );
+  const trustlineMinimum =
+    baseReserveInStroops != null && Number.isInteger(actualSubentryCount)
+      ? minimumBalanceInStroops(
+          baseReserveInStroops,
+          actualSubentryCount + (trustlineAlreadyExists ? 0 : 1)
+        )
+      : null;
+  let createAccountAffordable = false;
+  let createAccountDestinationAffordable = false;
+  let createAccountCheckError = null;
+  if (
+    sourceMinimumStroops != null &&
+    xlmBalance != null &&
+    createAccountForm.startingBalance
+  ) {
+    try {
+      createAccountAffordable = remainsAboveMinimum(
+        xlmBalance,
+        createAccountForm.startingBalance,
+        TRANSACTION_FEE_STROOPS,
+        sourceMinimumStroops
+      );
+      createAccountDestinationAffordable =
+        parseXlmToStroops(createAccountForm.startingBalance, "Starting balance") >=
+        minimumBalanceInStroops(baseReserveInStroops, 0);
+    } catch (error) {
+      createAccountAffordable = false;
+      createAccountDestinationAffordable = false;
+      createAccountCheckError = error.message;
+    }
+  }
+  let trustlineAffordable = false;
+  let trustlineCheckError = null;
+  if (xlmBalance != null && trustlineMinimum != null) {
+    try {
+      trustlineAffordable = remainsAboveMinimum(
+        xlmBalance,
+        "0",
+        TRANSACTION_FEE_STROOPS,
+        trustlineMinimum
+      );
+    } catch (error) {
+      trustlineCheckError = error.message;
+    }
+  }
 
   const loadLabInfo = async () => {
     setLoading("lab");
@@ -482,7 +613,10 @@ export default function App() {
       loadLabInfo();
       refreshLabState();
     }
-    if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
+    if (tab === "Assets") {
+      if (publicKey) refreshBalances();
+      else refreshReserve();
+    } else if ((tab === "Wallet" || tab === "Send") && publicKey) {
       refreshBalances();
     }
   };
@@ -780,6 +914,101 @@ export default function App() {
                   "Request Friendbot XLM"
                 )}
               </button>
+              <form className="form" onSubmit={handleCreateAccount}>
+                <h3 className="subhead">Create account from this wallet</h3>
+                <p className="muted">
+                  Create a Stellar account by sending XLM from your connected
+                  account. This is separate from Friendbot funding.
+                </p>
+                <label className="label" htmlFor="create-account-destination">
+                  New account address
+                </label>
+                <input
+                  id="create-account-destination"
+                  className="input"
+                  value={createAccountForm.destination}
+                  onChange={(event) =>
+                    setCreateAccountForm({
+                      ...createAccountForm,
+                      destination: event.target.value,
+                    })
+                  }
+                  placeholder="G…"
+                  required
+                />
+                <label className="label" htmlFor="create-account-amount">
+                  Starting balance (XLM)
+                </label>
+                <input
+                  id="create-account-amount"
+                  className="input"
+                  type="number"
+                  min="0.0000001"
+                  step="0.0000001"
+                  value={createAccountForm.startingBalance}
+                  onChange={(event) =>
+                    setCreateAccountForm({
+                      ...createAccountForm,
+                      startingBalance: event.target.value,
+                    })
+                  }
+                  required
+                />
+                <div className="info-box" aria-live="polite">
+                  <span className="eyebrow">Source account reserve check</span>
+                  <span>Source balance: {xlmBalance ?? "—"} XLM</span>
+                  <span>
+                    Amount: {createAccountForm.startingBalance || "—"} XLM
+                  </span>
+                  <span>Transaction fee: {transactionFee} XLM</span>
+                  <span>
+                    Source minimum:{" "}
+                    {sourceMinimumStroops == null
+                      ? "—"
+                      : `${formatStroops(sourceMinimumStroops)} XLM`}
+                  </span>
+                  {baseReserveInStroops == null ? (
+                    <p className="muted">
+                      {reserveError ||
+                        "Load the latest ledger before checking account creation."}
+                    </p>
+                  ) : !accountDetails ? (
+                    <p className="muted">
+                      Connect and load the source account to check its minimum.
+                    </p>
+                  ) : createAccountCheckError ? (
+                    <p className="muted">{createAccountCheckError}</p>
+                  ) : !createAccountForm.startingBalance ? (
+                    <p className="muted">Enter a starting balance to run the check.</p>
+                  ) : (
+                    <strong>
+                      {createAccountAffordable && createAccountDestinationAffordable
+                        ? "Source remains above its minimum; starting balance covers the new account minimum."
+                        : "This amount does not satisfy the source or new-account minimum."}
+                    </strong>
+                  )}
+                </div>
+                <button
+                  className="btn btn--primary"
+                  type="submit"
+                  disabled={
+                    loading === "create-account" ||
+                    requireWallet ||
+                    !accountDetails ||
+                    baseReserveInStroops == null ||
+                    !createAccountAffordable ||
+                    !createAccountDestinationAffordable
+                  }
+                >
+                  {loading === "create-account" ? (
+                    <>
+                      <Spinner /> Creating…
+                    </>
+                  ) : (
+                    "Sign create-account"
+                  )}
+                </button>
+              </form>
             </div>
           )}
 
@@ -790,6 +1019,40 @@ export default function App() {
                 View holdings, open a trustline, or remove an empty one with Freighter{" "}
                 <code>signTransaction</code>. Removing sets the limit to 0.
               </p>
+              <div className="info-box">
+                <span className="eyebrow">Minimum XLM calculator</span>
+                <label className="label" htmlFor="reserve-subentries">
+                  Subentry count
+                </label>
+                <input
+                  id="reserve-subentries"
+                  className="input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={reserveSubentryCount}
+                  onChange={(event) =>
+                    setReserveSubentryCount(event.target.value)
+                  }
+                />
+                {baseReserveInStroops == null ? (
+                  <p className="muted">
+                    {reserveError ||
+                      "Connect a wallet and load the latest ledger to calculate the minimum."}
+                  </p>
+                ) : !/^\d+$/.test(reserveSubentryCount) ? (
+                  <p className="muted">
+                    Enter a non-negative whole number of subentries.
+                  </p>
+                ) : (
+                  <p className="muted">
+                    Base reserve from the latest Horizon ledger:{" "}
+                    {formatStroops(baseReserveInStroops)} XLM. Minimum balance:{" "}
+                    {calculateMinimumBalance(baseReserveInStroops, reserveSubentryCount)}{" "}
+                    XLM.
+                  </p>
+                )}
+              </div>
 
               {balances.length > 0 ? (
                 <ul className="balance-list">
@@ -875,10 +1138,53 @@ export default function App() {
                   value={trustForm.limit}
                   onChange={(e) => setTrustForm({ ...trustForm, limit: e.target.value })}
                 />
+                <div className="info-box" aria-live="polite">
+                  <span className="eyebrow">Trustline reserve check</span>
+                  {baseReserveInStroops == null ? (
+                    <p className="muted">
+                      {reserveError ||
+                        "Load the latest ledger before checking this trustline."}
+                    </p>
+                  ) : !accountDetails || trustlineMinimum == null ? (
+                    <p className="muted">
+                      Connect and load the source account, including its subentry count, to check its reserve.
+                    </p>
+                  ) : trustlineCheckError ? (
+                    <p className="muted">{trustlineCheckError}</p>
+                  ) : (
+                    <>
+                      <span>
+                        Extra reserve:{" "}
+                        {trustlineAlreadyExists
+                          ? "0.0000000"
+                          : formatStroops(baseReserveInStroops)}{" "}
+                        XLM
+                      </span>
+                      <span>
+                        Required after trustline and fee:{" "}
+                        {formatStroops(
+                          trustlineMinimum + BigInt(TRANSACTION_FEE_STROOPS)
+                        )}{" "}
+                        XLM
+                      </span>
+                      <strong>
+                        {trustlineAffordable
+                          ? "Source can cover the reserve and fee."
+                          : "Source balance is below the required reserve and fee."}
+                      </strong>
+                    </>
+                  )}
+                </div>
                 <button
                   className="btn btn--primary"
                   type="submit"
-                  disabled={loading === "trust" || requireWallet}
+                  disabled={
+                    loading === "trust" ||
+                    requireWallet ||
+                    !accountDetails ||
+                    baseReserveInStroops == null ||
+                    !trustlineAffordable
+                  }
                 >
                   {loading === "trust" ? (
                     <>

@@ -97,8 +97,10 @@ The Testnet lab UI, using the existing assets in [`screenshots/`](./screenshots)
 
 - Freighter connect / disconnect (`setAllowed`, `getAddress`, `signTransaction`)
 - Friendbot funding (Testnet only)
+- Source-funded account creation with live source-reserve and fee checks
 - Testnet / Futurenet network toggle (persisted in `localStorage`)
-- Balances + `changeTrust` (open a trustline or remove an empty one)
+- Balances + `changeTrust` (open a trustline or remove an empty one), with a
+  minimum-balance calculator and pre-sign reserve check
 - XLM + credit-asset payments (asset picked from balances) + history
 - Path payments (`pathPaymentStrictSend` / `pathPaymentStrictReceive`)
 - Backend-backed account/payment reads (Horizon fallback)
@@ -106,6 +108,8 @@ The Testnet lab UI, using the existing assets in [`screenshots/`](./screenshots)
 - Lab tab Soroban registry: Freighter-signed `register(caller, name)` check-in + `lab_name` / `builder_count` / `get_builder` reads
 
 Send supports optional text memos up to 28 UTF-8 bytes, uint64 ID memos, and 32-byte hash memos.
+The reserve calculator and transaction checks use the base reserve reported by the latest
+Horizon ledger; if that ledger cannot be loaded, reserve-dependent signing is disabled.
 
 ### Path payments (Testnet)
 
