@@ -6,7 +6,11 @@ import {
 } from "@stellar/freighter-api";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
-import { buildAsset, parsePathAssets } from "./stellar";
+import {
+  buildAsset,
+  parsePathAssets,
+  getAccountAssetBalance,
+} from "./stellar";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -245,6 +249,27 @@ async function signAndSubmit(transaction, publicKey) {
   return getServer().submitTransaction(signedTx);
 }
 
+/** Compare Stellar amounts without floating point. */
+function amountToStroops(value) {
+  const [whole, fraction = ""] = String(value).trim().split(".");
+  return (
+    BigInt(whole || "0") * 10000000n +
+    BigInt((fraction + "0000000").slice(0, 7))
+  );
+}
+
+/** Whether a parsed transaction envelope already carries `publicKey`'s signature. */
+function hasSignatureFrom(transaction, publicKey) {
+  const hint = StellarSdk.StrKey.decodeEd25519PublicKey(publicKey).slice(-4);
+  return transaction.signatures.some((signature) => {
+    const signatureHint = signature.hint();
+    return (
+      signatureHint.length === hint.length &&
+      hint.every((byte, index) => byte === signatureHint[index])
+    );
+  });
+}
+
 /**
  * Validate a Stellar amount string (positive, max 7 decimal places) without
  * going through floating point, so values like 0.0000001 stay intact.
@@ -427,4 +452,138 @@ export async function changeTrustWithFreighter(
     .build();
 
   return signAndSubmit(transaction, publicKey);
+}
+
+/**
+ * Claw back part of a holder's balance for an asset the connected account
+ * issued with clawback enabled. The holder's balance is read from Horizon
+ * before signing, and an oversized amount is refused locally.
+ */
+export async function clawbackWithFreighter(
+  issuer,
+  holder,
+  assetCode,
+  assetIssuer,
+  amount
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(holder)) {
+    throw new Error("Holder must be a valid Stellar public key (G…).");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(assetIssuer)) {
+    throw new Error("Asset issuer must be a valid Stellar public key (G…).");
+  }
+  if (assetIssuer !== issuer) {
+    throw new Error("Only the asset issuer can claw back a balance.");
+  }
+
+  const clawbackAmount = normalizeAmount(amount, "Clawback amount");
+  const asset = resolvePaymentAsset({
+    isNative: false,
+    code: assetCode,
+    issuer: assetIssuer,
+  });
+
+  const holderBalance = await getAccountAssetBalance(
+    holder,
+    asset.getCode(),
+    assetIssuer
+  );
+  if (amountToStroops(clawbackAmount) > amountToStroops(holderBalance)) {
+    throw new Error(
+      `Clawback amount exceeds the holder's ${asset.getCode()} balance of ${holderBalance}.`
+    );
+  }
+
+  const sourceAccount = await getServer().loadAccount(issuer);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.clawback({
+        asset,
+        amount: clawbackAmount,
+        from: holder,
+      })
+    )
+    .setTimeout(180)
+    .build();
+
+  return signAndSubmit(transaction, issuer);
+}
+
+/**
+ * Sponsor a trustline for another account in one envelope:
+ * beginSponsoringFutureReserves → changeTrust (sponsored source) →
+ * endSponsoringFutureReserves. Both the sponsor and the sponsored account
+ * must sign the same envelope before it is submitted.
+ */
+export async function sponsorTrustlineWithFreighter({
+  publicKey,
+  sponsoredAccount,
+  assetCode,
+  assetIssuer,
+  limit = "1000000",
+} = {}) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(sponsoredAccount)) {
+    throw new Error("Sponsored account must be a valid Stellar public key (G…).");
+  }
+  if (sponsoredAccount === publicKey) {
+    throw new Error("You cannot sponsor a trustline for the connected account.");
+  }
+
+  const code = (assetCode || "").trim().toUpperCase();
+  if (!code || code.length > 12) {
+    throw new Error("Asset code must be 1–12 characters.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(assetIssuer)) {
+    throw new Error("Issuer must be a valid Stellar public key (G…).");
+  }
+
+  const asset = new StellarSdk.Asset(code, assetIssuer);
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.beginSponsoringFutureReserves({
+        sponsoredId: sponsoredAccount,
+      })
+    )
+    .addOperation(
+      StellarSdk.Operation.changeTrust({
+        asset,
+        limit: limit.toString(),
+        source: sponsoredAccount,
+      })
+    )
+    .addOperation(
+      StellarSdk.Operation.endSponsoringFutureReserves({ source: publicKey })
+    )
+    .setTimeout(180)
+    .build();
+
+  const sponsorSigned = await signWithFreighter(
+    transaction.toXDR(),
+    publicKey
+  );
+  if (!hasSignatureFrom(sponsorSigned, publicKey)) {
+    throw new Error("Freighter did not return the sponsor signature.");
+  }
+
+  const fullySigned = await signWithFreighter(
+    sponsorSigned.toXDR(),
+    sponsoredAccount
+  );
+  if (!hasSignatureFrom(fullySigned, sponsoredAccount)) {
+    throw new Error(
+      "Both the sponsor and the sponsored account must sign the envelope."
+    );
+  }
+
+  return getServer().submitTransaction(fullySigned);
 }

@@ -5,14 +5,19 @@ import {
   sendPaymentWithFreighter,
   pathPaymentWithFreighter,
   changeTrustWithFreighter,
+  clawbackWithFreighter,
+  sponsorTrustlineWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
 } from "./freighter";
+import { createSubmitGuard } from "./submitGuard";
+import { createTxLog, downloadTxLog } from "./txLog";
 import { shortenAddress } from "./addressFormat";
 import {
   fundWithFriendbot,
   getAccountBalances,
   getAccountDetails,
+  getIssuedClawbackAssets,
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
@@ -99,10 +104,47 @@ export default function App() {
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
+  const [clawbackAssets, setClawbackAssets] = useState([]);
+  const [clawbackForm, setClawbackForm] = useState({
+    assetKey: "",
+    holder: "",
+    amount: "",
+  });
+  const [sponsorForm, setSponsorForm] = useState({
+    sponsoredAccount: "",
+    code: "",
+    issuer: "",
+  });
+  const [sessionTxs, setSessionTxs] = useState([]);
+  const submitGuardRef = useRef(createSubmitGuard());
+  const txLogRef = useRef(createTxLog());
 
   const showToast = (message, type = "success", explorerUrl = null) => {
     setToast({ message, type, explorerUrl });
     setTimeout(() => setToast(null), 4200);
+  };
+
+  /** Append a successful submission to the in-memory session log. */
+  const trackSubmission = (hash, operationType) => {
+    txLogRef.current.record({
+      hash,
+      operationType,
+      network: getActiveNetworkId(),
+    });
+    setSessionTxs(txLogRef.current.list());
+  };
+
+  const handleDownloadTxLog = () => {
+    if (sessionTxs.length === 0) return;
+    downloadTxLog(txLogRef.current);
+  };
+
+  /** Ask for an extra confirmation before repeating an identical submit. */
+  const confirmDuplicate = (message) => {
+    if (typeof window === "undefined" || typeof window.confirm !== "function") {
+      return false;
+    }
+    return window.confirm(message);
   };
 
   const xlmBalance = balances.find((b) => b.isNative)?.balance ?? null;
@@ -137,10 +179,30 @@ export default function App() {
     }
   }, [publicKey]);
 
+  const refreshClawbackAssets = useCallback(async () => {
+    if (!publicKey) {
+      setClawbackAssets([]);
+      return;
+    }
+    try {
+      const assets = await getIssuedClawbackAssets(publicKey);
+      setClawbackAssets(assets);
+      setClawbackForm((previous) => ({
+        ...previous,
+        assetKey: assets.some((asset) => asset.key === previous.assetKey)
+          ? previous.assetKey
+          : assets[0]?.key || "",
+      }));
+    } catch {
+      setClawbackAssets([]);
+    }
+  }, [publicKey]);
+
   const handleConnect = async () => {
     setLoading("connect");
     try {
       const address = await connectFreighterWallet();
+      submitGuardRef.current.reset();
       setPublicKey(address);
       setBalances([]);
       setTransactions([]);
@@ -159,20 +221,28 @@ export default function App() {
   };
 
   const handleDisconnect = () => {
+    submitGuardRef.current.reset();
+    txLogRef.current.clear();
+    setSessionTxs([]);
     setPublicKey(null);
     setBalances([]);
     setTransactions([]);
     setAccountDetails(null);
+    setClawbackAssets([]);
+    setClawbackForm({ assetKey: "", holder: "", amount: "" });
+    setSponsorForm({ sponsoredAccount: "", code: "", issuer: "" });
     showToast("Disconnected.");
   };
 
   const handleNetworkChange = (id) => {
     try {
       const next = setActiveNetwork(id);
+      submitGuardRef.current.reset();
       setNetworkId(id);
       setBalances([]);
       setTransactions([]);
       setAccountDetails(null);
+      setClawbackAssets([]);
       showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
       if (publicKey) refreshBalances();
     } catch (e) {
@@ -207,14 +277,29 @@ export default function App() {
     } catch (err) {
       return showToast(err.message, "error");
     }
+    const limit = trustForm.limit || "1000000";
+    const fingerprint = `${code}|${trustForm.issuer}|${limit}`;
+    const gate = submitGuardRef.current.begin("trust", fingerprint);
+    if (!gate.allowed) return;
+    if (
+      gate.duplicate &&
+      !confirmDuplicate(
+        "You submitted this exact trustline in the last 15 seconds. Submit it again?"
+      )
+    ) {
+      submitGuardRef.current.end("trust");
+      return;
+    }
+
     setLoading("trust");
     try {
-      await changeTrustWithFreighter(
+      const result = await changeTrustWithFreighter(
         publicKey,
         code,
         trustForm.issuer,
-        trustForm.limit || "1000000"
+        limit
       );
+      trackSubmission(result.hash, "changeTrust");
       const next = await getAccountBalances(publicKey);
       setBalances(next);
       setTrustForm({ code: "", issuer: "", limit: "1000000" });
@@ -222,6 +307,7 @@ export default function App() {
     } catch (err) {
       showToast(err.message || "Change trust failed.", "error");
     } finally {
+      submitGuardRef.current.end("trust");
       setLoading("");
     }
   };
@@ -235,15 +321,26 @@ export default function App() {
       );
     }
 
-    setLoading(`remove-${asset.key}`);
+    const guardKey = `remove-${asset.key}`;
+    const gate = submitGuardRef.current.begin(guardKey, asset.key);
+    if (!gate.allowed) return;
+
+    setLoading(guardKey);
     try {
-      await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
+      const result = await changeTrustWithFreighter(
+        publicKey,
+        asset.code,
+        asset.issuer,
+        "0"
+      );
+      trackSubmission(result.hash, "changeTrust");
       const next = await getAccountBalances(publicKey);
       setBalances(next);
       showToast(`${asset.code} trustline removed.`);
     } catch (err) {
       showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
     } finally {
+      submitGuardRef.current.end(guardKey);
       setLoading("");
     }
   };
@@ -282,6 +379,25 @@ export default function App() {
       ? { isNative: true }
       : { isNative: false, code: selected.code, issuer: selected.issuer };
 
+    const fingerprint = [
+      sendForm.destination,
+      amount,
+      sendForm.assetKey,
+      sendForm.memoType,
+      sendForm.memo,
+    ].join("|");
+    const gate = submitGuardRef.current.begin("send", fingerprint);
+    if (!gate.allowed) return;
+    if (
+      gate.duplicate &&
+      !confirmDuplicate(
+        "You submitted this exact payment in the last 15 seconds. Submit it again?"
+      )
+    ) {
+      submitGuardRef.current.end("send");
+      return;
+    }
+
     setLoading("send");
     try {
       const result = await sendPaymentWithFreighter(
@@ -292,6 +408,7 @@ export default function App() {
         sendForm.memoType,
         sendForm.memo
       );
+      trackSubmission(result.hash, "payment");
       const next = await getAccountBalances(publicKey);
       setBalances(next);
       setSendForm({
@@ -309,6 +426,7 @@ export default function App() {
     } catch (err) {
       showToast(err.message || "Payment failed.", "error");
     } finally {
+      submitGuardRef.current.end("send");
       setLoading("");
     }
   };
@@ -324,6 +442,31 @@ export default function App() {
     }
     if (pathForm.destAssetType === "credit" && (!pathForm.destCode || !pathForm.destIssuer)) {
       return showToast("Destination asset code and issuer are required.", "error");
+    }
+
+    const fingerprint = [
+      pathForm.mode,
+      pathForm.destination,
+      pathForm.amount,
+      pathForm.bound,
+      pathForm.sendAssetType,
+      pathForm.sendCode,
+      pathForm.sendIssuer,
+      pathForm.destAssetType,
+      pathForm.destCode,
+      pathForm.destIssuer,
+      pathForm.path,
+    ].join("|");
+    const gate = submitGuardRef.current.begin("path", fingerprint);
+    if (!gate.allowed) return;
+    if (
+      gate.duplicate &&
+      !confirmDuplicate(
+        "You submitted this exact path payment in the last 15 seconds. Submit it again?"
+      )
+    ) {
+      submitGuardRef.current.end("path");
+      return;
     }
 
     setLoading("path");
@@ -349,6 +492,7 @@ export default function App() {
         path: pathForm.path,
       });
 
+      trackSubmission(result.hash, "pathPayment");
       setPathResult({
         hash: result.hash,
         explorerUrl: explorerTxUrl(result.hash),
@@ -363,6 +507,97 @@ export default function App() {
     } catch (err) {
       showToast(err.message || "Path payment failed.", "error");
     } finally {
+      submitGuardRef.current.end("path");
+      setLoading("");
+    }
+  };
+
+  const handleClawback = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    const asset = clawbackAssets.find(
+      (candidate) => candidate.key === clawbackForm.assetKey
+    );
+    if (!asset) {
+      return showToast(
+        "Choose an asset you issue with clawback enabled.",
+        "error"
+      );
+    }
+    if (!clawbackForm.holder || !clawbackForm.amount) {
+      return showToast("Holder and amount are required.", "error");
+    }
+
+    const gate = submitGuardRef.current.begin(
+      "clawback",
+      `${asset.key}|${clawbackForm.holder}|${clawbackForm.amount}`
+    );
+    if (!gate.allowed) return;
+
+    setLoading("clawback");
+    try {
+      const result = await clawbackWithFreighter(
+        publicKey,
+        clawbackForm.holder,
+        asset.code,
+        asset.issuer,
+        clawbackForm.amount
+      );
+      trackSubmission(result.hash, "clawback");
+      setClawbackForm((previous) => ({
+        ...previous,
+        holder: "",
+        amount: "",
+      }));
+      showToast(
+        `Clawback submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (err) {
+      showToast(err.message || "Clawback failed.", "error");
+    } finally {
+      submitGuardRef.current.end("clawback");
+      setLoading("");
+    }
+  };
+
+  const handleSponsor = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!sponsorForm.sponsoredAccount) {
+      return showToast("Sponsored account is required.", "error");
+    }
+    if (!sponsorForm.code || !sponsorForm.issuer) {
+      return showToast("Asset code and issuer are required.", "error");
+    }
+
+    const gate = submitGuardRef.current.begin(
+      "sponsor",
+      `${sponsorForm.sponsoredAccount}|${sponsorForm.code}|${sponsorForm.issuer}`
+    );
+    if (!gate.allowed) return;
+
+    setLoading("sponsor");
+    try {
+      const result = await sponsorTrustlineWithFreighter({
+        publicKey,
+        sponsoredAccount: sponsorForm.sponsoredAccount,
+        assetCode: sponsorForm.code,
+        assetIssuer: sponsorForm.issuer,
+      });
+      trackSubmission(result.hash, "sponsorTrustline");
+      setSponsorForm({ sponsoredAccount: "", code: "", issuer: "" });
+      showToast(
+        `Sponsored trustline submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (err) {
+      showToast(err.message || "Sponsored trustline failed.", "error");
+    } finally {
+      submitGuardRef.current.end("sponsor");
       setLoading("");
     }
   };
@@ -451,6 +686,12 @@ export default function App() {
     if (!registerForm.name.trim()) {
       return showToast("Enter a builder name to register.", "error");
     }
+    const gate = submitGuardRef.current.begin(
+      "register",
+      `${contractId}|${registerForm.name.trim()}`
+    );
+    if (!gate.allowed) return;
+
     setLoading("register");
     try {
       const result = await registerBuilderWithFreighter(
@@ -458,6 +699,7 @@ export default function App() {
         contractId,
         registerForm.name
       );
+      trackSubmission(result.hash, "register");
       setLastRegisterTx(result);
       setRegisterForm({ name: "" });
       showToast(
@@ -471,6 +713,7 @@ export default function App() {
     } catch (err) {
       showToast(err.message || "Contract invoke failed.", "error");
     } finally {
+      submitGuardRef.current.end("register");
       setLoading("");
     }
   };
@@ -482,9 +725,11 @@ export default function App() {
       loadLabInfo();
       refreshLabState();
     }
-    if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
+    if (!publicKey) return;
+    if (tab === "Wallet" || tab === "Assets" || tab === "Send") {
       refreshBalances();
     }
+    if (tab === "Assets") refreshClawbackAssets();
   };
 
   const handleTabKeyDown = (event, index) => {
@@ -888,6 +1133,162 @@ export default function App() {
                     "Sign changeTrust"
                   )}
                 </button>
+              </form>
+
+              <form onSubmit={handleSponsor} className="form">
+                <h3 className="subhead">Sponsor a trustline</h3>
+                <p className="muted">
+                  The sponsor pays the reserve. One transaction runs
+                  beginSponsoringFutureReserves → changeTrust for the sponsored
+                  account → endSponsoringFutureReserves. The sponsored account must
+                  sign the same envelope too, so Freighter will prompt twice.
+                </p>
+                <label className="label" htmlFor="sponsor-account">
+                  Sponsored account
+                </label>
+                <input
+                  id="sponsor-account"
+                  className="input"
+                  value={sponsorForm.sponsoredAccount}
+                  onChange={(e) =>
+                    setSponsorForm({
+                      ...sponsorForm,
+                      sponsoredAccount: e.target.value,
+                    })
+                  }
+                  placeholder="G…"
+                  required
+                />
+                <label className="label" htmlFor="sponsor-code">
+                  Asset code
+                </label>
+                <input
+                  id="sponsor-code"
+                  className="input"
+                  value={sponsorForm.code}
+                  onChange={(e) =>
+                    setSponsorForm({ ...sponsorForm, code: e.target.value })
+                  }
+                  placeholder="USDC"
+                  maxLength={12}
+                  required
+                />
+                <label className="label" htmlFor="sponsor-issuer">
+                  Issuer
+                </label>
+                <input
+                  id="sponsor-issuer"
+                  className="input"
+                  value={sponsorForm.issuer}
+                  onChange={(e) =>
+                    setSponsorForm({ ...sponsorForm, issuer: e.target.value })
+                  }
+                  placeholder="G…"
+                  required
+                />
+                <button
+                  className="btn btn--primary"
+                  type="submit"
+                  disabled={loading === "sponsor" || requireWallet}
+                >
+                  {loading === "sponsor" ? (
+                    <>
+                      <Spinner /> Waiting for signatures…
+                    </>
+                  ) : (
+                    "Sign & sponsor trustline"
+                  )}
+                </button>
+              </form>
+
+              <form onSubmit={handleClawback} className="form">
+                <h3 className="subhead">Claw back an issued asset</h3>
+                <p className="muted">
+                  Only the issuer can claw back, and only for an asset with the
+                  clawback flag enabled. The holder&apos;s balance is read from
+                  Horizon before you sign.
+                </p>
+                {!publicKey && (
+                  <p className="muted">Connect a wallet to list your issued assets.</p>
+                )}
+                {publicKey && clawbackAssets.length === 0 && (
+                  <p className="muted">
+                    No assets with clawback enabled are issued by the connected
+                    account.
+                  </p>
+                )}
+                {publicKey && clawbackAssets.length > 0 && (
+                  <>
+                    <label className="label" htmlFor="clawback-asset">
+                      Asset
+                    </label>
+                    <select
+                      id="clawback-asset"
+                      className="input"
+                      value={clawbackForm.assetKey}
+                      onChange={(e) =>
+                        setClawbackForm({
+                          ...clawbackForm,
+                          assetKey: e.target.value,
+                        })
+                      }
+                    >
+                      {clawbackAssets.map((asset) => (
+                        <option key={asset.key} value={asset.key}>
+                          {asset.code}
+                        </option>
+                      ))}
+                    </select>
+                    <label className="label" htmlFor="clawback-holder">
+                      Holder
+                    </label>
+                    <input
+                      id="clawback-holder"
+                      className="input"
+                      value={clawbackForm.holder}
+                      onChange={(e) =>
+                        setClawbackForm({
+                          ...clawbackForm,
+                          holder: e.target.value,
+                        })
+                      }
+                      placeholder="G…"
+                      required
+                    />
+                    <label className="label" htmlFor="clawback-amount">
+                      Amount
+                    </label>
+                    <input
+                      id="clawback-amount"
+                      className="input"
+                      type="number"
+                      step="0.0000001"
+                      min="0.0000001"
+                      value={clawbackForm.amount}
+                      onChange={(e) =>
+                        setClawbackForm({
+                          ...clawbackForm,
+                          amount: e.target.value,
+                        })
+                      }
+                      placeholder="e.g. 5"
+                      required
+                    />
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "clawback" || requireWallet}
+                    >
+                      {loading === "clawback" ? (
+                        <>
+                          <Spinner /> Signing in Freighter…
+                        </>
+                      ) : (
+                        "Sign clawback"
+                      )}
+                    </button>
+                  </>
+                )}
               </form>
             </div>
           )}
@@ -1412,6 +1813,24 @@ export default function App() {
                   </button>
                 </div>
               )}
+              <div className="info-box">
+                <span className="eyebrow">Session transactions</span>
+                <p className="muted">
+                  {sessionTxs.length === 0
+                    ? "No transactions submitted this session yet."
+                    : `${sessionTxs.length} successful submission${
+                        sessionTxs.length === 1 ? "" : "s"
+                      } this session. The list is cleared on disconnect or reload.`}
+                </p>
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={handleDownloadTxLog}
+                  disabled={sessionTxs.length === 0}
+                >
+                  Download JSON
+                </button>
+              </div>
             </div>
           )}
         </section>

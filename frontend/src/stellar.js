@@ -154,6 +154,58 @@ export async function getAccountDetails(publicKey) {
   };
 }
 
+/**
+ * List the assets issued by `publicKey` that have clawback enabled.
+ * Horizon's accounts endpoint lists what an account holds, not what it
+ * issues, so this reads the issued-asset index directly.
+ */
+export async function getIssuedClawbackAssets(publicKey) {
+  const params = new URLSearchParams({
+    asset_issuer: publicKey,
+    limit: "200",
+  });
+  const response = await fetch(
+    `${getActiveNetwork().horizonUrl}/assets?${params.toString()}`
+  );
+  if (!response.ok) {
+    throw new Error("Could not load the assets issued by this account.");
+  }
+
+  const data = await response.json();
+  return (data._embedded?.records || [])
+    .filter((asset) => asset.flags?.clawback_enabled)
+    .map((asset) => ({
+      key: `${asset.asset_code}:${asset.asset_issuer}`,
+      code: asset.asset_code,
+      issuer: asset.asset_issuer,
+      isNative: false,
+    }));
+}
+
+/**
+ * Read a holder's balance of one credit asset straight from Horizon.
+ * Throws when the holder has no trustline for that asset.
+ */
+export async function getAccountAssetBalance(
+  publicKey,
+  assetCode,
+  assetIssuer
+) {
+  const account = await getServer().loadAccount(publicKey);
+  const code = (assetCode || "").trim().toUpperCase();
+  const match = mapHorizonBalances(account).find(
+    (balance) =>
+      !balance.isNative &&
+      balance.code === code &&
+      balance.issuer === assetIssuer
+  );
+
+  if (!match) {
+    throw new Error(`Holder has no trustline for ${code || "that asset"}.`);
+  }
+  return match.balance;
+}
+
 export async function getBalance(publicKey) {
   const balances = await getAccountBalances(publicKey);
   const xlm = balances.find((b) => b.isNative);
