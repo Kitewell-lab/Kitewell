@@ -6,7 +6,17 @@ import {
 } from "@stellar/freighter-api";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
-import { buildAsset, parsePathAssets } from "./stellar";
+import {
+  buildAsset,
+  getLatestBaseReserve,
+  parsePathAssets,
+} from "./stellar";
+import {
+  formatStroops,
+  minimumBalanceInStroops,
+  parseXlmToStroops,
+  remainsAboveMinimum,
+} from "./accountReserve";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -18,6 +28,7 @@ function currentPassphrase() {
 
 const MAX_MEMO_TEXT_BYTES = 28;
 const MAX_U64 = 18446744073709551615n;
+export const TRANSACTION_FEE_STROOPS = StellarSdk.BASE_FEE;
 
 /** Public Stellar RPC endpoint for Soroban reads + invokes (Testnet). */
 export const SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
@@ -413,6 +424,42 @@ export async function changeTrustWithFreighter(
 
   const asset = new StellarSdk.Asset(assetCode.toUpperCase(), assetIssuer);
   const sourceAccount = await getServer().loadAccount(publicKey);
+  if (limit !== "0") {
+    const baseReserve = await getLatestBaseReserve();
+    const subentryCount = Number(sourceAccount.subentry_count);
+    const nativeBalance = sourceAccount.balances?.find(
+      (balance) => balance.asset_type === "native"
+    )?.balance;
+    if (!Number.isInteger(subentryCount) || nativeBalance == null) {
+      throw new Error(
+        "Could not verify the account balance and subentries; trustline signing is disabled."
+      );
+    }
+
+    const hasTrustline = sourceAccount.balances.some(
+      (balance) =>
+        balance.asset_issuer === assetIssuer &&
+        balance.asset_code === assetCode.toUpperCase()
+    );
+    const minimum = minimumBalanceInStroops(
+      baseReserve,
+      subentryCount + (hasTrustline ? 0 : 1)
+    );
+    if (
+      !remainsAboveMinimum(
+        nativeBalance,
+        "0",
+        StellarSdk.BASE_FEE,
+        minimum
+      )
+    ) {
+      const required = formatStroops(minimum + BigInt(StellarSdk.BASE_FEE));
+      throw new Error(
+        `Insufficient XLM for this trustline: the account needs ${required} XLM for its reserve and fee.`
+      );
+    }
+  }
+
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
     networkPassphrase: currentPassphrase(),
@@ -427,4 +474,62 @@ export async function changeTrustWithFreighter(
     .build();
 
   return signAndSubmit(transaction, publicKey);
+}
+
+export async function createAccountWithFreighter(
+  sourcePublicKey,
+  destinationPublicKey,
+  startingBalance
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destinationPublicKey)) {
+    throw new Error("New account must be a valid Stellar public key (G…).");
+  }
+  const amount = normalizeAmount(startingBalance, "Starting balance");
+  const sourceAccount = await getServer().loadAccount(sourcePublicKey);
+  const baseReserve = await getLatestBaseReserve();
+  const subentryCount = Number(sourceAccount.subentry_count);
+  const nativeBalance = sourceAccount.balances?.find(
+    (balance) => balance.asset_type === "native"
+  )?.balance;
+  if (!Number.isInteger(subentryCount) || nativeBalance == null) {
+    throw new Error(
+      "Could not verify the account balance and subentries; account creation is disabled."
+    );
+  }
+
+  const destinationMinimum = minimumBalanceInStroops(baseReserve, 0);
+  if (parseXlmToStroops(amount, "Starting balance") < destinationMinimum) {
+    throw new Error(
+      `Starting balance must be at least ${formatStroops(destinationMinimum)} XLM for the new account reserve.`
+    );
+  }
+
+  const sourceMinimum = minimumBalanceInStroops(baseReserve, subentryCount);
+  if (
+    !remainsAboveMinimum(
+      nativeBalance,
+      amount,
+      StellarSdk.BASE_FEE,
+      sourceMinimum
+    )
+  ) {
+    throw new Error(
+      `Insufficient XLM: after sending ${amount} XLM and paying the ${formatStroops(StellarSdk.BASE_FEE)} XLM fee, the source must retain ${formatStroops(sourceMinimum)} XLM.`
+    );
+  }
+
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.createAccount({
+        destination: destinationPublicKey,
+        startingBalance: amount,
+      })
+    )
+    .setTimeout(180)
+    .build();
+
+  return signAndSubmit(transaction, sourcePublicKey);
 }

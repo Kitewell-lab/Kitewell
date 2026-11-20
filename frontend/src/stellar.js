@@ -5,6 +5,7 @@ import {
   getActiveNetworkId,
   isFriendbotAvailable,
 } from "./network";
+import { calculateMinimumBalance } from "./accountReserve";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -153,6 +154,21 @@ export async function getAccountDetails(publicKey) {
     explorerUrl: explorerAccountUrl(publicKey),
   };
 }
+
+export async function getLatestBaseReserve() {
+  const response = await getServer()
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const baseReserve = response.records?.[0]?.base_reserve_in_stroops;
+  if (!/^\d+$/.test(String(baseReserve ?? "")) || Number(baseReserve) <= 0) {
+    throw new Error("Latest ledger did not include a valid base reserve.");
+  }
+  return String(baseReserve);
+}
+
+export { calculateMinimumBalance };
 
 export async function getBalance(publicKey) {
   const balances = await getAccountBalances(publicKey);
