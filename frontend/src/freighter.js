@@ -51,6 +51,89 @@ function buildContractTx(contract, method, args, sourceAccount, timeout = 60) {
     .build();
 }
 
+const WASM_MAGIC = [0x00, 0x61, 0x73, 0x6d]; // \0asm
+
+/** Accept a File.arrayBuffer(), Uint8Array, or byte array, with a magic check. */
+function normalizeWasmBytes(wasmBytes) {
+  let bytes;
+  if (wasmBytes instanceof Uint8Array) {
+    bytes = wasmBytes;
+  } else if (wasmBytes instanceof ArrayBuffer) {
+    bytes = new Uint8Array(wasmBytes);
+  } else if (Array.isArray(wasmBytes)) {
+    bytes = Uint8Array.from(wasmBytes);
+  } else {
+    throw new Error("Choose the built kitewell.wasm file to deploy.");
+  }
+
+  if (bytes.length < 8 || !WASM_MAGIC.every((byte, i) => bytes[i] === byte)) {
+    throw new Error("Not a Wasm binary — choose the built kitewell.wasm file.");
+  }
+  return bytes;
+}
+
+function newSalt() {
+  const salt = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(salt);
+  return salt;
+}
+
+function assertPublicKey(publicKey) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+}
+
+/**
+ * A create-contract tx has one host-function op; its result carries the new
+ * contract ID as a 32-byte hash.
+ */
+function contractIdFromResult(resultXdr) {
+  try {
+    const result =
+      typeof resultXdr === "string"
+        ? StellarSdk.xdr.TransactionResult.fromXDR(resultXdr, "base64")
+        : resultXdr;
+    const createResult = result
+      ?.result?.()
+      ?.results?.()[0]
+      ?.tr?.()
+      ?.invokeHostFunctionResult?.();
+    if (!createResult || createResult.switch().value !== 0) return null;
+    return StellarSdk.Address.contract(createResult.success()).toString();
+  } catch {
+    return null;
+  }
+}
+
+/** Prepare, sign with Freighter, submit, and poll until the tx is applied. */
+async function prepareSignSubmit(transaction, publicKey, label) {
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `${label} rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  // RPC submission is asynchronous: poll getTransaction until applied.
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return { hash: sendResult.hash, returnValue: status.returnValue ?? null, status };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(`${label} failed on-chain. Tx hash: ${sendResult.hash}`);
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  // Still pending after the polling window; the tx may land shortly.
+  return { hash: sendResult.hash, returnValue: null, status: null };
+}
+
 /**
  * Read-only lookups against the Kitewell registry via Soroban RPC.
  * Calls lab_name(), builder_count(), and get_builder(viewer).
@@ -131,38 +214,166 @@ export async function registerBuilderWithFreighter(
   );
 
   // Simulation fills in auth entries + resource fees for the invoke.
-  const prepared = await sorobanRpc.prepareTransaction(transaction);
-  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
-  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+  const submitted = await prepareSignSubmit(
+    transaction,
+    publicKey,
+    "Contract invoke"
+  );
 
-  if (sendResult.status === "ERROR") {
+  return {
+    hash: submitted.hash,
+    returnValue: submitted.returnValue
+      ? StellarSdk.scValToNative(submitted.returnValue)
+      : null,
+    confirmed: Boolean(submitted.status),
+  };
+}
+
+/** Upload the Wasm bytes in their own Soroban tx (one host op per tx). */
+async function uploadKitewellWasm(publicKey, wasm) {
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(StellarSdk.Operation.uploadContractWasm({ wasm }))
+    .setTimeout(60)
+    .build();
+
+  const submitted = await prepareSignSubmit(transaction, publicKey, "Wasm upload");
+  if (!submitted.status) {
     throw new Error(
-      `Contract invoke rejected by the network. Tx hash: ${sendResult.hash}`
+      `Wasm upload submitted (${submitted.hash}) but not confirmed; install stopped.`
+    );
+  }
+  return { wasmHash: StellarSdk.hash(wasm), hash: submitted.hash };
+}
+
+/** Create the contract instance from an uploaded Wasm hash. */
+async function createKitewellContract(publicKey, wasmHash, salt) {
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.createCustomContract({
+        address: new StellarSdk.Address(publicKey),
+        wasmHash,
+        salt,
+      })
+    )
+    .setTimeout(60)
+    .build();
+
+  const submitted = await prepareSignSubmit(
+    transaction,
+    publicKey,
+    "Contract create"
+  );
+  if (!submitted.status) {
+    throw new Error(
+      `Contract create submitted (${submitted.hash}) but not confirmed; no contract id yet.`
     );
   }
 
-  // RPC submission is asynchronous: poll getTransaction until applied.
-  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
-    const status = await sorobanRpc.getTransaction(sendResult.hash);
-    if (status.status === "SUCCESS") {
-      return {
-        hash: sendResult.hash,
-        returnValue: status.returnValue
-          ? StellarSdk.scValToNative(status.returnValue)
-          : null,
-        confirmed: true,
-      };
-    }
-    if (status.status === "FAILED") {
-      throw new Error(
-        `Contract invoke failed on-chain. Tx hash: ${sendResult.hash}`
-      );
-    }
-    await sleep(POLL_INTERVAL_MS);
+  const contractId = contractIdFromResult(submitted.status.resultXdr);
+  if (!contractId) {
+    throw new Error(
+      `Contract create confirmed (${submitted.hash}) but returned no contract id.`
+    );
+  }
+  return { contractId, hash: submitted.hash };
+}
+
+/**
+ * Install the Kitewell Wasm: upload bytes, then create a contract instance from
+ * the uploaded hash. Each phase is a Freighter-signed Soroban tx; the new
+ * contract ID comes from the create tx result. No `init` is called here.
+ *
+ * @returns {{ contractId: string, hash: string, uploadHash: string, confirmed: true }}
+ */
+export async function installKitewellContract(publicKey, wasmBytes, options = {}) {
+  assertPublicKey(publicKey);
+  const wasm = normalizeWasmBytes(wasmBytes);
+  const salt = options.salt ?? newSalt();
+
+  const upload = await uploadKitewellWasm(publicKey, wasm);
+  const created = await createKitewellContract(publicKey, upload.wasmHash, salt);
+
+  return {
+    contractId: created.contractId,
+    hash: created.hash,
+    uploadHash: upload.hash,
+    confirmed: true,
+  };
+}
+
+/**
+ * One-time `init(admin)` invoke for a freshly installed registry. The connected
+ * account is the admin; the contract itself rejects a second init.
+ */
+export async function initializeKitewellContract(publicKey, contractId) {
+  assertPublicKey(publicKey);
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
   }
 
-  // Still pending after the polling window; the tx may land shortly.
-  return { hash: sendResult.hash, returnValue: null, confirmed: false };
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = buildContractTx(
+    contract,
+    "init",
+    [StellarSdk.nativeToScVal(publicKey, { type: "address" })],
+    sourceAccount
+  );
+
+  const submitted = await prepareSignSubmit(transaction, publicKey, "Contract init");
+  return { hash: submitted.hash, confirmed: Boolean(submitted.status) };
+}
+
+/**
+ * Install + initialize the existing Kitewell contract from the Lab tab.
+ *
+ * `install` and `init` are injectable so a caller (or a test) can stub the two
+ * phases without touching the network. Install always runs first, and init is
+ * called exactly once with the new id; a failed install never yields an id.
+ */
+export async function deployKitewellContract(publicKey, wasmBytes, options = {}) {
+  const {
+    install = installKitewellContract,
+    init = initializeKitewellContract,
+  } = options;
+
+  // Validate before submitting anything so a bad file/key cannot half-deploy.
+  assertPublicKey(publicKey);
+  normalizeWasmBytes(wasmBytes);
+
+  const installed = await install(publicKey, wasmBytes, {
+    salt: options.salt,
+  });
+  if (!StellarSdk.StrKey.isValidContract(installed?.contractId)) {
+    throw new Error("Install did not return a valid contract id; init was not called.");
+  }
+
+  let initialized;
+  try {
+    initialized = await init(publicKey, installed.contractId);
+  } catch (error) {
+    // The install already succeeded, so surface its id for diagnostics without
+    // treating it as a usable deployment.
+    if (error instanceof Error) error.contractId = installed.contractId;
+    throw error;
+  }
+
+  return {
+    contractId: installed.contractId,
+    installHash: installed.hash,
+    initHash: initialized?.hash ?? null,
+    confirmed: Boolean(installed.confirmed && initialized?.confirmed),
+  };
 }
 
 function createMemo(memoType, value) {

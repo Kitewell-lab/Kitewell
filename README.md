@@ -69,13 +69,15 @@ cargo build --manifest-path contracts/Cargo.toml --target wasm32v1-none --releas
 
 Deploy steps: [contracts/README.md](./contracts/README.md). After deploy, set `KITEWELL_CONTRACT_ID` for the backend.
 
+With no `KITEWELL_CONTRACT_ID` configured, the **Lab** tab can also deploy the existing `contracts/kitewell` Wasm directly: choose the locally built `kitewell.wasm`, sign upload → create → `init(connected account)`, then copy the new id. The id is used for Lab reads and registers for that session only — the panel never writes backend env vars; it shows the `KITEWELL_CONTRACT_ID=...` line to set yourself. A second deploy in the same session asks for confirmation and keeps the first id visible.
+
 ### Tests (JS)
 
 ```bash
 npm test
 ```
 
-Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explorer URLs, asset/path parsing, Friendbot funding, balance/payment mapping, backend → Horizon fallback) with mocked Horizon SDK and API calls — CI-friendly, no Freighter wallet or network access required. `frontend/src/path-payment.test.js` covers amount normalization and path-payment operation building. `frontend/src/freighter.test.js` covers the Lab-tab Soroban registry reads and `register` invoke.
+Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explorer URLs, asset/path parsing, Friendbot funding, balance/payment mapping, backend → Horizon fallback) with mocked Horizon SDK and API calls — CI-friendly, no Freighter wallet or network access required. `frontend/src/path-payment.test.js` covers amount normalization and path-payment operation building. `frontend/src/freighter.test.js` covers the Lab-tab Soroban registry reads, `register` invoke, and the Wasm install → `init` deploy order (with both phases stubbed).
 
 ## Screenshots
 
@@ -104,6 +106,7 @@ The Testnet lab UI, using the existing assets in [`screenshots/`](./screenshots)
 - Backend-backed account/payment reads (Horizon fallback)
 - Lab panel for API + contract status
 - Lab tab Soroban registry: Freighter-signed `register(caller, name)` check-in + `lab_name` / `builder_count` / `get_builder` reads
+- Lab tab deploy: install the built `kitewell.wasm`, run `init(connected account)`, and use the new id for the session
 
 Send supports optional text memos up to 28 UTF-8 bytes, uint64 ID memos, and 32-byte hash memos.
 

@@ -45,11 +45,17 @@ const {
   SOROBAN_RPC_URL,
   readKitewellState,
   registerBuilderWithFreighter,
+  installKitewellContract,
+  initializeKitewellContract,
+  deployKitewellContract,
 } = await import("./freighter");
 
 const CONTRACT_ID =
   "CCWLNS5HECRJ2GM3Q6JZZDV334ZXYO6EKZLFPLQRXO6SUDAKMS4U3E3X";
 const USER = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const WASM = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0]);
+const CONTRACT_HASH = StellarSdk.hash(Buffer.from("kitewell-contract"));
+const DEPLOYED_ID = StellarSdk.Address.contract(CONTRACT_HASH).toString();
 
 /** Build the same tx shape the helpers build, for XDR round-trip asserts. */
 function buildRegisterTx(caller, name, sequence = "7") {
@@ -80,6 +86,48 @@ function rpcAccountFixture(address) {
 /** Minimal successful sim response for a read (lab_name / builder_count / get_builder). */
 function simOk(retval) {
   return { error: null, result: { retval } };
+}
+
+/** prepareTransaction's assemble step, with a fixed resource fee. */
+function assemblePrepared(tx) {
+  return StellarSdk.rpc
+    .assembleTransaction(tx, {
+      _parsed: true,
+      transactionData: new StellarSdk.SorobanDataBuilder().setResourceFee("4321"),
+      minResourceFee: "123",
+      result: {
+        auth: [],
+        retval: StellarSdk.nativeToScVal(undefined, { type: "void" }),
+      },
+    })
+    .build();
+}
+
+/** Successful create-contract result: the new contract hash in the first op. */
+function installResultXdr(contractHash = CONTRACT_HASH) {
+  const ok = StellarSdk.xdr.OperationResult.opInner(
+    StellarSdk.xdr.OperationResultTr.invokeHostFunction(
+      StellarSdk.xdr.InvokeHostFunctionResult.invokeHostFunctionSuccess(contractHash)
+    )
+  );
+  return new StellarSdk.xdr.TransactionResult({
+    feeCharged: StellarSdk.xdr.Int64.fromString("100"),
+    result: StellarSdk.xdr.TransactionResultResult.txSuccess([ok]),
+    ext: new StellarSdk.xdr.TransactionResultExt(0),
+  });
+}
+
+/** Stub the common prepare → sign → submit → poll pipeline for one invoke. */
+function stubSorobanSubmit(sendResult, successStatus = { status: "SUCCESS" }) {
+  sorobanServerMock.prepareTransaction.mockImplementation(async (tx) =>
+    assemblePrepared(tx)
+  );
+  signTransactionMock.mockImplementation(async (xdr) => ({
+    error: null,
+    signedTxXdr: xdr,
+  }));
+  sorobanServerMock.sendTransaction.mockResolvedValue(sendResult);
+  sorobanServerMock.getTransaction.mockResolvedValue(successStatus);
 }
 
 beforeEach(() => {
@@ -398,5 +446,184 @@ describe("registerBuilderWithFreighter", () => {
     await expect(
       registerBuilderWithFreighter(USER, "GAAAAWTF", "alice")
     ).rejects.toThrow("valid Soroban contract");
+  });
+});
+
+describe("installKitewellContract", () => {
+  it("uploads the Wasm, then creates the contract and reads its id from the result", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(rpcAccountFixture(USER));
+    const preparedTxs = [];
+    sorobanServerMock.prepareTransaction.mockImplementation(async (tx) => {
+      preparedTxs.push(tx);
+      return assemblePrepared(tx);
+    });
+    signTransactionMock.mockImplementation(async (xdr) => ({
+      error: null,
+      signedTxXdr: xdr,
+    }));
+    sorobanServerMock.sendTransaction
+      .mockResolvedValueOnce({ status: "PENDING", hash: "upload-hash" })
+      .mockResolvedValueOnce({ status: "PENDING", hash: "create-hash" });
+    sorobanServerMock.getTransaction
+      .mockResolvedValueOnce({ status: "SUCCESS" })
+      .mockResolvedValueOnce({
+        status: "SUCCESS",
+        resultXdr: installResultXdr(),
+      });
+
+    const result = await installKitewellContract(USER, WASM, {
+      salt: new Uint8Array(32),
+    });
+
+    expect(result).toEqual({
+      contractId: DEPLOYED_ID,
+      hash: "create-hash",
+      uploadHash: "upload-hash",
+      confirmed: true,
+    });
+    expect(
+      preparedTxs.map((tx) => tx.operations.map((op) => op.func.switch().name))
+    ).toEqual([
+      ["hostFunctionTypeUploadContractWasm"],
+      ["hostFunctionTypeCreateContractV2"],
+    ]);
+    expect(Buffer.from(preparedTxs[0].operations[0].func.wasm())).toEqual(
+      Buffer.from(WASM)
+    );
+    const create = preparedTxs[1].operations[0].func.createContractV2();
+    expect(Buffer.from(create.executable().wasmHash())).toEqual(
+      Buffer.from(StellarSdk.hash(WASM))
+    );
+    expect(
+      StellarSdk.Address.fromScAddress(
+        create.contractIdPreimage().fromAddress().address()
+      ).toString()
+    ).toBe(USER);
+    expect(signTransactionMock).toHaveBeenCalledTimes(2);
+    expect(sorobanServerMock.sendTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws without a contract id when the create step is rejected", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(rpcAccountFixture(USER));
+    sorobanServerMock.prepareTransaction.mockImplementation(async (tx) =>
+      assemblePrepared(tx)
+    );
+    signTransactionMock.mockImplementation(async (xdr) => ({
+      error: null,
+      signedTxXdr: xdr,
+    }));
+    sorobanServerMock.sendTransaction
+      .mockResolvedValueOnce({ status: "PENDING", hash: "upload-hash" })
+      .mockResolvedValueOnce({ status: "ERROR", hash: "bad-create" });
+    sorobanServerMock.getTransaction.mockResolvedValue({ status: "SUCCESS" });
+
+    await expect(installKitewellContract(USER, WASM)).rejects.toThrow(
+      "Contract create rejected by the network. Tx hash: bad-create"
+    );
+    expect(signTransactionMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops after a failed upload and never creates a contract", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(rpcAccountFixture(USER));
+    stubSorobanSubmit({ status: "ERROR", hash: "bad-upload" });
+
+    await expect(installKitewellContract(USER, WASM)).rejects.toThrow(
+      "Wasm upload rejected by the network. Tx hash: bad-upload"
+    );
+    expect(signTransactionMock).toHaveBeenCalledTimes(1);
+    expect(sorobanServerMock.sendTransaction).toHaveBeenCalledTimes(1);
+    expect(sorobanServerMock.getTransaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-Wasm file before touching RPC", async () => {
+    await expect(
+      installKitewellContract(USER, new Uint8Array([1, 2, 3, 4]))
+    ).rejects.toThrow("Not a Wasm binary");
+    expect(sorobanServerMock.getAccount).not.toHaveBeenCalled();
+  });
+});
+
+describe("initializeKitewellContract", () => {
+  it("calls init once with the connected account as admin", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(rpcAccountFixture(USER));
+    let prepared;
+    stubSorobanSubmit({ status: "PENDING", hash: "init-hash" }, { status: "SUCCESS" });
+    sorobanServerMock.prepareTransaction.mockImplementation(async (tx) => {
+      prepared = tx;
+      return assemblePrepared(tx);
+    });
+
+    const result = await initializeKitewellContract(USER, CONTRACT_ID);
+
+    expect(result).toEqual({ hash: "init-hash", confirmed: true });
+    expect(prepared.operations).toHaveLength(1);
+    const invoke = prepared.operations[0].func.value();
+    expect(invoke.functionName().toString()).toBe("init");
+    expect(invoke.args()).toHaveLength(1);
+    expect(StellarSdk.scValToNative(invoke.args()[0])).toBe(USER);
+    expect(signTransactionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an invalid contract id before building a tx", async () => {
+    await expect(initializeKitewellContract(USER, "GAAAAWTF")).rejects.toThrow(
+      "valid Soroban contract"
+    );
+    expect(sorobanServerMock.getAccount).not.toHaveBeenCalled();
+  });
+});
+
+describe("deployKitewellContract", () => {
+  it("stubs install and init and asserts the order", async () => {
+    const calls = [];
+    const install = vi.fn(async (publicKey, wasm) => {
+      calls.push("install");
+      expect(publicKey).toBe(USER);
+      expect(wasm).toBe(WASM);
+      return {
+        contractId: DEPLOYED_ID,
+        hash: "install-hash",
+        confirmed: true,
+      };
+    });
+    const init = vi.fn(async () => {
+      calls.push("init");
+      return { hash: "init-hash", confirmed: true };
+    });
+
+    const result = await deployKitewellContract(USER, WASM, { install, init });
+
+    expect(calls).toEqual(["install", "init"]);
+    expect(install).toHaveBeenCalledTimes(1);
+    expect(init).toHaveBeenCalledTimes(1);
+    expect(init).toHaveBeenCalledWith(USER, DEPLOYED_ID);
+    expect(result).toEqual({
+      contractId: DEPLOYED_ID,
+      installHash: "install-hash",
+      initHash: "init-hash",
+      confirmed: true,
+    });
+  });
+
+  it("does not call init when the install fails, and shows no id", async () => {
+    const init = vi.fn();
+    const install = vi.fn(async () => {
+      throw new Error("Contract install rejected by the network. Tx hash: bad");
+    });
+
+    await expect(
+      deployKitewellContract(USER, WASM, { install, init })
+    ).rejects.toThrow("Contract install rejected");
+    expect(install).toHaveBeenCalledTimes(1);
+    expect(init).not.toHaveBeenCalled();
+  });
+
+  it("rejects a bad Wasm file before either phase runs", async () => {
+    const install = vi.fn();
+    const init = vi.fn();
+    await expect(
+      deployKitewellContract(USER, "not bytes", { install, init })
+    ).rejects.toThrow("Choose the built kitewell.wasm");
+    expect(install).not.toHaveBeenCalled();
+    expect(init).not.toHaveBeenCalled();
   });
 });
