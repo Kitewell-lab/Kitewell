@@ -246,6 +246,115 @@ async function signAndSubmit(transaction, publicKey) {
 }
 
 /**
+ * Build a SEP-7 transaction-request URI (web+stellar:tx) from an unsigned
+ * transaction envelope XDR and the network passphrase.
+ */
+export function buildSep7TxUri(envelopeXdr, passphrase) {
+  if (!envelopeXdr) {
+    throw new Error("Envelope XDR is required to build a SEP-7 URI.");
+  }
+  const params = new URLSearchParams({ network_passphrase: passphrase });
+  return `web+stellar:tx:${envelopeXdr}?${params.toString()}`;
+}
+
+/**
+ * Parse a SEP-7 transaction-request URI and validate its network passphrase
+ * matches the expected passphrase. Returns the envelope XDR on success.
+ */
+export function parseSep7TxUri(uri, expectedPassphrase) {
+  if (!uri || !uri.startsWith("web+stellar:tx:")) {
+    throw new Error("Invalid SEP-7 transaction-request URI.");
+  }
+  // Remove the scheme prefix to get the rest: <envelope>?network_passphrase=...
+  const rest = uri.slice("web+stellar:tx:".length);
+  const questionIdx = rest.indexOf("?");
+  if (questionIdx === -1) {
+    throw new Error("SEP-7 URI missing network_passphrase parameter.");
+  }
+  const envelopeXdr = rest.slice(0, questionIdx);
+  if (!envelopeXdr) {
+    throw new Error("SEP-7 URI missing transaction envelope.");
+  }
+  const queryString = rest.slice(questionIdx + 1);
+  const params = new URLSearchParams(queryString);
+  const passphrase = params.get("network_passphrase");
+  if (!passphrase) {
+    throw new Error("SEP-7 URI missing network_passphrase parameter.");
+  }
+  if (passphrase !== expectedPassphrase) {
+    throw new Error("Transaction request is for a different network.");
+  }
+  return envelopeXdr;
+}
+
+/**
+ * Submit a transaction envelope (signed or unsigned) through Freighter.
+ * If the envelope is unsigned, it will be signed by Freighter before submission.
+ * If already signed, it will be submitted as-is without adding a second signature.
+ * Returns the submission result from Horizon.
+ */
+export async function submitEnvelope(envelopeXdr, publicKey) {
+  const passphrase = currentPassphrase();
+  
+  // Parse the envelope to check if it's already signed
+  let transaction;
+  try {
+    transaction = StellarSdk.TransactionBuilder.fromXDR(envelopeXdr, passphrase);
+  } catch (err) {
+    throw new Error("Unable to decode transaction envelope: " + err.message);
+  }
+
+  const isSigned = transaction.signatures && transaction.signatures.length > 0;
+  
+  if (!isSigned) {
+    // Unsigned envelope: sign with Freighter then submit
+    const signedTx = await signWithFreighter(envelopeXdr, publicKey);
+    return getServer().submitTransaction(signedTx);
+  } else {
+    // Already signed: submit directly without re-signing
+    return getServer().submitTransaction(transaction);
+  }
+}
+
+export function getServerForComposer() {
+  return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
+}
+
+export function getCurrentPassphrase() {
+  return getActiveNetwork().passphrase;
+}
+
+export function createMemoForComposer(memoType, value) {
+  const MAX_MEMO_TEXT_BYTES = 28;
+  const MAX_U64 = 18446744073709551615n;
+
+  if (!value) return null;
+
+  if (memoType === "text") {
+    if (new TextEncoder().encode(value).length > MAX_MEMO_TEXT_BYTES) {
+      throw new Error("Text memos must be 28 UTF-8 bytes or fewer.");
+    }
+    return StellarSdk.Memo.text(value);
+  }
+
+  if (memoType === "id") {
+    if (!/^\d{1,20}$/.test(value) || BigInt(value) > MAX_U64) {
+      throw new Error("ID memos must be unsigned 64-bit integers.");
+    }
+    return StellarSdk.Memo.id(value);
+  }
+
+  if (memoType === "hash") {
+    if (!/^[0-9a-fA-F]{64}$/.test(value)) {
+      throw new Error("Hash memos must be exactly 64 hexadecimal characters.");
+    }
+    return StellarSdk.Memo.hash(value);
+  }
+
+  throw new Error(`Unsupported memo type: ${memoType}`);
+}
+
+/**
  * Validate a Stellar amount string (positive, max 7 decimal places) without
  * going through floating point, so values like 0.0000001 stay intact.
  */
@@ -286,6 +395,8 @@ export function resolvePaymentAsset(asset) {
  * Build a payment op, sign it with Freighter, and submit it to Horizon.
  * `asset` accepts a UI descriptor (`{ isNative: true }` or
  * `{ isNative: false, code, issuer }`); omit it to send native XLM.
+ * Optional `minTime` and `maxTime` are Unix timestamps (seconds) for transaction time bounds.
+ * When both are provided, they replace the default timeout.
  */
 export async function sendPaymentWithFreighter(
   publicKey,
@@ -293,10 +404,26 @@ export async function sendPaymentWithFreighter(
   amount,
   asset = null,
   memoType = "text",
-  memo = ""
+  memo = "",
+  minTime = null,
+  maxTime = null
 ) {
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
     throw new Error("Destination must be a valid Stellar public key (G…).");
+  }
+
+  // Validate time bounds if provided
+  if (minTime !== null || maxTime !== null) {
+    const min = minTime !== null ? Number(minTime) : 0;
+    const max = maxTime !== null ? Number(maxTime) : 0;
+    const now = Math.floor(Date.now() / 1000);
+
+    if (minTime !== null && maxTime !== null && max <= min) {
+      throw new Error("Maximum time must be after minimum time.");
+    }
+    if (maxTime !== null && max <= now) {
+      throw new Error("Maximum time must be in the future.");
+    }
   }
 
   const transactionMemo = createMemo(memoType, memo);
@@ -316,7 +443,15 @@ export async function sendPaymentWithFreighter(
     txBuilder.addMemo(transactionMemo);
   }
 
-  const transaction = txBuilder.setTimeout(180).build();
+  let transaction;
+  if (minTime !== null || maxTime !== null) {
+    const min = minTime !== null ? Number(minTime) : 0;
+    const max = maxTime !== null ? Number(maxTime) : 0;
+    transaction = txBuilder.setTimebounds(min, max).build();
+  } else {
+    transaction = txBuilder.setTimeout(180).build();
+  }
+
   return signAndSubmit(transaction, publicKey);
 }
 

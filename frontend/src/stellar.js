@@ -98,6 +98,8 @@ export async function fundWithFriendbot(publicKey) {
 
 function mapHorizonBalances(account) {
   return account.balances.map((b) => {
+    const sellingLiabilities = b.selling_liabilities ?? "0";
+    const buyingLiabilities = b.buying_liabilities ?? "0";
     if (b.asset_type === "native") {
       return {
         key: "native",
@@ -106,6 +108,8 @@ function mapHorizonBalances(account) {
         balance: b.balance,
         limit: null,
         isNative: true,
+        sellingLiabilities,
+        buyingLiabilities,
       };
     }
     return {
@@ -115,6 +119,8 @@ function mapHorizonBalances(account) {
       balance: b.balance,
       limit: b.limit,
       isNative: false,
+      sellingLiabilities,
+      buyingLiabilities,
     };
   });
 }
