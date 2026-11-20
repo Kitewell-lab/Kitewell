@@ -295,8 +295,13 @@ export async function sendPaymentWithFreighter(
   memoType = "text",
   memo = ""
 ) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
-    throw new Error("Destination must be a valid Stellar public key (G…).");
+  const isAccountAddress =
+    StellarSdk.StrKey.isValidEd25519PublicKey(destination) ||
+    StellarSdk.StrKey.isValidMed25519PublicKey(destination);
+  if (!isAccountAddress) {
+    throw new Error(
+      "Destination must be a valid Stellar public key (G…). A muxed address (M…) is also accepted."
+    );
   }
 
   const transactionMemo = createMemo(memoType, memo);

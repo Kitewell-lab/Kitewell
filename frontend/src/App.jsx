@@ -8,7 +8,11 @@ import {
   readKitewellState,
   registerBuilderWithFreighter,
 } from "./freighter";
-import { shortenAddress } from "./addressFormat";
+import {
+  shortenAddress,
+  buildMuxedAddress,
+  splitMuxedAddress,
+} from "./addressFormat";
 import {
   fundWithFriendbot,
   getAccountBalances,
@@ -28,7 +32,16 @@ import {
 import { validateAssetCode } from "./validateAssetCode";
 import "./App.css";
 
-const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
+const TABS = [
+  "Wallet",
+  "Fund",
+  "Assets",
+  "Send",
+  "Path",
+  "History",
+  "Muxed",
+  "Lab",
+];
 const PATH_MODE_FIELDS = {
   strictSend: {
     amountLabel: "Amount to send",
@@ -97,6 +110,11 @@ export default function App() {
   const [labStateError, setLabStateError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
+  const [muxedBuildForm, setMuxedBuildForm] = useState({ gAddress: "", id: "" });
+  const [muxedBuildResult, setMuxedBuildResult] = useState(null);
+  const [muxedSplitForm, setMuxedSplitForm] = useState({ mAddress: "" });
+  const [muxedSplitResult, setMuxedSplitResult] = useState(null);
+  const [muxedError, setMuxedError] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
@@ -112,6 +130,15 @@ export default function App() {
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
   const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
+  const muxedSendBase = (() => {
+    const value = sendForm.destination.trim();
+    if (!value) return null;
+    try {
+      return splitMuxedAddress(value).gAddress;
+    } catch {
+      return null;
+    }
+  })();
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -472,6 +499,36 @@ export default function App() {
       showToast(err.message || "Contract invoke failed.", "error");
     } finally {
       setLoading("");
+    }
+  };
+
+  const handleBuildMuxed = (event) => {
+    event.preventDefault();
+    setMuxedError(null);
+    setMuxedBuildResult(null);
+    try {
+      setMuxedBuildResult(
+        buildMuxedAddress(
+          muxedBuildForm.gAddress.trim(),
+          muxedBuildForm.id.trim()
+        )
+      );
+    } catch (err) {
+      setMuxedError(err.message || "Could not build the muxed address.");
+    }
+  };
+
+  const handleSplitMuxed = (event) => {
+    event.preventDefault();
+    setMuxedError(null);
+    setMuxedSplitResult(null);
+    try {
+      const { gAddress, id } = splitMuxedAddress(
+        muxedSplitForm.mAddress.trim()
+      );
+      setMuxedSplitResult({ gAddress, id: id.toString() });
+    } catch (err) {
+      setMuxedError(err.message || "Could not split the muxed address.");
     }
   };
 
@@ -901,17 +958,23 @@ export default function App() {
               </p>
               <form onSubmit={handleSend} className="form">
                 <label className="label" htmlFor="send-destination">
-                  Destination
+                  Destination (G… or M…)
                 </label>
                 <input
                   id="send-destination"
                   className="input"
                   type="text"
-                  placeholder="G…"
+                  placeholder="G… or M…"
                   value={sendForm.destination}
                   onChange={(e) => setSendForm({ ...sendForm, destination: e.target.value })}
                   required
                 />
+                {muxedSendBase && (
+                  <p className="muted">
+                    Muxed payment arrives at {shortenAddress(muxedSendBase)} (the
+                    base account).
+                  </p>
+                )}
                 <label className="label" htmlFor="send-asset">
                   Asset
                 </label>
@@ -1175,6 +1238,114 @@ export default function App() {
                   >
                     View on StellarExpert ↗
                   </a>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === "Muxed" && (
+            <div className="section">
+              <h2>Muxed accounts</h2>
+              <p className="muted">
+                An M… address combines a G… base account with an unsigned 64-bit
+                id. A payment to the M… address still credits the base account.
+              </p>
+
+              {muxedError && (
+                <div className="info-box info-box--warning" role="alert">
+                  <span className="eyebrow">Muxed address</span>
+                  <p className="muted">{muxedError}</p>
+                </div>
+              )}
+
+              <form className="form" onSubmit={handleBuildMuxed}>
+                <div className="subhead">Build an M address</div>
+                <label className="label" htmlFor="muxed-base-address">
+                  Base account (G…)
+                </label>
+                <input
+                  id="muxed-base-address"
+                  className="input"
+                  type="text"
+                  placeholder="G…"
+                  value={muxedBuildForm.gAddress}
+                  onChange={(e) =>
+                    setMuxedBuildForm({
+                      ...muxedBuildForm,
+                      gAddress: e.target.value,
+                    })
+                  }
+                />
+                <label className="label" htmlFor="muxed-id">
+                  Id (unsigned 64-bit)
+                </label>
+                <input
+                  id="muxed-id"
+                  className="input"
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  placeholder="0"
+                  value={muxedBuildForm.id}
+                  onChange={(e) =>
+                    setMuxedBuildForm({
+                      ...muxedBuildForm,
+                      id: e.target.value,
+                    })
+                  }
+                />
+                <button className="btn btn--secondary" type="submit">
+                  Build M address
+                </button>
+              </form>
+
+              {muxedBuildResult && (
+                <div className="info-box">
+                  <span className="eyebrow">Muxed address</span>
+                  <code>{muxedBuildResult}</code>
+                </div>
+              )}
+
+              <form className="form" onSubmit={handleSplitMuxed}>
+                <div className="subhead">Split an M address</div>
+                <label className="label" htmlFor="muxed-address">
+                  Muxed address (M…)
+                </label>
+                <input
+                  id="muxed-address"
+                  className="input"
+                  type="text"
+                  placeholder="M…"
+                  value={muxedSplitForm.mAddress}
+                  onChange={(e) =>
+                    setMuxedSplitForm({ mAddress: e.target.value })
+                  }
+                />
+                <button className="btn btn--secondary" type="submit">
+                  Split M address
+                </button>
+              </form>
+
+              {muxedSplitResult && (
+                <div className="info-box">
+                  <span className="eyebrow">Base account and id</span>
+                  <div className="metadata-grid">
+                    <div>
+                      <span className="metadata-label">Base account</span>
+                      <span className="metadata-value">
+                        {muxedSplitResult.gAddress}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="metadata-label">Id</span>
+                      <span className="metadata-value">
+                        {muxedSplitResult.id}
+                      </span>
+                    </div>
+                  </div>
+                  <p className="muted" style={{ marginTop: 6 }}>
+                    Payments to this M address arrive at the base account above.
+                  </p>
                 </div>
               )}
             </div>
