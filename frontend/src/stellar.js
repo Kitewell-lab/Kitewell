@@ -203,3 +203,69 @@ export async function getTransactions(publicKey, limit = 15, cursor) {
     nextCursor: null,
   };
 }
+
+/** Deep-link into the hash status watch panel for a transaction. */
+export function statusWatchHref(hash) {
+  return `#status-watch/${encodeURIComponent(hash)}`;
+}
+
+/**
+ * Map a Horizon pending-queue record into the fields the panel renders.
+ * Accepts both short lab names and classic Horizon transaction field names.
+ */
+export function mapPendingTransaction(record) {
+  const status = String(
+    record.status ?? record.tx_status ?? "pending"
+  ).toLowerCase();
+
+  return {
+    hash: record.hash,
+    fee: String(record.fee ?? record.fee_charged ?? record.max_fee ?? ""),
+    sequence: String(
+      record.sequence ?? record.source_account_sequence ?? ""
+    ),
+    status,
+  };
+}
+
+/**
+ * Keep only transactions Horizon has not applied yet.
+ * Applied rows from the pending endpoint are ignored.
+ */
+export function selectPendingTransactions(records) {
+  return (records || [])
+    .map(mapPendingTransaction)
+    .filter((tx) => tx.hash && tx.status !== "applied");
+}
+
+/**
+ * List transactions for an account that are still pending on Horizon.
+ *
+ * Hits `GET {horizon}/accounts/{id}/pending_transactions`. A 404 means an
+ * empty queue (not an error). Applied records in the payload are dropped.
+ *
+ * @param {string} publicKey Connected account.
+ * @returns {Promise<object[]>} Pending rows with hash, fee, and sequence.
+ */
+export async function getPendingTransactions(publicKey) {
+  const url = `${getActiveNetwork().horizonUrl}/accounts/${encodeURIComponent(
+    publicKey
+  )}/pending_transactions`;
+
+  const response = await fetch(url);
+  if (response.status === 404) {
+    return [];
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Could not load pending transactions (HTTP ${response.status}).`
+    );
+  }
+
+  const body = await response.json();
+  const records = Array.isArray(body)
+    ? body
+    : body?._embedded?.records || body?.records || [];
+
+  return selectPendingTransactions(records);
+}

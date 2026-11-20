@@ -13,9 +13,11 @@ import {
   fundWithFriendbot,
   getAccountBalances,
   getAccountDetails,
+  getPendingTransactions,
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
+  statusWatchHref,
 } from "./stellar";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
@@ -28,7 +30,8 @@ import {
 import { validateAssetCode } from "./validateAssetCode";
 import "./App.css";
 
-const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
+const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Pending", "Lab"];
+const PENDING_REFRESH_MS = 8000;
 const PATH_MODE_FIELDS = {
   strictSend: {
     amountLabel: "Amount to send",
@@ -66,6 +69,8 @@ export default function App() {
   const [freighterInstalled, setFreighterInstalled] = useState(null);
   const [balances, setBalances] = useState([]);
   const [transactions, setTransactions] = useState([]);
+  const [pendingTransactions, setPendingTransactions] = useState([]);
+  const [pendingError, setPendingError] = useState(null);
   const [nextCursor, setNextCursor] = useState(null);
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
@@ -144,6 +149,8 @@ export default function App() {
       setPublicKey(address);
       setBalances([]);
       setTransactions([]);
+      setPendingTransactions([]);
+      setPendingError(null);
       showToast("Freighter connected.");
       try {
         const next = await getAccountBalances(address);
@@ -162,6 +169,8 @@ export default function App() {
     setPublicKey(null);
     setBalances([]);
     setTransactions([]);
+    setPendingTransactions([]);
+    setPendingError(null);
     setAccountDetails(null);
     showToast("Disconnected.");
   };
@@ -172,6 +181,8 @@ export default function App() {
       setNetworkId(id);
       setBalances([]);
       setTransactions([]);
+      setPendingTransactions([]);
+      setPendingError(null);
       setAccountDetails(null);
       showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
       if (publicKey) refreshBalances();
@@ -179,6 +190,40 @@ export default function App() {
       showToast(e.message || "Could not switch network.", "error");
     }
   };
+
+  const refreshPending = useCallback(async () => {
+    if (!publicKey) {
+      setPendingTransactions([]);
+      setPendingError(null);
+      return;
+    }
+    try {
+      const rows = await getPendingTransactions(publicKey);
+      setPendingTransactions(rows);
+      setPendingError(null);
+    } catch (e) {
+      setPendingError(e.message || "Could not load pending transactions.");
+    }
+  }, [publicKey]);
+
+  useEffect(() => {
+    if (activeTab !== "Pending" || !publicKey) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled) return;
+      await refreshPending();
+    };
+
+    tick();
+    const timer = setInterval(tick, PENDING_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeTab, publicKey, networkId, refreshPending]);
 
   const handleFund = async () => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -1411,6 +1456,56 @@ export default function App() {
                     )}
                   </button>
                 </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === "Pending" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Pending transactions</h2>
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={refreshPending}
+                  disabled={requireWallet}
+                >
+                  Refresh
+                </button>
+              </div>
+              <p className="muted">
+                Transactions Horizon has accepted but not applied yet for this
+                account. The list refreshes while this panel is open.
+              </p>
+              {requireWallet ? (
+                <p className="muted">Connect a wallet to load the pending queue.</p>
+              ) : pendingError ? (
+                <div className="info-box info-box--warning">
+                  <span className="eyebrow">Pending queue</span>
+                  <p className="muted">{pendingError}</p>
+                </div>
+              ) : pendingTransactions.length > 0 ? (
+                <div className="tx-list">
+                  {pendingTransactions.map((tx) => (
+                    <div key={tx.hash} className="tx-item tx-item--out">
+                      <div className="tx-item__direction">Pending</div>
+                      <div className="tx-item__amount">
+                        <code>{tx.hash}</code>
+                      </div>
+                      <div className="tx-item__addr muted">
+                        Fee {tx.fee || "—"} · Seq {tx.sequence || "—"}
+                      </div>
+                      <a
+                        href={statusWatchHref(tx.hash)}
+                        className="tx-item__link"
+                      >
+                        Watch status ↗
+                      </a>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No pending transactions.</p>
               )}
             </div>
           )}
