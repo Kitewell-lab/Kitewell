@@ -300,6 +300,7 @@ export async function sendPaymentWithFreighter(
   }
 
   const transactionMemo = createMemo(memoType, memo);
+  // Load account immediately before building to get fresh sequence
   const sourceAccount = await getServer().loadAccount(publicKey);
   const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
@@ -382,6 +383,7 @@ export async function pathPaymentWithFreighter({
         path: intermediatePath,
       });
 
+  // Load account immediately before building to get fresh sequence
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
@@ -412,6 +414,7 @@ export async function changeTrustWithFreighter(
   }
 
   const asset = new StellarSdk.Asset(assetCode.toUpperCase(), assetIssuer);
+  // Load account immediately before building to get fresh sequence
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
