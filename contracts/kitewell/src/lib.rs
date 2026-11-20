@@ -337,6 +337,8 @@ mod test {
         let admin = Address::generate(&env);
 
         assert!(client.try_init(&admin).is_ok());
+        // The connected account that signs the Lab deploy becomes the admin.
+        assert_eq!(client.get_admin(), Some(admin));
     }
 
     #[test]
