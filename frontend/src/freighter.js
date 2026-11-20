@@ -283,6 +283,88 @@ export function resolvePaymentAsset(asset) {
 }
 
 /**
+ * Build an unsigned transaction envelope from an operation list.
+ *
+ * Nothing is signed or submitted: the returned base64 XDR can be shown to the
+ * user, copied, or handed to another signer/decoder. Building with an empty
+ * operation list is rejected, so there is never an empty envelope to copy.
+ *
+ * @param {string} publicKey source account (must be a valid Stellar key)
+ * @param {StellarSdk.xdr.Operation[]} operations one or more operations
+ * @param {{ memo?: StellarSdk.Memo|null, timeout?: number }} [options]
+ * @returns {Promise<string>} base64-encoded transaction envelope XDR
+ */
+export async function buildUnsignedEnvelope(
+  publicKey,
+  operations,
+  { memo = null, timeout = 180 } = {}
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!Array.isArray(operations) || operations.length === 0) {
+    throw new Error("Add at least one operation before building an envelope.");
+  }
+
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  });
+
+  operations.forEach((operation) => txBuilder.addOperation(operation));
+  if (memo) txBuilder.addMemo(memo);
+
+  return txBuilder.setTimeout(timeout).build().toXDR();
+}
+
+/**
+ * Build the unsigned payment envelope without signing or submitting it.
+ * `asset` accepts a UI descriptor (`{ isNative: true }` or
+ * `{ isNative: false, code, issuer }`); omit it to send native XLM.
+ *
+ * @returns {Promise<string>} base64-encoded transaction envelope XDR
+ */
+export async function buildPaymentEnvelope(
+  publicKey,
+  destination,
+  amount,
+  asset = null,
+  memoType = "text",
+  memo = ""
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
+    throw new Error("Destination must be a valid Stellar public key (G…).");
+  }
+
+  return buildUnsignedEnvelope(
+    publicKey,
+    [
+      StellarSdk.Operation.payment({
+        destination,
+        asset: resolvePaymentAsset(asset),
+        amount: amount.toString(),
+      }),
+    ],
+    { memo: createMemo(memoType, memo) }
+  );
+}
+
+/**
+ * Sign an already-built unsigned envelope with Freighter and submit it.
+ * Taking the XDR string keeps the signed payload identical to the one the user
+ * previewed/copied.
+ */
+export async function submitEnvelopeWithFreighter(unsignedXdr, publicKey) {
+  if (!unsignedXdr) {
+    throw new Error("No unsigned envelope to sign.");
+  }
+
+  const signedTx = await signWithFreighter(unsignedXdr, publicKey);
+  return getServer().submitTransaction(signedTx);
+}
+
+/**
  * Build a payment op, sign it with Freighter, and submit it to Horizon.
  * `asset` accepts a UI descriptor (`{ isNative: true }` or
  * `{ isNative: false, code, issuer }`); omit it to send native XLM.
@@ -295,29 +377,15 @@ export async function sendPaymentWithFreighter(
   memoType = "text",
   memo = ""
 ) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
-    throw new Error("Destination must be a valid Stellar public key (G…).");
-  }
-
-  const transactionMemo = createMemo(memoType, memo);
-  const sourceAccount = await getServer().loadAccount(publicKey);
-  const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase: currentPassphrase(),
-  }).addOperation(
-    StellarSdk.Operation.payment({
-      destination,
-      asset: resolvePaymentAsset(asset),
-      amount: amount.toString(),
-    })
+  const unsignedXdr = await buildPaymentEnvelope(
+    publicKey,
+    destination,
+    amount,
+    asset,
+    memoType,
+    memo
   );
-
-  if (transactionMemo) {
-    txBuilder.addMemo(transactionMemo);
-  }
-
-  const transaction = txBuilder.setTimeout(180).build();
-  return signAndSubmit(transaction, publicKey);
+  return submitEnvelopeWithFreighter(unsignedXdr, publicKey);
 }
 
 /**

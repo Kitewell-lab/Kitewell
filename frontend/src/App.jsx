@@ -2,7 +2,8 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import {
   checkFreighterInstalled,
   connectFreighterWallet,
-  sendPaymentWithFreighter,
+  buildPaymentEnvelope,
+  submitEnvelopeWithFreighter,
   pathPaymentWithFreighter,
   changeTrustWithFreighter,
   readKitewellState,
@@ -91,6 +92,7 @@ export default function App() {
     path: "",
   });
   const [pathResult, setPathResult] = useState(null);
+  const [unsignedEnvelope, setUnsignedEnvelope] = useState(null);
   const [labInfo, setLabInfo] = useState(null);
   const [labError, setLabError] = useState(null);
   const [labState, setLabState] = useState(null);
@@ -111,6 +113,11 @@ export default function App() {
   const friendbotAvailable = isFriendbotAvailable();
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
   const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
+  // Any edit changes the operation list, so the previewed envelope is stale.
+  const updateSendForm = (changes) => {
+    setSendForm((prev) => ({ ...prev, ...changes }));
+    setUnsignedEnvelope(null);
+  };
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
 
   useEffect(() => {
@@ -248,49 +255,114 @@ export default function App() {
     }
   };
 
-  const handleSend = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
+  /** Validate the send form and return the args shared by preview and send. */
+  const sendFormArgs = () => {
+    if (!publicKey) {
+      showToast("Connect Freighter first.", "error");
+      return null;
+    }
     if (!sendForm.destination) {
-      return showToast("Destination is required.", "error");
+      showToast("Destination is required.", "error");
+      return null;
     }
     let amount;
     try {
       amount = validatePaymentAmount(sendForm.amount);
     } catch (err) {
-      return showToast(err.message, "error");
+      showToast(err.message, "error");
+      return null;
     }
     if (
       sendForm.memoType === "text" &&
       new TextEncoder().encode(sendForm.memo).length > 28
     ) {
-      return showToast("Text memos must be 28 UTF-8 bytes or fewer.", "error");
+      showToast("Text memos must be 28 UTF-8 bytes or fewer.", "error");
+      return null;
     }
 
     const selected = balances.find((b) => b.key === sendForm.assetKey);
     if (!selected) {
-      return showToast("Choose an asset you hold a trustline for.", "error");
+      showToast("Choose an asset you hold a trustline for.", "error");
+      return null;
     }
     if (parseFloat(amount) > parseFloat(selected.balance)) {
-      return showToast(
+      showToast(
         `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
         "error"
       );
+      return null;
     }
 
-    const asset = selected.isNative
-      ? { isNative: true }
-      : { isNative: false, code: selected.code, issuer: selected.issuer };
+    return {
+      destination: sendForm.destination,
+      amount,
+      asset: selected.isNative
+        ? { isNative: true }
+        : { isNative: false, code: selected.code, issuer: selected.issuer },
+      memoType: sendForm.memoType,
+      memo: sendForm.memo,
+    };
+  };
+
+  const buildSendEnvelope = async () => {
+    const args = sendFormArgs();
+    if (!args) return null;
+
+    return buildPaymentEnvelope(
+      publicKey,
+      args.destination,
+      args.amount,
+      args.asset,
+      args.memoType,
+      args.memo
+    );
+  };
+
+  /** Build the unsigned envelope only: never signs and never submits. */
+  const handlePreviewEnvelope = async () => {
+    setLoading("preview");
+    try {
+      const xdr = await buildSendEnvelope();
+      if (!xdr) return;
+      setUnsignedEnvelope(xdr);
+      showToast(
+        "Unsigned envelope ready. Nothing was signed or submitted.",
+        "info"
+      );
+    } catch (err) {
+      showToast(err.message || "Could not build the unsigned envelope.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleSend = async (e) => {
+    e.preventDefault();
+    const args = sendFormArgs();
+    if (!args) return;
+
+    // Show the envelope before Freighter opens so it can be copied or handed
+    // to another signer. The same XDR is signed on the next click.
+    if (!unsignedEnvelope) {
+      try {
+        const xdr = await buildSendEnvelope();
+        if (!xdr) return;
+        setUnsignedEnvelope(xdr);
+        showToast(
+          "Review the unsigned envelope, then click Sign & send to sign this exact XDR.",
+          "info"
+        );
+      } catch (err) {
+        showToast(err.message || "Could not build the unsigned envelope.", "error");
+      }
+      return;
+    }
 
     setLoading("send");
     try {
-      const result = await sendPaymentWithFreighter(
-        publicKey,
-        sendForm.destination,
-        amount,
-        asset,
-        sendForm.memoType,
-        sendForm.memo
+      const result = await submitEnvelopeWithFreighter(
+        unsignedEnvelope,
+        publicKey
       );
       const next = await getAccountBalances(publicKey);
       setBalances(next);
@@ -301,6 +373,7 @@ export default function App() {
         memoType: "text",
         memo: "",
       });
+      setUnsignedEnvelope(null);
       showToast(
         `Payment submitted · ${result.hash.slice(0, 12)}…`,
         "success",
@@ -896,8 +969,8 @@ export default function App() {
             <div className="section">
               <h2>Send payment</h2>
               <p className="muted">
-                Builds a payment op for XLM or a credit asset you hold, signs in Freighter, then
-                submits to Horizon Testnet.
+                Builds a payment op for XLM or a credit asset you hold. Review the unsigned
+                envelope XDR, then sign in Freighter to submit it to Horizon Testnet.
               </p>
               <form onSubmit={handleSend} className="form">
                 <label className="label" htmlFor="send-destination">
@@ -909,7 +982,7 @@ export default function App() {
                   type="text"
                   placeholder="G…"
                   value={sendForm.destination}
-                  onChange={(e) => setSendForm({ ...sendForm, destination: e.target.value })}
+                  onChange={(e) => updateSendForm({ destination: e.target.value })}
                   required
                 />
                 <label className="label" htmlFor="send-asset">
@@ -919,7 +992,7 @@ export default function App() {
                   id="send-asset"
                   className="input"
                   value={sendForm.assetKey}
-                  onChange={(e) => setSendForm({ ...sendForm, assetKey: e.target.value })}
+                  onChange={(e) => updateSendForm({ assetKey: e.target.value })}
                 >
                   <option value="native">XLM (native)</option>
                   {balances
@@ -944,7 +1017,7 @@ export default function App() {
                   min="0.0000001"
                   placeholder="e.g. 10"
                   value={sendForm.amount}
-                  onChange={(e) => setSendForm({ ...sendForm, amount: e.target.value })}
+                  onChange={(e) => updateSendForm({ amount: e.target.value })}
                   required
                 />
                 <label className="label" htmlFor="send-memo-type">
@@ -955,11 +1028,7 @@ export default function App() {
                   className="input"
                   value={sendForm.memoType}
                   onChange={(e) =>
-                    setSendForm({
-                      ...sendForm,
-                      memoType: e.target.value,
-                      memo: "",
-                    })
+                    updateSendForm({ memoType: e.target.value, memo: "" })
                   }
                 >
                   <option value="text">Text</option>
@@ -978,21 +1047,62 @@ export default function App() {
                   inputMode={memoField.inputMode}
                   placeholder={memoField.placeholder}
                   value={sendForm.memo}
-                  onChange={(e) => setSendForm({ ...sendForm, memo: e.target.value })}
+                  onChange={(e) => updateSendForm({ memo: e.target.value })}
                 />
-                <button
-                  className="btn btn--primary"
-                  type="submit"
-                  disabled={loading === "send" || requireWallet}
-                >
-                  {loading === "send" ? (
-                    <>
-                      <Spinner /> Signing in Freighter…
-                    </>
-                  ) : (
-                    "Sign & send"
-                  )}
-                </button>
+                {unsignedEnvelope && (
+                  <div className="info-box">
+                    <span className="eyebrow">Unsigned envelope XDR</span>
+                    <code style={{ wordBreak: "break-all" }}>
+                      {unsignedEnvelope}
+                    </code>
+                    <p className="muted">
+                      Copy this envelope to hand it to another signer or the decoder.
+                      Copying does not sign or submit it.
+                    </p>
+                    <button
+                      className="btn btn--secondary btn--sm"
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(unsignedEnvelope);
+                        showToast(
+                          "Unsigned envelope copied. Nothing was signed or submitted.",
+                          "info"
+                        );
+                      }}
+                    >
+                      Copy XDR
+                    </button>
+                  </div>
+                )}
+                <div className="section__row">
+                  <button
+                    className="btn btn--secondary"
+                    type="button"
+                    onClick={handlePreviewEnvelope}
+                    disabled={loading === "preview" || requireWallet}
+                  >
+                    {loading === "preview" ? (
+                      <>
+                        <Spinner /> Building…
+                      </>
+                    ) : (
+                      "Build unsigned envelope"
+                    )}
+                  </button>
+                  <button
+                    className="btn btn--primary"
+                    type="submit"
+                    disabled={loading === "send" || loading === "preview" || requireWallet}
+                  >
+                    {loading === "send" ? (
+                      <>
+                        <Spinner /> Signing in Freighter…
+                      </>
+                    ) : (
+                      "Sign & send"
+                    )}
+                  </button>
+                </div>
               </form>
             </div>
           )}
