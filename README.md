@@ -102,6 +102,7 @@ The Testnet lab UI, using the existing assets in [`screenshots/`](./screenshots)
 - XLM + credit-asset payments (asset picked from balances) + history
 - Path payments (`pathPaymentStrictSend` / `pathPaymentStrictReceive`)
 - Backend-backed account/payment reads (Horizon fallback)
+- Latest-ledger header with sequence, UTC close time, base fee, and base reserve
 - Lab panel for API + contract status
 - Lab tab Soroban registry: Freighter-signed `register(caller, name)` check-in + `lab_name` / `builder_count` / `get_builder` reads
 
@@ -158,4 +159,6 @@ one place.
 - Friendbot is Testnet-only and is disabled on Futurenet.
 - The Kitewell backend is configured for Testnet, so account/payment reads go straight to Horizon
   when another network is selected.
+- Latest-ledger values come from the selected network's Horizon endpoint, refresh while the page
+  is visible, and retain the last successful values with a warning when a refresh fails.
 - No Mainnet funds are ever used.
