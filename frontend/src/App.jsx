@@ -271,9 +271,11 @@ export default function App() {
     if (!selected) {
       return showToast("Choose an asset you hold a trustline for.", "error");
     }
-    if (parseFloat(amount) > parseFloat(selected.balance)) {
+    
+    const available = parseFloat(selected.available || selected.balance);
+    if (parseFloat(amount) > available) {
       return showToast(
-        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
+        `Insufficient ${selected.code} balance. Available: ${available.toFixed(7)} (after reserves/liabilities).`,
         "error"
       );
     }
@@ -794,38 +796,51 @@ export default function App() {
               {balances.length > 0 ? (
                 <ul className="balance-list">
                   {balances.map((b) => (
-                    <li key={b.key} className="balance-row">
-                      <div>
-                        <strong>{b.code}</strong>
-                        {!b.isNative && (
-                          <span className="muted balance-row__issuer">
-                            {shortenAddress(b.issuer)}
-                          </span>
-                        )}
-                      </div>
-                      <div className="balance-row__actions">
-                        <span>
-                          {parseFloat(b.balance).toLocaleString(undefined, {
-                            maximumFractionDigits: 7,
-                          })}
-                        </span>
-                        {!b.isNative && (
-                          <button
-                            className="btn btn--secondary btn--sm"
-                            type="button"
-                            onClick={() => handleRemoveTrust(b)}
-                            disabled={loading === `remove-${b.key}`}
-                            title={
-                              parseFloat(b.balance) > 0
-                                ? "Balance must be 0 before removing this trustline"
-                                : `Remove the ${b.code} trustline`
-                            }
-                          >
-                            {loading === `remove-${b.key}`
-                              ? "Removing…"
-                              : "Remove"}
-                          </button>
-                        )}
+                    <li key={b.key} className="balance-row" style={{ flexDirection: "column", alignItems: "flex-start", gap: "8px" }}>
+                      <div style={{ display: "flex", width: "100%", justifyContent: "space-between", alignItems: "flex-start" }}>
+                        <div>
+                          <strong>{b.code}</strong>
+                          {!b.isNative && (
+                            <span className="muted balance-row__issuer">
+                              {shortenAddress(b.issuer)}
+                            </span>
+                          )}
+                          <div style={{ fontSize: "0.85em", marginTop: "4px" }} className="muted">
+                            Total: {parseFloat(b.balance).toLocaleString(undefined, { maximumFractionDigits: 7 })}
+                            {b.sellingLiabilities && parseFloat(b.sellingLiabilities) > 0 && (
+                              <> | Selling: {parseFloat(b.sellingLiabilities).toLocaleString(undefined, { maximumFractionDigits: 7 })}</>
+                            )}
+                            {b.buyingLiabilities && parseFloat(b.buyingLiabilities) > 0 && (
+                              <> | Buying: {parseFloat(b.buyingLiabilities).toLocaleString(undefined, { maximumFractionDigits: 7 })}</>
+                            )}
+                          </div>
+                        </div>
+                        <div className="balance-row__actions">
+                          <div style={{ textAlign: "right", marginBottom: "8px" }}>
+                            <div style={{ fontWeight: "bold" }}>
+                              Available: {parseFloat(b.available || b.balance).toLocaleString(undefined, {
+                                maximumFractionDigits: 7,
+                              })}
+                            </div>
+                          </div>
+                          {!b.isNative && (
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              type="button"
+                              onClick={() => handleRemoveTrust(b)}
+                              disabled={loading === `remove-${b.key}`}
+                              title={
+                                parseFloat(b.balance) > 0
+                                  ? "Balance must be 0 before removing this trustline"
+                                  : `Remove the ${b.code} trustline`
+                              }
+                            >
+                              {loading === `remove-${b.key}`
+                                ? "Removing…"
+                                : "Remove"}
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </li>
                   ))}

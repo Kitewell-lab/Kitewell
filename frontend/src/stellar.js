@@ -96,9 +96,50 @@ export async function fundWithFriendbot(publicKey) {
   return response.json();
 }
 
-function mapHorizonBalances(account) {
+/**
+ * Calculate available balance for an asset, accounting for reserves and liabilities.
+ * 
+ * @param {object} balance - Balance object with balance, selling_liabilities, buying_liabilities
+ * @param {boolean} isNative - Whether this is the native XLM asset
+ * @param {number} subentryCount - Number of subentries (for XLM reserve calculation)
+ * @param {number} baseReserve - Base reserve from latest ledger (default 0.5 XLM)
+ * @returns {string} Available balance as string
+ */
+export function calculateAvailableBalance(
+  balance,
+  isNative,
+  subentryCount = 0,
+  baseReserve = 0.5
+) {
+  const total = parseFloat(balance.balance || "0");
+  const sellingLiabilities = parseFloat(balance.selling_liabilities || "0");
+  const buyingLiabilities = parseFloat(balance.buying_liabilities || "0");
+
+  if (isNative) {
+    // For XLM: available = total - (base reserve * (2 + subentries)) - selling liabilities
+    const minBalance = baseReserve * (2 + subentryCount);
+    const available = total - minBalance - sellingLiabilities;
+    return Math.max(0, available).toFixed(7);
+  } else {
+    // For credit assets: available = total - selling liabilities
+    const available = total - sellingLiabilities;
+    return Math.max(0, available).toFixed(7);
+  }
+}
+
+function mapHorizonBalances(account, baseReserve = 0.5) {
   return account.balances.map((b) => {
+    const sellingLiabilities = parseFloat(b.selling_liabilities || "0");
+    const buyingLiabilities = parseFloat(b.buying_liabilities || "0");
+    
     if (b.asset_type === "native") {
+      const available = calculateAvailableBalance(
+        b,
+        true,
+        account.subentry_count || 0,
+        baseReserve
+      );
+      
       return {
         key: "native",
         code: "XLM",
@@ -106,8 +147,14 @@ function mapHorizonBalances(account) {
         balance: b.balance,
         limit: null,
         isNative: true,
+        sellingLiabilities: sellingLiabilities.toFixed(7),
+        buyingLiabilities: buyingLiabilities.toFixed(7),
+        available,
       };
     }
+    
+    const available = calculateAvailableBalance(b, false);
+    
     return {
       key: `${b.asset_code}:${b.asset_issuer}`,
       code: b.asset_code,
@@ -115,6 +162,9 @@ function mapHorizonBalances(account) {
       balance: b.balance,
       limit: b.limit,
       isNative: false,
+      sellingLiabilities: sellingLiabilities.toFixed(7),
+      buyingLiabilities: buyingLiabilities.toFixed(7),
+      available,
     };
   });
 }
@@ -131,7 +181,20 @@ export async function getAccountBalances(publicKey) {
   }
 
   const account = await getServer().loadAccount(publicKey);
-  return mapHorizonBalances(account);
+  
+  let baseReserve = 0.5; // Default base reserve
+  try {
+    if (getServer().ledgers) {
+      const ledgerInfo = await getServer().ledgers().order("desc").limit(1).call();
+      if (ledgerInfo.records[0]?.base_reserve_in_stroops) {
+        baseReserve = parseFloat(ledgerInfo.records[0].base_reserve_in_stroops) / 10000000;
+      }
+    }
+  } catch {
+    // Use default base reserve if ledgers API is unavailable
+  }
+  
+  return mapHorizonBalances(account, baseReserve);
 }
 
 export async function getAccountDetails(publicKey) {
@@ -144,12 +207,25 @@ export async function getAccountDetails(publicKey) {
   }
 
   const account = await getServer().loadAccount(publicKey);
+  
+  let baseReserve = 0.5; // Default base reserve
+  try {
+    if (getServer().ledgers) {
+      const ledgerInfo = await getServer().ledgers().order("desc").limit(1).call();
+      if (ledgerInfo.records[0]?.base_reserve_in_stroops) {
+        baseReserve = parseFloat(ledgerInfo.records[0].base_reserve_in_stroops) / 10000000;
+      }
+    }
+  } catch {
+    // Use default base reserve if ledgers API is unavailable
+  }
+  
   return {
     id: account.id,
     sequence: account.sequenceNumber(),
     subentryCount: account.subentry_count,
     thresholds: account.thresholds,
-    balances: mapHorizonBalances(account),
+    balances: mapHorizonBalances(account, baseReserve),
     explorerUrl: explorerAccountUrl(publicKey),
   };
 }

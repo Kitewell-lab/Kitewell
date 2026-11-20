@@ -237,7 +237,17 @@ describe("balance mapping", () => {
     loadAccountMock.mockResolvedValue(horizonAccountFixture());
 
     await expect(getAccountBalances("GTEST")).resolves.toEqual([
-      { key: "native", code: "XLM", issuer: null, balance: "3.5000000", limit: null, isNative: true },
+      {
+        key: "native",
+        code: "XLM",
+        issuer: null,
+        balance: "3.5000000",
+        limit: null,
+        isNative: true,
+        sellingLiabilities: "0.0000000",
+        buyingLiabilities: "0.0000000",
+        available: "1.5000000", // 3.5 - (0.5 * (2 + 2)) = 1.5
+      },
       {
         key: "FOO:GISSUER",
         code: "FOO",
@@ -245,6 +255,9 @@ describe("balance mapping", () => {
         balance: "11.0000000",
         limit: "1000.0000000",
         isNative: false,
+        sellingLiabilities: "0.0000000",
+        buyingLiabilities: "0.0000000",
+        available: "11.0000000",
       },
     ]);
   });
