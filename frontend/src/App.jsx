@@ -14,6 +14,7 @@ import {
   getAccountBalances,
   getAccountDetails,
   getTransactions,
+  getFeeStats,
   explorerAccountUrl,
   explorerTxUrl,
 } from "./stellar";
@@ -26,9 +27,24 @@ import {
   setActiveNetwork,
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
+import { loadFeeSetting, saveFeeSetting } from "./feeSetting";
 import "./App.css";
 
-const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
+const TABS = [
+  "Wallet",
+  "Fund",
+  "Assets",
+  "Send",
+  "Path",
+  "History",
+  "Fees",
+  "Lab",
+];
+const FEE_PERCENTILES = [
+  { key: "mode", label: "Mode" },
+  { key: "p10", label: "p10" },
+  { key: "p99", label: "p99" },
+];
 const PATH_MODE_FIELDS = {
   strictSend: {
     amountLabel: "Amount to send",
@@ -97,6 +113,13 @@ export default function App() {
   const [labStateError, setLabStateError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
+  const [feeStats, setFeeStats] = useState(null);
+  const [feeStatsError, setFeeStatsError] = useState(null);
+  const [feeSetting, setFeeSetting] = useState(() => loadFeeSetting());
+  const [customFee, setCustomFee] = useState(() => {
+    const saved = loadFeeSetting();
+    return saved?.source === "custom" ? saved.stroops : "";
+  });
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
@@ -475,8 +498,47 @@ export default function App() {
     }
   };
 
+  const loadFeeStats = async () => {
+    setLoading("feestats");
+    setFeeStatsError(null);
+    setFeeStats(null);
+    try {
+      setFeeStats(await getFeeStats());
+    } catch {
+      setFeeStatsError("Fee stats could not be loaded.");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const applyFeePreset = (source) => {
+    const stroops = feeStats?.[source];
+    if (!stroops) {
+      return showToast("Load fee stats before choosing a percentile.", "error");
+    }
+
+    try {
+      setFeeSetting(saveFeeSetting({ source, stroops }));
+      showToast(`Fee set to ${stroops} stroops per operation.`);
+    } catch (err) {
+      showToast(err.message || "Could not save the fee.", "error");
+    }
+  };
+
+  const handleCustomFee = (event) => {
+    event.preventDefault();
+    try {
+      const saved = saveFeeSetting({ source: "custom", stroops: customFee });
+      setFeeSetting(saved);
+      showToast(`Fee set to ${saved.stroops} stroops per operation.`);
+    } catch (err) {
+      showToast(err.message || "Could not save the fee.", "error");
+    }
+  };
+
   const activateTab = (tab) => {
     setActiveTab(tab);
+    if (tab === "Fees") loadFeeStats();
     if (tab === "History") handleHistory();
     if (tab === "Lab") {
       loadLabInfo();
@@ -1177,6 +1239,102 @@ export default function App() {
                   </a>
                 </div>
               )}
+            </div>
+          )}
+
+          {activeTab === "Fees" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Network fee</h2>
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={loadFeeStats}
+                  disabled={loading === "feestats"}
+                >
+                  {loading === "feestats" ? (
+                    <>
+                      <Spinner /> Loading…
+                    </>
+                  ) : (
+                    "Refresh stats"
+                  )}
+                </button>
+              </div>
+              <p className="muted">
+                Horizon reports the fees charged in the last ledger. Pick one of its
+                percentiles or type your own; the next payment, trustline, or path
+                payment uses that fee per operation.
+              </p>
+
+              <div className="info-box">
+                <span className="eyebrow">Current fee</span>
+                <code>
+                  {feeSetting
+                    ? `${feeSetting.stroops} stroops per operation`
+                    : "SDK default (100 stroops per operation)"}
+                </code>
+                {feeSetting && (
+                  <p className="muted" style={{ marginTop: 6 }}>
+                    Source:{" "}
+                    {feeSetting.source === "custom"
+                      ? "custom"
+                      : `Horizon ${feeSetting.source}`}
+                  </p>
+                )}
+              </div>
+
+              {feeStatsError && (
+                <div className="info-box info-box--warning" role="alert">
+                  <span className="eyebrow">Fee stats</span>
+                  <p className="muted">{feeStatsError}</p>
+                </div>
+              )}
+
+              {feeStats && (
+                <div className="info-box">
+                  <span className="eyebrow">
+                    Last ledger
+                    {feeStats.lastLedger ? ` · ${feeStats.lastLedger}` : ""}
+                  </span>
+                  <div className="metadata-grid">
+                    {FEE_PERCENTILES.map(({ key, label }) => (
+                      <div key={key}>
+                        <span className="metadata-label">{label}</span>
+                        <span className="metadata-value">
+                          {feeStats[key]} stroops
+                        </span>
+                        <button
+                          className="btn btn--secondary"
+                          type="button"
+                          onClick={() => applyFeePreset(key)}
+                        >
+                          Use {label}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <form className="form" onSubmit={handleCustomFee}>
+                <label className="label" htmlFor="custom-fee">
+                  Custom fee (stroops per operation)
+                </label>
+                <input
+                  id="custom-fee"
+                  className="input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="e.g. 500"
+                  value={customFee}
+                  onChange={(e) => setCustomFee(e.target.value)}
+                />
+                <button className="btn btn--secondary" type="submit">
+                  Use custom fee
+                </button>
+              </form>
             </div>
           )}
 

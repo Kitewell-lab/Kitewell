@@ -7,6 +7,7 @@ import {
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
 import { buildAsset, parsePathAssets } from "./stellar";
+import { getFeePerOperation } from "./feeSetting";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -14,6 +15,11 @@ function getServer() {
 
 function currentPassphrase() {
   return getActiveNetwork().passphrase;
+}
+
+/** Selected fee per operation; falls back to the SDK default (100 stroops). */
+function selectedFeePerOperation() {
+  return getFeePerOperation() ?? StellarSdk.BASE_FEE;
 }
 
 const MAX_MEMO_TEXT_BYTES = 28;
@@ -302,7 +308,7 @@ export async function sendPaymentWithFreighter(
   const transactionMemo = createMemo(memoType, memo);
   const sourceAccount = await getServer().loadAccount(publicKey);
   const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   }).addOperation(
     StellarSdk.Operation.payment({
@@ -384,7 +390,7 @@ export async function pathPaymentWithFreighter({
 
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(operation)
@@ -414,7 +420,7 @@ export async function changeTrustWithFreighter(
   const asset = new StellarSdk.Asset(assetCode.toUpperCase(), assetIssuer);
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(

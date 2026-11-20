@@ -23,6 +23,27 @@ export function explorerTxUrl(hash) {
   return `${getActiveNetwork().explorerBase}/tx/${hash}`;
 }
 
+/**
+ * Read Horizon's `/fee_stats` and expose the last ledger's charged-fee mode and
+ * the p10/p99 percentiles used by the fee selector.
+ *
+ * @returns {Promise<{mode: string, p10: string, p99: string, lastLedger: string|null}>}
+ */
+export async function getFeeStats() {
+  const stats = await getServer().feeStats();
+  const charged = stats?.fee_charged ?? {};
+  const fallback = String(
+    stats?.last_ledger_base_fee ?? StellarSdk.BASE_FEE
+  );
+
+  return {
+    mode: String(charged.mode ?? fallback),
+    p10: String(charged.p10 ?? fallback),
+    p99: String(charged.p99 ?? fallback),
+    lastLedger: stats?.last_ledger ? String(stats.last_ledger) : null,
+  };
+}
+
 export const MAX_ASSET_CODE_LENGTH = 12;
 
 /**
