@@ -7,6 +7,9 @@ import {
   changeTrustWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  validateSignerWeight,
+  buildSetOptionsTx,
+  validateMediumAgainstSigners,
 } from "./freighter";
 import { shortenAddress } from "./addressFormat";
 import {
@@ -96,6 +99,10 @@ export default function App() {
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
+  const [signerForm, setSignerForm] = useState({ publicKey: "", weight: "" });
+  const [signers, setSigners] = useState([]);
+  const [thresholdForm, setThresholdForm] = useState({ low: "", med: "", high: "" });
+  const [thresholdWarning, setThresholdWarning] = useState(null);
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
@@ -470,6 +477,82 @@ export default function App() {
       setLabState(state);
     } catch (err) {
       showToast(err.message || "Contract invoke failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleAddSigner = (e) => {
+    e.preventDefault();
+    if (!signerForm.publicKey || !signerForm.weight) {
+      return showToast("Enter both public key and weight.", "error");
+    }
+    // Validate the weight
+    const weightValidation = validateSignerWeight(Number(signerForm.weight));
+    if (!weightValidation.ok) {
+      return showToast(weightValidation.error, "error");
+    }
+    setSigners((prev) => [
+      ...prev,
+      { publicKey: signerForm.publicKey, weight: Number(signerForm.weight) },
+    ]);
+    setSignerForm({ publicKey: "", weight: "" });
+  };
+
+const handleSetOptions = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    setLoading("setoptions");
+    setThresholdWarning(null);
+
+    // Validate thresholds against signers
+    const med = Number(thresholdForm.med);
+    const validation = validateMediumAgainstSigners(med, signers);
+    if (!validation.ok) {
+      setThresholdWarning(validation.error);
+      setLoading("");
+      return showToast(validation.error, "error");
+    }
+
+    // Build the setOptions transaction
+    const opts = {
+      masterWeight: 0, // will be set below
+      lowThreshold: Number(thresholdForm.low),
+      medThreshold: med,
+      highThreshold: Number(thresholdForm.high),
+      signers: signers.map((s) => ({
+        ed25519PublicKey: s.publicKey,
+        weight: Number(s.weight),
+      })),
+    };
+
+    // masterWeight should be >= each signer's weight and typically >= medThreshold
+    // Set it to the sum of all signer weights or medThreshold, whichever is higher
+    const totalSignerWeight = signers.reduce((sum, s) => sum + Number(s.weight), 0);
+    opts.masterWeight = Math.max(totalSignerWeight, med);
+
+    try {
+      const tx = buildSetOptionsTx(opts);
+      const result = await signAndSubmit(tx, publicKey);
+
+      if (result.status === "SUCCESS") {
+        showToast(
+          `setOptions submitted · ${result.hash.slice(0, 12)}…`,
+          "success",
+          explorerTxUrl(result.hash)
+        );
+        // Refresh lab state
+        await refreshLabState();
+        await loadLabInfo();
+      } else {
+        showToast(
+          `setOptions rejected: ${result.error?.message || "unknown error"}`,
+          "error"
+        );
+      }
+    } catch (err) {
+      showToast(err.message || "setOptions failed.", "error");
     } finally {
       setLoading("");
     }
@@ -1321,6 +1404,165 @@ export default function App() {
                       >
                         Explorer ↗
                       </a>
+                    </div>
+                  )}
+                  {/* Signer & Threshold Management */}
+                  {publicKey && labState && (
+                    <div className="info-box">
+                      <h3 className="subhead">Signer & Threshold Management</h3>
+                      {thresholdWarning && (
+                        <div className="info-box info-box--warning">
+                          <span className="eyebrow">Warning</span>
+                          <p className="muted">{thresholdWarning}</p>
+                        </div>
+                      )}
+                      {/* Signer form */}
+                      <form className="form" onSubmit={handleAddSigner}>
+                        <label className="label" htmlFor="signer-public-key">
+                          Signer public key
+                        </label>
+                        <input
+                          id="signer-public-key"
+                          className="input"
+                          type="text"
+                          placeholder="G… (Ed25519 public key)"
+                          value={signerForm.publicKey}
+                          onChange={(e) =>
+                            setSignerForm({ ...signerForm, publicKey: e.target.value })}
+                          maxLength={56}
+                          required
+                        />
+                        <label className="label" htmlFor="signer-weight">
+                          Weight
+                        </label>
+                        <input
+                          id="signer-weight"
+                          className="input"
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={signerForm.weight}
+                          onChange={(e) =>
+                            setSignerForm({
+                              ...signerForm,
+                              weight: e.target.valueAsNumber || e.target.value,
+                            })}
+                          required
+                        />
+                        <button
+                          className="btn btn--primary"
+                          type="submit"
+                          disabled={loading === "setoptions"}
+                        >
+                          {loading === "setoptions"
+                            ? (<>
+                              <Spinner /> Adding…
+                            </>)
+                            : "Add signer"}
+                        </button>
+                      </form>
+
+                      {/* Signers list */}
+                      {signers.length > 0 && (
+                        <div className="metadata-grid">
+                          <div>
+                            <span className="metadata-label">Signers</span>
+                          </div>
+                          <div>
+                            {signers.map((s, i) => (
+                              <div key={i} className="metadata-row">
+                                <span className="metadata-value">
+                                  {shortenAddress(s.publicKey)} · weight: {s.weight}
+                                </span>
+                                <button
+                                  className="btn btn--secondary btn--sm"
+                                  onClick={() =>
+                                    setSigners(
+                                      signers.filter((_, index) => index !== i)
+                                    )
+                                  }
+                                  title="Remove signer"
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Threshold form */}
+                      <form className="form" onSubmit={handleSetOptions}>
+                        <label className="label" htmlFor="threshold-low">
+                          Low threshold
+                        </label>
+                        <input
+                          id="threshold-low"
+                          className="input"
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={thresholdForm.low}
+                          onChange={(e) =>
+                            setThresholdForm({
+                              ...thresholdForm,
+                              low: e.target.valueAsNumber || e.target.value,
+                            })}
+                        />
+                        <label className="label" htmlFor="threshold-med">
+                          Medium threshold
+                        </label>
+                        <input
+                          id="threshold-med"
+                          className="input"
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={thresholdForm.med}
+                          onChange={(e) =>
+                            setThresholdForm({
+                              ...thresholdForm,
+                              med: e.target.valueAsNumber || e.target.value,
+                            })}
+                        />
+                        <p className="muted">
+                          {signers.length > 0 &&
+                          Number(thresholdForm.med) >
+                            signers.reduce(
+                              (sum, s) => sum + Number(s.weight),
+                              0
+                            )
+                            ? "⚠ Medium threshold exceeds total signer weight"
+                            : ""}
+                        </p>
+                        <label className="label" htmlFor="threshold-high">
+                          High threshold
+                        </label>
+                        <input
+                          id="threshold-high"
+                          className="input"
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={thresholdForm.high}
+                          onChange={(e) =>
+                            setThresholdForm({
+                              ...thresholdForm,
+                              high: e.target.valueAsNumber || e.target.value,
+                            })}
+                        />
+                        <button
+                          className="btn btn--primary"
+                          type="submit"
+                          disabled={loading === "setoptions"}
+                        >
+                          {loading === "setoptions"
+                            ? (<>
+                              <Spinner /> Setting…
+                            </>)
+                            : "Set thresholds & signers"}
+                        </button>
+                      </form>
                     </div>
                   )}
                 </>
