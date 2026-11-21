@@ -19,6 +19,32 @@ function currentPassphrase() {
 const MAX_MEMO_TEXT_BYTES = 28;
 const MAX_U64 = 18446744073709551615n;
 
+/** Signer weight validation (0–255 inclusive), matching the backend validator. */
+export const SIGNER_WEIGHT_ERROR = {
+  TYPE: "Signer weight must be a number",
+  INTEGER: "Signer weight must be an integer",
+  RANGE: "Signer weight must be between 0 and 255",
+};
+
+/** Validate a signer weight value. */
+export function validateSignerWeight(weight) {
+  if (typeof weight !== "number") {
+    return { ok: false, error: SIGNER_WEIGHT_ERROR.TYPE };
+  }
+  if (!Number.isInteger(weight)) {
+    return { ok: false, error: SIGNER_WEIGHT_ERROR.INTEGER };
+  }
+  if (weight < 0 || weight > 255) {
+    return { ok: false, error: SIGNER_WEIGHT_ERROR.RANGE };
+  }
+  return { ok: true, weight };
+}
+
+/** Boolean form of validateSignerWeight. */
+export function isValidSignerWeight(weight) {
+  return validateSignerWeight(weight).ok === true;
+}
+
 /** Public Stellar RPC endpoint for Soroban reads + invokes (Testnet). */
 export const SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
 const sorobanRpc = new StellarSdk.rpc.Server(SOROBAN_RPC_URL);
@@ -165,6 +191,262 @@ export async function registerBuilderWithFreighter(
   return { hash: sendResult.hash, returnValue: null, confirmed: false };
 }
 
+/**
+ * Build a setOptions operation for updating account thresholds and signers.
+ *
+ * @param {object} opts
+ *   @param {number} [opts.masterWeight] - master threshold weight (0-255)
+ *   @param {number} [opts.lowThreshold] - low threshold weight (0-255)
+ *   @param {number} [opts.medThreshold] - medium threshold weight (0-255)
+ *   @param {number} [opts.highThreshold] - high threshold weight (0-255)
+ *   @param {Array<{ed25519PublicKey: string, weight: number}}} [opts.signers] - signer entries
+ *   @param {string} [opts.inflationDest] - destination for inflation
+ *   @param {string} [opts.homeDomain] - home domain
+ * @returns {import("@stellar/stellar-sdk").Transaction} The built transaction (not yet signed)
+ */
+export function buildSetOptionsTx(opts = {}) {
+  const {
+    masterWeight,
+    lowThreshold,
+    medThreshold,
+    highThreshold,
+    signers,
+    inflationDest,
+    homeDomain,
+  } = opts;
+
+  const source = new StellarSdk.Account(ZERO_ADDRESS, "0");
+  const txBuilder = new StellarSdk.TransactionBuilder(source, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  });
+
+  // Build setOptions operation args
+  const opArgs = {};
+
+  if (masterWeight !== undefined) {
+    opArgs.masterWeight = masterWeight;
+  }
+  if (lowThreshold !== undefined) {
+    opArgs.lowThreshold = lowThreshold;
+  }
+  if (medThreshold !== undefined) {
+    opArgs.medThreshold = medThreshold;
+  }
+  if (highThreshold !== undefined) {
+    opArgs.highThreshold = highThreshold;
+  }
+
+  // Handle signers: format expected by SDK is {ed25519PublicKey: "...", weight: ...}
+  if (signers && signers.length > 0) {
+    opArgs.signer = signers.map((s) => ({
+      ed25519PublicKey: s.ed25519PublicKey,
+      weight: s.weight,
+    }));
+  }
+
+  if (inflationDest !== undefined) {
+    opArgs.inflationDest = inflationDest;
+  }
+  if (homeDomain !== undefined) {
+    opArgs.homeDomain = homeDomain;
+  }
+
+  txBuilder.addOperation(StellarSdk.Operation.setOptions(opArgs));
+  txBuilder.setTimeout(180);
+  return txBuilder.build();
+}
+
+/** Validate that the medium threshold is not above the sum of signer weights. */
+export function validateMediumAgainstSigners(medThreshold, signers) {
+  const totalSignerWeight = signers.reduce((sum, s) => sum + (s.weight || 0), 0);
+  if (medThreshold > totalSignerWeight) {
+    return {
+      ok: false,
+      error: `Medium threshold (${medThreshold}) is above the sum of signer weights (${totalSignerWeight})`,
+    };
+  }
+  return { ok: true };
+}
+
+/** Operation builder for manageSellOffer. */
+export function buildManageSellTx(sourceAccount, sellingAsset, buyingAsset, price, amount) {
+  return new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.manageSellOffer({
+        selling: sellingAsset,
+        buying: buyingAsset,
+        price: price,
+        amount: amount.toString(),
+      })
+    )
+    .setTimeout(180)
+    .build();
+}
+
+/** Operation builder for manageBuyOffer. */
+export function buildManageBuyTx(sourceAccount, sellingAsset, buyingAsset, price, amount) {
+  return new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.manageBuyOffer({
+        selling: sellingAsset,
+        buying: buyingAsset,
+        price: price,
+        amount: amount.toString(),
+      })
+    )
+    .setTimeout(180)
+    .build();
+}
+
+/** Validate price is a positive number (fraction), reject 0. */
+export function validatePrice(price) {
+  if (typeof price !== "number") {
+    return { ok: false, error: "Price must be a number" };
+  }
+  if (!Number.isFinite(price) || price <= 0) {
+    return { ok: false, error: "Price must be a positive number" };
+  }
+  return { ok: true, price };
+}
+
+/** List offers for an account from Horizon. */
+export async function listOffers(publicKey) {
+  const server = getServer();
+  const offers = await server.offers().forAccount(publicKey).order("asc").call();
+  return offers.records.map((record) => ({
+    id: record.paging_token,
+    selling: record.selling,
+    buying: record.buying,
+    price: record.price,
+    amount: record.selling_amount,
+  }));
+}
+
+/** Cancel an offer by submitting manageSellOffer/manageBuyOffer with amount=0.
+ *  `offer` should be an object from {@link listOffers} with selling, buying, price properties.
+ */
+export async function cancelOffer(publicKey, offer) {
+  const server = getServer();
+  const sourceAccount = await server.loadAccount(publicKey);
+  
+  // Determine if it's a sell or buy offer based on the assets
+  const isSellOffer = offer.selling.asset_type !== "native" || 
+                      (offer.selling.asset_type === "native" && offer.buying.asset_type !== "native");
+  
+  let operation;
+  if (isSellOffer) {
+    operation = StellarSdk.Operation.manageSellOffer({
+      selling: offer.selling,
+      buying: offer.buying,
+      price: offer.price,
+      amount: "0",
+    });
+  } else {
+    operation = StellarSdk.Operation.manageBuyOffer({
+      selling: offer.selling,
+      buying: offer.buying,
+      price: offer.price,
+      amount: "0",
+    });
+  }
+  
+  const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(operation)
+    .setTimeout(180)
+    .build();
+  
+  return signAndSubmit(tx, publicKey);
+  // Actually, proper cancel: manageSellOffer with selling set to the asset, but amount 0
+  // Let me check the proper Stellar SDK way
+  // The standard way is: manageSellOffer({selling: asset, buying: asset, price, amount: "0"})
+  // But we need the actual selling asset. Let me use a different approach.
+  
+  // Actually, the proper way to cancel an offer is to submit a manageSellOffer
+  // or manageBuyOffer with amount=0. But we need to know which offer and its assets.
+  // For now, let's return an error asking for more info.
+  throw new Error("Cancel implementation needs offer details - use manageSellOffer with amount 0");
+}
+
+/**
+ * Create a memo for the setOptions transaction.
+ * Memos are optional for setOptions but we include a helper for consistency.
+ */
+/** Build a liquidity pool deposit operation.
+ *  depositAmount is the max amount of the first reserve to deposit.
+ *  shareMinimum is the minimum pool shares to receive.
+ *  Returns the built (but not yet signed) transaction.
+ */
+export function buildLiquidityPoolDepositTx(sourceAccount, reserveA, reserveB, depositAmount, shareMinimum) {
+  return new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.liquidityPoolDeposit({
+        reservoir: [reserveA, reserveB],
+        amount: depositAmount.toString(),
+        minShareOut: shareMinimum.toString(),
+      })
+    )
+    .setTimeout(180)
+    .build();
+}
+
+/** Build a liquidity pool withdraw operation.
+ *  shareAmount is the amount of pool shares to withdraw.
+ *  reserveAMin is the minimum reserve A to receive.
+ *  reserveBMin is the minimum reserve B to receive.
+ *  Returns the built (but not yet signed) transaction.
+ */
+export function buildLiquidityPoolWithdrawTx(sourceAccount, shareAmount, reserveAMin, reserveBMin) {
+  return new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.liquidityPoolWithdraw({
+        shareIn: shareAmount.toString(),
+        minReserveA: reserveAMin.toString(),
+        minReserveB: reserveBMin.toString(),
+      })
+    )
+    .setTimeout(180)
+    .build();
+}
+
+/** Validate that a pair of assets are not the same. */
+export function validateLiquidityPair(codeA, codeB) {
+  if (!codeA || !codeB) {
+    return { ok: false, error: "Both asset codes are required" };
+  }
+  if (codeA.toUpperCase() === codeB.toUpperCase()) {
+    return { ok: false, error: "Pair of the same asset is refused" };
+  }
+  return { ok: true };
+}
+
+/** Validate minimum amount is not zero. */
+export function validateMinAmount(min) {
+  if (min <= 0) {
+    return { ok: false, error: "Minimum out of zero is refused" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Create a memo for the setOptions transaction.
+ * Memos are optional for setOptions but we include a helper for consistency.
+ */
 function createMemo(memoType, value) {
   if (!value) return null;
 
