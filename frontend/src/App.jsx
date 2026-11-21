@@ -7,6 +7,14 @@ import {
   changeTrustWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  validateSignerWeight,
+  buildSetOptionsTx,
+  validateMediumAgainstSigners,
+  buildManageSellTx,
+  buildManageBuyTx,
+  validatePrice,
+  listOffers,
+  cancelOffer,
 } from "./freighter";
 import { shortenAddress } from "./addressFormat";
 import {
@@ -96,6 +104,13 @@ export default function App() {
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
+  const [signerForm, setSignerForm] = useState({ publicKey: "", weight: "" });
+  const [signers, setSigners] = useState([]);
+  const [thresholdForm, setThresholdForm] = useState({ low: "", med: "", high: "" });
+  const [thresholdWarning, setThresholdWarning] = useState(null);
+  const [offerForm, setOfferForm] = useState({ sellingAsset: "", buyingAsset: "", price: "", amount: "" });
+  const [offers, setOffers] = useState([]);
+  const [cancelForm, setCancelForm] = useState({ offerId: "", price: "", amount: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
@@ -470,6 +485,218 @@ export default function App() {
       setLabState(state);
     } catch (err) {
       showToast(err.message || "Contract invoke failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleAddSigner = (e) => {
+    e.preventDefault();
+    if (!signerForm.publicKey || !signerForm.weight) {
+      return showToast("Enter both public key and weight.", "error");
+    }
+    // Validate the weight
+    const weightValidation = validateSignerWeight(Number(signerForm.weight));
+    if (!weightValidation.ok) {
+      return showToast(weightValidation.error, "error");
+    }
+    setSigners((prev) => [
+      ...prev,
+      { publicKey: signerForm.publicKey, weight: Number(signerForm.weight) },
+    ]);
+    setSignerForm({ publicKey: "", weight: "" });
+  };
+
+const handleSetOptions = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    setLoading("setoptions");
+    setThresholdWarning(null);
+
+    // Validate thresholds against signers
+    const med = Number(thresholdForm.med);
+    const validation = validateMediumAgainstSigners(med, signers);
+    if (!validation.ok) {
+      setThresholdWarning(validation.error);
+      setLoading("");
+      return showToast(validation.error, "error");
+    }
+
+    // Build the setOptions transaction
+    const opts = {
+      masterWeight: 0, // will be set below
+      lowThreshold: Number(thresholdForm.low),
+      medThreshold: med,
+      highThreshold: Number(thresholdForm.high),
+      signers: signers.map((s) => ({
+        ed25519PublicKey: s.publicKey,
+        weight: Number(s.weight),
+      })),
+    };
+
+    // masterWeight should be >= each signer's weight and typically >= medThreshold
+    // Set it to the sum of all signer weights or medThreshold, whichever is higher
+    const totalSignerWeight = signers.reduce((sum, s) => sum + Number(s.weight), 0);
+    opts.masterWeight = Math.max(totalSignerWeight, med);
+
+    try {
+      const tx = buildSetOptionsTx(opts);
+      const result = await signAndSubmit(tx, publicKey);
+
+      if (result.status === "SUCCESS") {
+        showToast(
+          `setOptions submitted · ${result.hash.slice(0, 12)}…`,
+          "success",
+          explorerTxUrl(result.hash)
+        );
+        // Refresh lab state
+        await refreshLabState();
+        await loadLabInfo();
+      } else {
+        showToast(
+          `setOptions rejected: ${result.error?.message || "unknown error"}`,
+          "error"
+        );
+      }
+    } catch (err) {
+      showToast(err.message || "setOptions failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handlePlaceOffer = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    // Validate price
+    const priceValidation = validatePrice(Number(offerForm.price));
+    if (!priceValidation.ok) {
+      return showToast(priceValidation.error, "error");
+    }
+
+    // Determine if this is a sell or buy offer based on assets
+    const selling = offerForm.sellingAssetType === "native" 
+      ? StellarSdk.Asset.native() 
+      : StellarSdk.Asset.code(offerForm.sellingAssetCode, offerForm.sellingAssetIssuer);
+    const buying = offerForm.buyingAssetType === "native" 
+      ? StellarSdk.Asset.native() 
+      : StellarSdk.Asset.code(offerForm.buyingAssetCode, offerForm.buyingAssetIssuer);
+
+    // Build the transaction
+    let tx;
+    if (offerForm.mode === "sell") {
+      tx = buildManageSellTx(
+        // We need a source account - load it
+        null, // will be handled below
+        selling,
+        buying,
+        priceValidation.price,
+        Number(offerForm.amount)
+      );
+    } else {
+      tx = buildManageBuyTx(
+        selling,
+        buying,
+        priceValidation.price,
+        Number(offerForm.amount)
+      );
+    }
+
+    // Actually we need the source account, let me redo this
+    setLoading("placeoffer");
+    try {
+      const sourceAccount = await getServer().loadAccount(publicKey);
+      
+      let operation;
+      if (offerForm.mode === "sell") {
+        operation = StellarSdk.Operation.manageSellOffer({
+          selling: selling,
+          buying: buying,
+          price: priceValidation.price,
+          amount: offerForm.amount,
+        });
+      } else {
+        operation = StellarSdk.Operation.manageBuyOffer({
+          selling: selling,
+          buying: buying,
+          price: priceValidation.price,
+          amount: offerForm.amount,
+        });
+      }
+
+      const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
+        fee: StellarSdk.BASE_FEE,
+        networkPassphrase: currentPassphrase(),
+      });
+      txBuilder.addOperation(operation);
+      txBuilder.setTimeout(180);
+      const tx = txBuilder.build();
+
+      const result = await signAndSubmit(tx, publicKey);
+
+      if (result.status === "SUCCESS") {
+        showToast(
+          `Offer placed · ${result.hash.slice(0, 12)}…`,
+          "success",
+          explorerTxUrl(result.hash)
+        );
+        // Refresh offers list
+        await refreshOffers();
+      } else {
+        showToast(
+          `Offer failed: ${result.error?.message || "unknown error"}`,
+          "error"
+        );
+      }
+    } catch (err) {
+      showToast(err.message || "Offer placement failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const refreshOffers = async () => {
+    if (!publicKey) return;
+    try {
+      const listedOffers = await listOffers(publicKey);
+      setOffers(listedOffers);
+    } catch (err) {
+      showToast("Could not load offers.", "error");
+    }
+  };
+
+  const handleCancelOffer = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    // Find the offer to cancel
+    const offerToCancel = offers.find(o => o.id === cancelForm.offerId);
+    if (!offerToCancel) {
+      return showToast("Offer not found.", "error");
+    }
+
+    setLoading("canceloffer");
+    try {
+      const result = await cancelOffer(publicKey, offerToCancel);
+
+      if (result.status === "SUCCESS") {
+        showToast(
+          `Offer cancelled · ${result.hash.slice(0, 12)}…`,
+          "success",
+          explorerTxUrl(result.hash)
+        );
+        // Refresh offers list
+        await refreshOffers();
+      } else {
+        showToast(
+          `Cancel failed: ${result.error?.message || "unknown error"}`,
+          "error"
+        );
+      }
+    } catch (err) {
+      showToast(err.message || "Offer cancellation failed.", "error");
     } finally {
       setLoading("");
     }
@@ -1323,7 +1550,379 @@ export default function App() {
                       </a>
                     </div>
                   )}
+                  {/* Signer & Threshold Management */}
+                  {publicKey && labState && (
+                    <div className="info-box">
+                      <h3 className="subhead">Signer & Threshold Management</h3>
+                      {thresholdWarning && (
+                        <div className="info-box info-box--warning">
+                          <span className="eyebrow">Warning</span>
+                          <p className="muted">{thresholdWarning}</p>
+                        </div>
+                      )}
+                      {/* Signer form */}
+                      <form className="form" onSubmit={handleAddSigner}>
+                        <label className="label" htmlFor="signer-public-key">
+                          Signer public key
+                        </label>
+                        <input
+                          id="signer-public-key"
+                          className="input"
+                          type="text"
+                          placeholder="G… (Ed25519 public key)"
+                          value={signerForm.publicKey}
+                          onChange={(e) =>
+                            setSignerForm({ ...signerForm, publicKey: e.target.value })}
+                          maxLength={56}
+                          required
+                        />
+                        <label className="label" htmlFor="signer-weight">
+                          Weight
+                        </label>
+                        <input
+                          id="signer-weight"
+                          className="input"
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={signerForm.weight}
+                          onChange={(e) =>
+                            setSignerForm({
+                              ...signerForm,
+                              weight: e.target.valueAsNumber || e.target.value,
+                            })}
+                          required
+                        />
+                        <button
+                          className="btn btn--primary"
+                          type="submit"
+                          disabled={loading === "setoptions"}
+                        >
+                          {loading === "setoptions"
+                            ? (<>
+                              <Spinner /> Adding…
+                            </>)
+                            : "Add signer"}
+                        </button>
+                      </form>
+
+                      {/* Signers list */}
+                      {signers.length > 0 && (
+                        <div className="metadata-grid">
+                          <div>
+                            <span className="metadata-label">Signers</span>
+                          </div>
+                          <div>
+                            {signers.map((s, i) => (
+                              <div key={i} className="metadata-row">
+                                <span className="metadata-value">
+                                  {shortenAddress(s.publicKey)} · weight: {s.weight}
+                                </span>
+                                <button
+                                  className="btn btn--secondary btn--sm"
+                                  onClick={() =>
+                                    setSigners(
+                                      signers.filter((_, index) => index !== i)
+                                    )
+                                  }
+                                  title="Remove signer"
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Threshold form */}
+                      <form className="form" onSubmit={handleSetOptions}>
+                        <label className="label" htmlFor="threshold-low">
+                          Low threshold
+                        </label>
+                        <input
+                          id="threshold-low"
+                          className="input"
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={thresholdForm.low}
+                          onChange={(e) =>
+                            setThresholdForm({
+                              ...thresholdForm,
+                              low: e.target.valueAsNumber || e.target.value,
+                            })}
+                        />
+                        <label className="label" htmlFor="threshold-med">
+                          Medium threshold
+                        </label>
+                        <input
+                          id="threshold-med"
+                          className="input"
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={thresholdForm.med}
+                          onChange={(e) =>
+                            setThresholdForm({
+                              ...thresholdForm,
+                              med: e.target.valueAsNumber || e.target.value,
+                            })}
+                        />
+                        <p className="muted">
+                          {signers.length > 0 &&
+                          Number(thresholdForm.med) >
+                            signers.reduce(
+                              (sum, s) => sum + Number(s.weight),
+                              0
+                            )
+                            ? "⚠ Medium threshold exceeds total signer weight"
+                            : ""}
+                        </p>
+                        <label className="label" htmlFor="threshold-high">
+                          High threshold
+                        </label>
+                        <input
+                          id="threshold-high"
+                          className="input"
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={thresholdForm.high}
+                          onChange={(e) =>
+                            setThresholdForm({
+                              ...thresholdForm,
+                              high: e.target.valueAsNumber || e.target.value,
+                            })}
+                        />
+                        <button
+                          className="btn btn--primary"
+                          type="submit"
+                          disabled={loading === "setoptions"}
+                        >
+                          {loading === "setoptions"
+                            ? (<>
+                              <Spinner /> Setting…
+                            </>)
+                            : "Set thresholds & signers"}
+                        </button>
+                      </form>
+                    </div>
+                  )}
                 </>
+              )}
+              {/* Offer Management */}
+              {publicKey && labState && (
+                <div className="info-box">
+                  <h3 className="subhead">Order Book Management</h3>
+                  <form className="form" onSubmit={handlePlaceOffer}>
+                    <label className="label" htmlFor="offer-mode">
+                      Mode
+                    </label>
+                    <select
+                      id="offer-mode"
+                      className="input"
+                      value={offerForm.mode}
+                      onChange={(e) => setOfferForm({ ...offerForm, mode: e.target.value })}
+                    >
+                      <option value="sell">Sell offer — sell {offerForm.sellingAssetType === "native" ? "XLM" : offerForm.sellingAssetCode} for {offerForm.buyingAssetType === "native" ? "XLM" : offerForm.buyingAssetCode}</option>
+                      <option value="buy">Buy offer — buy {offerForm.buyingAssetType === "native" ? "XLM" : offerForm.buyingAssetCode} with {offerForm.sellingAssetType === "native" ? "XLM" : offerForm.sellingAssetCode}</option>
+                    </select>
+
+                    <label className="label" htmlFor="selling-asset-type">
+                      Sell asset type
+                    </label>
+                    <select
+                      id="selling-asset-type"
+                      className="input"
+                      value={offerForm.sellingAssetType}
+                      onChange={(e) => setOfferForm({ ...offerForm, sellingAssetType: e.target.value })}
+                    >
+                      <option value="native">XLM (native)</option>
+                      <option value="credit">Credit asset</option>
+                    </select>
+                    {offerForm.sellingAssetType === "credit" && (
+                      <>
+                        <input
+                          className="input"
+                          type="text"
+                          placeholder="Asset code, e.g. USDC"
+                          maxLength={12}
+                          value={offerForm.sellingAssetCode}
+                          onChange={(e) => setOfferForm({ ...offerForm, sellingAssetCode: e.target.value })}
+                          required
+                        />
+                        <input
+                          className="input"
+                          type="text"
+                          placeholder="Issuer G…"
+                          value={offerForm.sellingAssetIssuer}
+                          onChange={(e) => setOfferForm({ ...offerForm, sellingAssetIssuer: e.target.value })}
+                          required
+                        />
+                      </>
+                    )}
+
+                    <label className="label" htmlFor="dest-asset-type">
+                      Buy asset type
+                    </label>
+                    <select
+                      id="dest-asset-type"
+                      className="input"
+                      value={offerForm.buyingAssetType}
+                      onChange={(e) => setOfferForm({ ...offerForm, buyingAssetType: e.target.value })}
+                    >
+                      <option value="native">XLM (native)</option>
+                      <option value="credit">Credit asset</option>
+                    </select>
+                    {offerForm.buyingAssetType === "credit" && (
+                      <>
+                        <input
+                          className="input"
+                          type="text"
+                          placeholder="Asset code, e.g. USDC"
+                          maxLength={12}
+                          value={offerForm.buyingAssetCode}
+                          onChange={(e) => setOfferForm({ ...offerForm, buyingAssetCode: e.target.value })}
+                          required
+                        />
+                        <input
+                          className="input"
+                          type="text"
+                          placeholder="Issuer G…"
+                          value={offerForm.buyingAssetIssuer}
+                          onChange={(e) => setOfferForm({ ...offerForm, buyingAssetIssuer: e.target.value })}
+                          required
+                        />
+                      </>
+                    )}
+
+                    <label className="label" htmlFor="offer-amount">
+                      Amount
+                    </label>
+                    <input
+                      id="offer-amount"
+                      className="input"
+                      type="number"
+                      step="0.0000001"
+                      min="0.0000001"
+                      placeholder="e.g. 10"
+                      value={offerForm.amount}
+                      onChange={(e) => setOfferForm({ ...offerForm, amount: e.target.valueAsNumber || e.target.value })}
+                      required
+                    />
+
+                    <label className="label" htmlFor="offer-price">
+                      Price (positive number)
+                    </label>
+                    <input
+                      id="offer-price"
+                      className="input"
+                      type="number"
+                      step="any"
+                      min="0.0000001"
+                      placeholder="e.g. 1.5"
+                      value={offerForm.price}
+                      onChange={(e) => setOfferForm({ ...offerForm, price: e.target.value })}
+                      required
+                    />
+
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "placeoffer"}
+                    >
+                      {loading === "placeoffer"
+                        ? (<>
+                          <Spinner /> Placing…
+                        </>)
+                        : "Place offer"}
+                    </button>
+                  </form>
+
+                  {offers.length > 0 ? (
+                    <div className="metadata-grid">
+                      <div>
+                        <span className="metadata-label">Your Offers</span>
+                      </div>
+                      <div>
+                        {offers.map((offer) => (
+                          <div key={offer.id} className="metadata-row">
+                            <span className="metadata-value">
+                              Offer ID: {offer.id}
+                            </span>
+                            <span className="metadata-value">
+                              Selling: {offer.selling.asset_code || "XLM"} · Amount: {offer.amount}
+                            </span>
+                            <span className="metadata-value">
+                              Buying: {offer.buying.asset_code || "XLM"} · Price: {offer.price}
+                            </span>
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              onClick={() => setCancelForm({ offerId: offer.id, price: offer.price, amount: offer.amount })}
+                              title="Cancel this offer"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="muted">No offers yet. Place a new offer above.</p>
+                  )}
+
+                  <form className="form" onSubmit={handleCancelOffer}>
+                    <label className="label" htmlFor="cancel-offer-id">
+                      Offer ID to cancel
+                    </label>
+                    <input
+                      id="cancel-offer-id"
+                      className="input"
+                      type="text"
+                      value={cancelForm.offerId}
+                      onChange={(e) => setCancelForm({ ...cancelForm, offerId: e.target.value })}
+                      required
+                    />
+                    <label className="label" htmlFor="cancel-price">
+                      Price
+                    </label>
+                    <input
+                      id="cancel-price"
+                      className="input"
+                      type="number"
+                      step="any"
+                      min="0.0000001"
+                      value={cancelForm.price}
+                      onChange={(e) => setCancelForm({ ...cancelForm, price: e.target.value })}
+                      required
+                    />
+                    <label className="label" htmlFor="cancel-amount">
+                      Amount
+                    </label>
+                    <input
+                      id="cancel-amount"
+                      className="input"
+                      type="number"
+                      step="0.0000001"
+                      min="0.0000001"
+                      value={cancelForm.amount}
+                      onChange={(e) => setCancelForm({ ...cancelForm, amount: e.target.valueAsNumber || e.target.value })}
+                      required
+                    />
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "canceloffer"}
+                    >
+                      {loading === "canceloffer"
+                        ? (<>
+                          <Spinner /> Cancelling…
+                        </>)
+                        : "Cancel offer"}
+                    </button>
+                  </form>
+                </div>
               )}
               {!labInfo && !labError && (
                 <p className="muted">Open this tab to probe the backend.</p>
