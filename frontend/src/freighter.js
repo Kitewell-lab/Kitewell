@@ -381,6 +381,72 @@ export async function cancelOffer(publicKey, offer) {
  * Create a memo for the setOptions transaction.
  * Memos are optional for setOptions but we include a helper for consistency.
  */
+/** Build a liquidity pool deposit operation.
+ *  depositAmount is the max amount of the first reserve to deposit.
+ *  shareMinimum is the minimum pool shares to receive.
+ *  Returns the built (but not yet signed) transaction.
+ */
+export function buildLiquidityPoolDepositTx(sourceAccount, reserveA, reserveB, depositAmount, shareMinimum) {
+  return new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.liquidityPoolDeposit({
+        reservoir: [reserveA, reserveB],
+        amount: depositAmount.toString(),
+        minShareOut: shareMinimum.toString(),
+      })
+    )
+    .setTimeout(180)
+    .build();
+}
+
+/** Build a liquidity pool withdraw operation.
+ *  shareAmount is the amount of pool shares to withdraw.
+ *  reserveAMin is the minimum reserve A to receive.
+ *  reserveBMin is the minimum reserve B to receive.
+ *  Returns the built (but not yet signed) transaction.
+ */
+export function buildLiquidityPoolWithdrawTx(sourceAccount, shareAmount, reserveAMin, reserveBMin) {
+  return new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.liquidityPoolWithdraw({
+        shareIn: shareAmount.toString(),
+        minReserveA: reserveAMin.toString(),
+        minReserveB: reserveBMin.toString(),
+      })
+    )
+    .setTimeout(180)
+    .build();
+}
+
+/** Validate that a pair of assets are not the same. */
+export function validateLiquidityPair(codeA, codeB) {
+  if (!codeA || !codeB) {
+    return { ok: false, error: "Both asset codes are required" };
+  }
+  if (codeA.toUpperCase() === codeB.toUpperCase()) {
+    return { ok: false, error: "Pair of the same asset is refused" };
+  }
+  return { ok: true };
+}
+
+/** Validate minimum amount is not zero. */
+export function validateMinAmount(min) {
+  if (min <= 0) {
+    return { ok: false, error: "Minimum out of zero is refused" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Create a memo for the setOptions transaction.
+ * Memos are optional for setOptions but we include a helper for consistency.
+ */
 function createMemo(memoType, value) {
   if (!value) return null;
 

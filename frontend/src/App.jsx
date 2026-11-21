@@ -15,6 +15,10 @@ import {
   validatePrice,
   listOffers,
   cancelOffer,
+  buildLiquidityPoolDepositTx,
+  buildLiquidityPoolWithdrawTx,
+  validateLiquidityPair,
+  validateMinAmount,
 } from "./freighter";
 import { shortenAddress } from "./addressFormat";
 import {
@@ -108,6 +112,9 @@ export default function App() {
   const [signers, setSigners] = useState([]);
   const [thresholdForm, setThresholdForm] = useState({ low: "", med: "", high: "" });
   const [thresholdWarning, setThresholdWarning] = useState(null);
+  const [poolForm, setPoolForm] = useState({ assetA: "", assetB: "", depositAmount: "", shareMinimum: "", withdrawShare: "", reserveAMin: "", reserveBMin: "" });
+  const [pools, setPools] = useState([]);
+  const [poolWarning, setPoolWarning] = useState(null);
   const [offerForm, setOfferForm] = useState({ sellingAsset: "", buyingAsset: "", price: "", amount: "" });
   const [offers, setOffers] = useState([]);
   const [cancelForm, setCancelForm] = useState({ offerId: "", price: "", amount: "" });
@@ -699,6 +706,110 @@ const handleSetOptions = async (e) => {
       showToast(err.message || "Offer cancellation failed.", "error");
     } finally {
       setLoading("");
+    }
+  };
+
+  const handleDeposit = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    // Validate pair
+    const pairValidation = validateLiquidityPair(poolForm.assetA, poolForm.assetB);
+    if (!pairValidation.ok) {
+      return showToast(pairValidation.error, "error");
+    }
+    // Validate minimum
+    const minValidation = validateMinAmount(Number(poolForm.shareMinimum));
+    if (!minValidation.ok) {
+      return showToast(minValidation.error, "error");
+    }
+
+    // Build reserves - need to get actual asset objects
+    const assetA = poolForm.assetAType === "native"
+      ? StellarSdk.Asset.native()
+      : StellarSdk.Asset.code(poolForm.assetACode, poolForm.assetAIssuer);
+    const assetB = poolForm.assetBType === "native"
+      ? StellarSdk.Asset.native()
+      : StellarSdk.Asset.code(poolForm.assetBCode, poolForm.assetBIssuer);
+
+    setLoading("deposit");
+    try {
+      const sourceAccount = await getServer().loadAccount(publicKey);
+      const tx = buildLiquidityPoolDepositTx(sourceAccount, assetA, assetB, Number(poolForm.depositAmount), Number(poolForm.shareMinimum));
+
+      const result = await signAndSubmit(tx, publicKey);
+
+      if (result.status === "SUCCESS") {
+        showToast(
+          `Liquidity deposit · ${result.hash.slice(0, 12)}…`,
+          "success",
+          explorerTxUrl(result.hash)
+        );
+        // Refresh balances
+        await refreshBalances();
+        await refreshPools();
+      } else {
+        showToast(
+          `Deposit failed: ${result.error?.message || "unknown error"}`,
+          "error"
+        );
+      }
+    } catch (err) {
+      showToast(err.message || "Deposit failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleWithdraw = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    // Validate minimum
+    const minAValidation = validateMinAmount(Number(poolForm.reserveAMin));
+    const minBValidation = validateMinAmount(Number(poolForm.reserveBMin));
+    if (!minAValidation.ok || !minBValidation.ok) {
+      return showToast(minAValidation.ok ? "" : minAValidation.error, "error");
+    }
+
+    // Build the withdraw tx
+    setLoading("withdraw");
+    try {
+      const sourceAccount = await getServer().loadAccount(publicKey);
+      const tx = buildLiquidityPoolWithdrawTx(sourceAccount, Number(poolForm.withdrawShare), Number(poolForm.reserveAMin), Number(poolForm.reserveBMin));
+
+      const result = await signAndSubmit(tx, publicKey);
+
+      if (result.status === "SUCCESS") {
+        showToast(
+          `Liquidity withdraw · ${result.hash.slice(0, 12)}…`,
+          "success",
+          explorerTxUrl(result.hash)
+        );
+        // Refresh balances
+        await refreshBalances();
+        await refreshPools();
+      } else {
+        showToast(
+          `Withdraw failed: ${result.error?.message || "unknown error"}`,
+          "error"
+        );
+      }
+    } catch (err) {
+      showToast(err.message || "Withdraw failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const refreshPools = async () => {
+    if (!publicKey) return;
+    try {
+      // This is a simplified pool listing - in practice would query Horizon
+      // For now, just refresh balances which includes pool shares
+      await refreshBalances();
+    } catch (err) {
+      showToast("Could not refresh pool data.", "error");
     }
   };
 
@@ -1920,6 +2031,220 @@ const handleSetOptions = async (e) => {
                           <Spinner /> Cancelling…
                         </>)
                         : "Cancel offer"}
+                    </button>
+                  </form>
+                </div>
+              )}
+              {/* Liquidity Pool Management */}
+              {publicKey && labState && (
+                <div className="info-box">
+                  <h3 className="subhead">Liquidity Pool Management</h3>
+                  <form className="form" onSubmit={handleDeposit}>
+                    <label className="label" htmlFor="pool-asset-a">
+                      Reserve A asset
+                    </label>
+                    <select
+                      id="pool-asset-a-type"
+                      className="input"
+                      value={poolForm.assetAType}
+                      onChange={(e) => setPoolForm({ ...poolForm, assetAType: e.target.value })}
+                    >
+                      <option value="native">XLM (native)</option>
+                      <option value="credit">Credit asset</option>
+                    </select>
+                    {poolForm.assetAType === "credit" && (
+                      <>
+                        <input
+                          className="input"
+                          type="text"
+                          placeholder="Asset code A, e.g. USDC"
+                          maxLength={12}
+                          value={poolForm.assetACode}
+                          onChange={(e) => setPoolForm({ ...poolForm, assetACode: e.target.value })}
+                          required
+                        />
+                        <input
+                          className="input"
+                          type="text"
+                          placeholder="Issuer A G…"
+                          value={poolForm.assetAIssuer}
+                          onChange={(e) => setPoolForm({ ...poolForm, assetAIssuer: e.target.value })}
+                          required
+                        />
+                      </>
+                    )}
+
+                    <label className="label" htmlFor="pool-asset-b-type">
+                      Reserve B asset
+                    </label>
+                    <select
+                      id="pool-asset-b-type"
+                      className="input"
+                      value={poolForm.assetBType}
+                      onChange={(e) => setPoolForm({ ...poolForm, assetBType: e.target.value })}
+                    >
+                      <option value="native">XLM (native)</option>
+                      <option value="credit">Credit asset</option>
+                    </select>
+                    {poolForm.assetBType === "credit" && (
+                      <>
+                        <input
+                          className="input"
+                          type="text"
+                          placeholder="Asset code B, e.g. USDC"
+                          maxLength={12}
+                          value={poolForm.assetBCode}
+                          onChange={(e) => setPoolForm({ ...poolForm, assetBCode: e.target.value })}
+                          required
+                        />
+                        <input
+                          className="input"
+                          type="text"
+                          placeholder="Issuer B G…"
+                          value={poolForm.assetBIssuer}
+                          onChange={(e) => setPoolForm({ ...poolForm, assetBIssuer: e.target.value })}
+                          required
+                        />
+                      </>
+                    )}
+
+                    <label className="label" htmlFor="pool-deposit-amount">
+                      Deposit amount
+                    </label>
+                    <input
+                      id="pool-deposit-amount"
+                      className="input"
+                      type="number"
+                      step="0.0000001"
+                      min="0.0000001"
+                      placeholder="e.g. 10"
+                      value={poolForm.depositAmount}
+                      onChange={(e) => setPoolForm({ ...poolForm, depositAmount: e.target.valueAsNumber || e.target.value })}
+                      required
+                    />
+
+                    <label className="label" htmlFor="pool-share-minimum">
+                      Min pool shares
+                    </label>
+                    <input
+                      id="pool-share-minimum"
+                      className="input"
+                      type="number"
+                      step="0.0000001"
+                      min="0.0000001"
+                      placeholder="e.g. 1000"
+                      value={poolForm.shareMinimum}
+                      onChange={(e) => setPoolForm({ ...poolForm, shareMinimum: e.target.valueAsNumber || e.target.value })}
+                      required
+                    />
+
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "deposit"}
+                    >
+                      {loading === "deposit"
+                        ? (<>
+                          <Spinner /> Depositing…
+                        </>)
+                        : "Deposit liquidity"}
+                    </button>
+                  </form>
+
+                  {pools.length > 0 ? (
+                    <div className="metadata-grid">
+                      <div>
+                        <span className="metadata-label">Your Pools</span>
+                      </div>
+                      <div>
+                        {pools.map((pool) => (
+                          <div key={pool.id} className="metadata-row">
+                            <span className="metadata-value">
+                              Pool: {pool.id} · Shares: {pool.shares}
+                            </span>
+                            <span className="metadata-value">
+                              Reserve A: {pool.reserveA} · Reserve B: {pool.reserveB}
+                            </span>
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              onClick={() => setPoolForm({
+                                assetAType: pool.reserveAType,
+                                assetBType: pool.reserveBType,
+                                assetACode: pool.reserveACode,
+                                assetAIssuer: pool.reserveAIssuer,
+                                assetBCode: pool.reserveBCode,
+                                assetBIssuer: pool.reserveBIssuer,
+                                depositAmount: pool.depositAmount,
+                                shareMinimum: pool.shareMinimum,
+                                withdrawShare: pool.shares,
+                                reserveAMin: pool.minReserveA,
+                                reserveBMin: pool.minReserveB,
+                              })}
+                              title="Configure withdraw from this pool"
+                            >
+                              Withdraw
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="muted">No pools yet. Deposit liquidity above.</p>
+                  )}
+
+                  <form className="form" onSubmit={handleWithdraw}>
+                    <label className="label" htmlFor="withdraw-share">
+                      Share amount
+                    </label>
+                    <input
+                      id="withdraw-share"
+                      className="input"
+                      type="number"
+                      step="0.0000001"
+                      min="0.0000001"
+                      placeholder="e.g. 1000"
+                      value={poolForm.withdrawShare}
+                      onChange={(e) => setPoolForm({ ...poolForm, withdrawShare: e.target.valueAsNumber || e.target.value })}
+                      required
+                    />
+                    <label className="label" htmlFor="reserve-a-min">
+                      Min reserve A
+                    </label>
+                    <input
+                      id="reserve-a-min"
+                      className="input"
+                      type="number"
+                      step="0.0000001"
+                      min="0.0000001"
+                      placeholder="e.g. 5"
+                      value={poolForm.reserveAMin}
+                      onChange={(e) => setPoolForm({ ...poolForm, reserveAMin: e.target.valueAsNumber || e.target.value })}
+                      required
+                    />
+                    <label className="label" htmlFor="reserve-b-min">
+                      Min reserve B
+                    </label>
+                    <input
+                      id="reserve-b-min"
+                      className="input"
+                      type="number"
+                      step="0.0000001"
+                      min="0.0000001"
+                      placeholder="e.g. 5"
+                      value={poolForm.reserveBMin}
+                      onChange={(e) => setPoolForm({ ...poolForm, reserveBMin: e.target.valueAsNumber || e.target.value })}
+                      required
+                    />
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "withdraw"}
+                    >
+                      {loading === "withdraw"
+                        ? (<>
+                          <Spinner /> Withdrawing…
+                        </>)
+                        : "Withdraw liquidity"}
                     </button>
                   </form>
                 </div>
