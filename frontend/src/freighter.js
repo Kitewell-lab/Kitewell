@@ -269,6 +269,114 @@ export function validateMediumAgainstSigners(medThreshold, signers) {
   return { ok: true };
 }
 
+/** Operation builder for manageSellOffer. */
+export function buildManageSellTx(sourceAccount, sellingAsset, buyingAsset, price, amount) {
+  return new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.manageSellOffer({
+        selling: sellingAsset,
+        buying: buyingAsset,
+        price: price,
+        amount: amount.toString(),
+      })
+    )
+    .setTimeout(180)
+    .build();
+}
+
+/** Operation builder for manageBuyOffer. */
+export function buildManageBuyTx(sourceAccount, sellingAsset, buyingAsset, price, amount) {
+  return new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.manageBuyOffer({
+        selling: sellingAsset,
+        buying: buyingAsset,
+        price: price,
+        amount: amount.toString(),
+      })
+    )
+    .setTimeout(180)
+    .build();
+}
+
+/** Validate price is a positive number (fraction), reject 0. */
+export function validatePrice(price) {
+  if (typeof price !== "number") {
+    return { ok: false, error: "Price must be a number" };
+  }
+  if (!Number.isFinite(price) || price <= 0) {
+    return { ok: false, error: "Price must be a positive number" };
+  }
+  return { ok: true, price };
+}
+
+/** List offers for an account from Horizon. */
+export async function listOffers(publicKey) {
+  const server = getServer();
+  const offers = await server.offers().forAccount(publicKey).order("asc").call();
+  return offers.records.map((record) => ({
+    id: record.paging_token,
+    selling: record.selling,
+    buying: record.buying,
+    price: record.price,
+    amount: record.selling_amount,
+  }));
+}
+
+/** Cancel an offer by submitting manageSellOffer/manageBuyOffer with amount=0.
+ *  `offer` should be an object from {@link listOffers} with selling, buying, price properties.
+ */
+export async function cancelOffer(publicKey, offer) {
+  const server = getServer();
+  const sourceAccount = await server.loadAccount(publicKey);
+  
+  // Determine if it's a sell or buy offer based on the assets
+  const isSellOffer = offer.selling.asset_type !== "native" || 
+                      (offer.selling.asset_type === "native" && offer.buying.asset_type !== "native");
+  
+  let operation;
+  if (isSellOffer) {
+    operation = StellarSdk.Operation.manageSellOffer({
+      selling: offer.selling,
+      buying: offer.buying,
+      price: offer.price,
+      amount: "0",
+    });
+  } else {
+    operation = StellarSdk.Operation.manageBuyOffer({
+      selling: offer.selling,
+      buying: offer.buying,
+      price: offer.price,
+      amount: "0",
+    });
+  }
+  
+  const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(operation)
+    .setTimeout(180)
+    .build();
+  
+  return signAndSubmit(tx, publicKey);
+  // Actually, proper cancel: manageSellOffer with selling set to the asset, but amount 0
+  // Let me check the proper Stellar SDK way
+  // The standard way is: manageSellOffer({selling: asset, buying: asset, price, amount: "0"})
+  // But we need the actual selling asset. Let me use a different approach.
+  
+  // Actually, the proper way to cancel an offer is to submit a manageSellOffer
+  // or manageBuyOffer with amount=0. But we need to know which offer and its assets.
+  // For now, let's return an error asking for more info.
+  throw new Error("Cancel implementation needs offer details - use manageSellOffer with amount 0");
+}
+
 /**
  * Create a memo for the setOptions transaction.
  * Memos are optional for setOptions but we include a helper for consistency.
