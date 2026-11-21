@@ -428,3 +428,107 @@ export async function changeTrustWithFreighter(
 
   return signAndSubmit(transaction, publicKey);
 }
+
+const SEP7_ASSET_CODE = /^[A-Za-z0-9]{1,12}$/;
+
+export function parseSep7PayUri(uri) {
+  const value = typeof uri === "string" ? uri.trim() : "";
+  if (!value) throw new Error("SEP-7 URI is required.");
+
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Invalid SEP-7 URI.");
+  }
+
+  if (parsed.protocol !== "web+stellar:") {
+    throw new Error("URI must use the web+stellar scheme.");
+  }
+
+  const operation = parsed.pathname.replace(/^\/+|\/+$/g, "");
+  if (operation !== "pay") {
+    throw new Error("Only SEP-7 pay requests are supported.");
+  }
+
+  const params = parsed.searchParams;
+  const destination = (params.get("destination") || "").trim();
+  if (!destination) {
+    throw new Error("SEP-7 pay URI requires a destination.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
+    throw new Error("SEP-7 destination must be a valid Stellar public key (G…).");
+  }
+
+  const amount = (params.get("amount") || "").trim();
+
+  let assetCode = (params.get("asset_code") || "").trim();
+  let assetIssuer = (params.get("asset_issuer") || "").trim();
+  const assetParam = (params.get("asset") || "").trim();
+
+  if (assetParam && (!assetCode || !assetIssuer)) {
+    if (/^(native|xlm)$/i.test(assetParam)) {
+      assetCode = "";
+      assetIssuer = "";
+    } else {
+      const separator = assetParam.indexOf(":");
+      if (separator <= 0) {
+        throw new Error("SEP-7 asset must be XLM or CODE:ISSUER.");
+      }
+      assetCode = assetParam.slice(0, separator).trim();
+      assetIssuer = assetParam.slice(separator + 1).trim();
+    }
+  }
+
+  let asset;
+  let assetKey;
+
+  // XLM is native when no issuer is supplied.
+  if (
+    (!assetCode && !assetIssuer) ||
+    (!assetIssuer && /^(native|xlm)$/i.test(assetCode))
+  ) {
+    assetCode = "";
+    assetIssuer = "";
+    asset = { isNative: true };
+    assetKey = "native";
+  } else {
+    if (!SEP7_ASSET_CODE.test(assetCode) || !assetIssuer) {
+      throw new Error("SEP-7 credit asset requires a valid code and issuer.");
+    }
+    if (!StellarSdk.StrKey.isValidEd25519PublicKey(assetIssuer)) {
+      throw new Error("SEP-7 asset issuer must be a valid Stellar public key (G…).");
+    }
+    assetCode = assetCode.toUpperCase();
+    asset = { isNative: false, code: assetCode, issuer: assetIssuer };
+    assetKey = `${assetCode}:${assetIssuer}`;
+  }
+
+  const rawMemoType = (params.get("memo_type") || "text").trim().toLowerCase();
+  let memoType;
+  if (["text", "memo_text"].includes(rawMemoType)) memoType = "text";
+  else if (["id", "memo_id"].includes(rawMemoType)) memoType = "id";
+  else if (["hash", "memo_hash"].includes(rawMemoType)) memoType = "hash";
+  else throw new Error(`Unsupported SEP-7 memo type: ${rawMemoType}`);
+
+  const memo = params.get("memo") || "";
+  const signature = params.get("signature") || "";
+  const originDomain = params.get("origin_domain") || "";
+
+  return {
+    destination,
+    amount,
+    asset,
+    assetKey,
+    assetCode,
+    assetIssuer,
+    memo,
+    memoType,
+    signature,
+    originDomain,
+    origin_domain: originDomain,
+  };
+}
+
+// Short alias for callers and tests that use URI rather than Uri naming.
+export const parseSep7Uri = parseSep7PayUri;
