@@ -51,7 +51,12 @@ describe("empty backend transaction history", () => {
     fetchPaymentsViaApi.mockResolvedValue(page);
 
     await expect(getTransactions("GTEST")).resolves.toEqual(page);
-    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 15, undefined);
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith(
+      "GTEST",
+      15,
+      undefined,
+      "TESTNET"
+    );
     expect(paymentsCallMock).not.toHaveBeenCalled();
   });
 });

@@ -10,11 +10,6 @@ function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
 }
 
-/** The Kitewell backend is configured for Testnet, so skip it elsewhere. */
-function backendIsUsable() {
-  return getActiveNetworkId() === "TESTNET";
-}
-
 export function explorerAccountUrl(publicKey) {
   return `${getActiveNetwork().explorerBase}/account/${publicKey}`;
 }
@@ -119,15 +114,17 @@ function mapHorizonBalances(account) {
   });
 }
 
-/** Prefer the Kitewell backend on Testnet; otherwise read Horizon directly. */
+/**
+ * Prefer the Kitewell backend on both networks; fall back to direct Horizon
+ * only when the backend is unreachable. The backend itself resolves the
+ * selected network's Horizon (see docs/api.md).
+ */
 export async function getAccountBalances(publicKey) {
-  if (backendIsUsable()) {
-    try {
-      const data = await fetchAccountViaApi(publicKey);
-      return data.balances;
-    } catch {
-      /* fall back to direct Horizon */
-    }
+  try {
+    const data = await fetchAccountViaApi(publicKey, getActiveNetworkId());
+    return data.balances;
+  } catch {
+    /* fall back to direct Horizon */
   }
 
   const account = await getServer().loadAccount(publicKey);
@@ -135,12 +132,10 @@ export async function getAccountBalances(publicKey) {
 }
 
 export async function getAccountDetails(publicKey) {
-  if (backendIsUsable()) {
-    try {
-      return await fetchAccountViaApi(publicKey);
-    } catch {
-      /* fall back to direct Horizon */
-    }
+  try {
+    return await fetchAccountViaApi(publicKey, getActiveNetworkId());
+  } catch {
+    /* fall back to direct Horizon */
   }
 
   const account = await getServer().loadAccount(publicKey);
@@ -171,12 +166,10 @@ export async function getBalance(publicKey) {
  *   mapped records plus the cursor for the next page (null on the last page).
  */
 export async function getTransactions(publicKey, limit = 15, cursor) {
-  if (backendIsUsable()) {
-    try {
-      return await fetchPaymentsViaApi(publicKey, limit, cursor);
-    } catch {
-      /* fall back to direct Horizon */
-    }
+  try {
+    return await fetchPaymentsViaApi(publicKey, limit, cursor, getActiveNetworkId());
+  } catch {
+    /* fall back to direct Horizon */
   }
 
   const payments = await getServer()

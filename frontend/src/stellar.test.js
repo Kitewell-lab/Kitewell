@@ -181,7 +181,7 @@ describe("getBalance", () => {
     });
 
     await expect(getBalance("GTEST")).resolves.toBe("3.5000000");
-    expect(fetchAccountViaApi).toHaveBeenCalledWith("GTEST");
+    expect(fetchAccountViaApi).toHaveBeenCalledWith("GTEST", "TESTNET");
   });
 
   it("falls back to Horizon and reports 0 when no native balance exists", async () => {
@@ -285,7 +285,12 @@ describe("getTransactions", () => {
     fetchPaymentsViaApi.mockResolvedValue(page);
 
     await expect(getTransactions("GTEST")).resolves.toEqual(page);
-    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 15, undefined);
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith(
+      "GTEST",
+      15,
+      undefined,
+      "TESTNET"
+    );
   });
 
   it("filters to payments and defaults non-native asset codes to XLM on fallback", async () => {

@@ -7,6 +7,8 @@ import {
   changeTrustWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  setPausedWithFreighter,
+  unregisterBuilderWithFreighter,
 } from "./freighter";
 import { shortenAddress } from "./addressFormat";
 import {
@@ -26,6 +28,7 @@ import {
   setActiveNetwork,
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
+import { fetchPathQuote, formatPathHops } from "./paths";
 import "./App.css";
 
 const TABS = ["Wallet", "Fund", "Assets", "Send", "Path", "History", "Lab"];
@@ -91,12 +94,14 @@ export default function App() {
     path: "",
   });
   const [pathResult, setPathResult] = useState(null);
+  const [pathQuote, setPathQuote] = useState(null);
   const [labInfo, setLabInfo] = useState(null);
   const [labError, setLabError] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
+  const [lastLabTx, setLastLabTx] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
@@ -110,7 +115,21 @@ export default function App() {
   const activeNetwork = NETWORKS[networkId];
   const friendbotAvailable = isFriendbotAvailable();
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
-  const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
+  const pathSendAsset = {
+    isNative: pathForm.sendAssetType === "native",
+    code: pathForm.sendCode,
+    issuer: pathForm.sendIssuer,
+  };
+  const pathDestAsset = {
+    isNative: pathForm.destAssetType === "native",
+    code: pathForm.destCode,
+    issuer: pathForm.destIssuer,
+  };
+  const updatePathForm = (changes) => {
+    setPathForm((prev) => ({ ...prev, ...changes }));
+    // Editing the request invalidates any quote from the previous form state.
+    setPathQuote(null);
+  };
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
 
   useEffect(() => {
@@ -313,6 +332,49 @@ export default function App() {
     }
   };
 
+  const handlePathQuote = async () => {
+    if (!pathForm.destination || !pathForm.amount) {
+      return showToast("Destination and amount are required for a quote.", "error");
+    }
+    if (pathForm.sendAssetType === "credit" && (!pathForm.sendCode || !pathForm.sendIssuer)) {
+      return showToast("Send asset code and issuer are required.", "error");
+    }
+    if (pathForm.destAssetType === "credit" && (!pathForm.destCode || !pathForm.destIssuer)) {
+      return showToast("Destination asset code and issuer are required.", "error");
+    }
+
+    setLoading("pathquote");
+    setPathQuote(null);
+    try {
+      const paths = await fetchPathQuote({
+        mode: pathForm.mode,
+        sendAsset: pathSendAsset,
+        destAsset: pathDestAsset,
+        destination: pathForm.destination,
+        amount: pathForm.amount,
+      });
+      setPathQuote({
+        paths,
+        error: paths.length
+          ? null
+          : "Horizon found no path for this asset pair and amount.",
+      });
+    } catch (err) {
+      setPathQuote({ paths: [], error: err.message || "Path lookup failed." });
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleUsePath = (path) => {
+    const hops = formatPathHops(path);
+    setPathForm((prev) => ({ ...prev, path: hops }));
+    showToast(
+      hops ? `Path applied: ${hops}` : "Direct path applied.",
+      "info"
+    );
+  };
+
   const handlePathPayment = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -333,16 +395,8 @@ export default function App() {
         publicKey,
         destination: pathForm.destination,
         mode: pathForm.mode,
-        sendAsset: {
-          isNative: pathForm.sendAssetType === "native",
-          code: pathForm.sendCode,
-          issuer: pathForm.sendIssuer,
-        },
-        destAsset: {
-          isNative: pathForm.destAssetType === "native",
-          code: pathForm.destCode,
-          issuer: pathForm.destIssuer,
-        },
+        sendAsset: pathSendAsset,
+        destAsset: pathDestAsset,
         amount: pathForm.amount,
         destMin: pathForm.mode === "strictSend" ? pathForm.bound : undefined,
         sendMax: pathForm.mode === "strictReceive" ? pathForm.bound : undefined,
@@ -456,7 +510,8 @@ export default function App() {
       const result = await registerBuilderWithFreighter(
         publicKey,
         contractId,
-        registerForm.name
+        registerForm.name,
+        labInfo?.network?.passphrase
       );
       setLastRegisterTx(result);
       setRegisterForm({ name: "" });
@@ -470,6 +525,74 @@ export default function App() {
       setLabState(state);
     } catch (err) {
       showToast(err.message || "Contract invoke failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleTogglePause = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+
+    const nextPaused = !labState?.paused;
+    setLoading("pause");
+    try {
+      const result = await setPausedWithFreighter(
+        publicKey,
+        contractId,
+        nextPaused,
+        labInfo?.network?.passphrase
+      );
+      setLastLabTx(result);
+      showToast(
+        result.confirmed
+          ? `Registration ${nextPaused ? "paused" : "resumed"} · ${result.hash.slice(0, 12)}…`
+          : `Submitted · ${result.hash.slice(0, 12)}…`,
+        "success"
+      );
+      const state = await readKitewellState(contractId, publicKey);
+      setLabState(state);
+    } catch (err) {
+      showToast(err.message || "Could not change the pause flag.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleUnregister = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+
+    setLoading("unregister");
+    try {
+      const result = await unregisterBuilderWithFreighter(
+        publicKey,
+        contractId,
+        labInfo?.network?.passphrase
+      );
+      setLastLabTx(result);
+      showToast(
+        result.confirmed
+          ? `Unregistered · ${result.hash.slice(0, 12)}…`
+          : `Submitted · ${result.hash.slice(0, 12)}…`,
+        "success"
+      );
+      const state = await readKitewellState(contractId, publicKey);
+      setLabState(state);
+    } catch (err) {
+      showToast(err.message || "Could not unregister.", "error");
     } finally {
       setLoading("");
     }
@@ -1148,6 +1271,65 @@ export default function App() {
                 </p>
 
                 <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={handlePathQuote}
+                  disabled={loading === "pathquote"}
+                >
+                  {loading === "pathquote" ? (
+                    <>
+                      <Spinner /> Asking Horizon…
+                    </>
+                  ) : (
+                    "Get a Horizon path quote"
+                  )}
+                </button>
+
+                {pathQuote && (
+                  <div className="info-box">
+                    <span className="eyebrow">Horizon paths</span>
+                    {pathQuote.error ? (
+                      <p className="muted">{pathQuote.error}</p>
+                    ) : (
+                      <div className="tx-list">
+                        {pathQuote.paths.map((quote, index) => {
+                          const hops = formatPathHops(quote.path);
+                          const destLabel =
+                            pathForm.destAssetType === "native"
+                              ? "XLM"
+                              : pathForm.destCode;
+                          const sendLabel =
+                            pathForm.sendAssetType === "native"
+                              ? "XLM"
+                              : pathForm.sendCode;
+                          const estimate =
+                            pathForm.mode === "strictSend"
+                              ? `${quote.destinationAmount} ${destLabel} received`
+                              : `${quote.sourceAmount} ${sendLabel} spent`;
+                          return (
+                            <div key={`${hops}-${index}`} className="tx-item">
+                              <div className="tx-item__amount">
+                                {hops || "Direct path"}
+                              </div>
+                              <div className="tx-item__addr muted">
+                                {estimate}
+                              </div>
+                              <button
+                                className="btn btn--secondary"
+                                type="button"
+                                onClick={() => handleUsePath(quote.path)}
+                              >
+                                Use this path
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <button
                   className="btn btn--primary"
                   type="submit"
                   disabled={loading === "path" || requireWallet}
@@ -1267,6 +1449,18 @@ export default function App() {
                             {publicKey ? labState.builder ?? "Not registered" : "Connect to check"}
                           </span>
                         </div>
+                        <div>
+                          <span className="metadata-label">paused</span>
+                          <span className="metadata-value">
+                            {labState.paused ? "Yes — registration paused" : "No"}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">get_admin</span>
+                          <span className="metadata-value">
+                            {labState.admin ? shortenAddress(labState.admin) : "Not set"}
+                          </span>
+                        </div>
                       </div>
                     </div>
                   ) : (
@@ -1278,6 +1472,67 @@ export default function App() {
                     <div className="info-box info-box--warning">
                       <span className="eyebrow">Soroban RPC</span>
                       <p className="muted">{labStateError}</p>
+                    </div>
+                  )}
+                  {labState?.paused && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Registration paused</span>
+                      <p className="muted">
+                        The admin paused check-ins. Registering now is rejected by the
+                        contract with a paused error; unpause to resume.
+                      </p>
+                    </div>
+                  )}
+                  <div className="section__row">
+                    <div className="subhead">Contract controls</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={handleTogglePause}
+                      disabled={loading === "pause" || requireWallet}
+                    >
+                      {loading === "pause" ? (
+                        <>
+                          <Spinner /> Signing in Freighter…
+                        </>
+                      ) : labState?.paused ? (
+                        "Unpause registration"
+                      ) : (
+                        "Pause registration"
+                      )}
+                    </button>
+                    {publicKey && labState?.builder && (
+                      <button
+                        className="btn btn--secondary"
+                        type="button"
+                        onClick={handleUnregister}
+                        disabled={loading === "unregister"}
+                      >
+                        {loading === "unregister" ? (
+                          <>
+                            <Spinner /> Signing in Freighter…
+                          </>
+                        ) : (
+                          "Unregister me"
+                        )}
+                      </button>
+                    )}
+                  </div>
+                  {!publicKey && (
+                    <p className="muted">Connect Freighter to pause or unregister.</p>
+                  )}
+                  {lastLabTx && (
+                    <div className="info-box">
+                      <span className="eyebrow">Last contract tx</span>
+                      <code>{lastLabTx.hash}</code>
+                      <a
+                        href={explorerTxUrl(lastLabTx.hash)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-link"
+                      >
+                        Explorer ↗
+                      </a>
                     </div>
                   )}
                   <form className="form" onSubmit={handleRegister}>

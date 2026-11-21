@@ -3,7 +3,7 @@ import cors from "cors";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { mapBalances } from "./mapBalances.js";
 import { createRateLimiter } from "./rateLimit.js";
-import { resolveNetwork } from "./networkConfig.js";
+import { resolveNetwork, resolveRequestNetwork } from "./networkConfig.js";
 
 /**
  * Build the Kitewell Express app.
@@ -13,8 +13,9 @@ import { resolveNetwork } from "./networkConfig.js";
  * module-load side effects.
  *
  * @param {object} [options]
- * @param {object} [options.horizon] Horizon server to use; defaults to a real
- *   `StellarSdk.Horizon.Server` pointed at `HORIZON_URL`.
+ * @param {object} [options.horizon] Horizon server to use for every request
+ *   network, or a map `{ TESTNET, FUTURENET }` of servers (tests). Defaults to
+ *   one real `StellarSdk.Horizon.Server` per network, created on first use.
  * @param {Record<string, string|undefined>} [options.env] Environment source;
  *   defaults to `process.env`.
  * @returns {import("express").Express} The configured app (not listening).
@@ -36,7 +37,53 @@ export function createApp({ horizon, env = process.env } = {}) {
   /** Optional: set after deploying contracts/kitewell on Testnet */
   const KITEWELL_CONTRACT_ID = env.KITEWELL_CONTRACT_ID || null;
 
-  const server = horizon || new StellarSdk.Horizon.Server(HORIZON_URL);
+  /** Horizon servers created lazily per network, so a read for one network
+   * can never reuse a client pointed at another network's Horizon. */
+  const serversByNetwork = new Map();
+
+  function serverFor(network) {
+    if (horizon) {
+      // A single injected server serves every network (existing tests); a map
+      // lets a test give each network its own stub.
+      return typeof horizon.loadAccount === "function"
+        ? horizon
+        : horizon[network];
+    }
+    if (!serversByNetwork.has(network)) {
+      const url =
+        network === NETWORK
+          ? HORIZON_URL
+          : resolveRequestNetwork(network).horizonUrl;
+      serversByNetwork.set(network, new StellarSdk.Horizon.Server(url));
+    }
+    return serversByNetwork.get(network);
+  }
+
+  /**
+   * Resolve `?network=` (or the `x-kitewell-network` header) for a read.
+   * Sends a 400 and returns `null` for an unsupported value so every route
+   * rejects unknown networks the same way.
+   */
+  function requestNetwork(req, res) {
+    const requested = req.query.network ?? req.get("x-kitewell-network");
+    let config;
+    try {
+      config = resolveRequestNetwork(requested);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+      return null;
+    }
+
+    // The configured network keeps its env URL overrides; any other network
+    // uses its own preset URLs.
+    const isConfigured = config.network === NETWORK;
+    return {
+      ...config,
+      horizonUrl: isConfigured ? HORIZON_URL : config.horizonUrl,
+      explorerBase: isConfigured ? EXPLORER_BASE : config.explorerBase,
+    };
+  }
+
   const app = express();
 
   /** One JSON log line per request: method, path, status, ms */
@@ -99,8 +146,11 @@ export function createApp({ horizon, env = process.env } = {}) {
       return res.status(400).json({ error: "Invalid Stellar public key" });
     }
 
+    const network = requestNetwork(req, res);
+    if (!network) return;
+
     try {
-      const account = await server.loadAccount(address);
+      const account = await serverFor(network.network).loadAccount(address);
       const balances = mapBalances(account.balances);
 
       res.json({
@@ -109,14 +159,14 @@ export function createApp({ horizon, env = process.env } = {}) {
         subentryCount: account.subentry_count,
         thresholds: account.thresholds,
         balances,
-        explorerUrl: `${EXPLORER_BASE}/account/${address}`,
+        explorerUrl: `${network.explorerBase}/account/${address}`,
       });
     } catch (err) {
       const status = err?.response?.status || 404;
       res.status(status === 404 ? 404 : 502).json({
         error:
           status === 404
-            ? "Account not found on Testnet. Fund with Friendbot first."
+            ? `Account not found on ${network.label}. Fund with Friendbot first.`
             : "Horizon request failed",
         detail: err?.message,
       });
@@ -132,8 +182,11 @@ export function createApp({ horizon, env = process.env } = {}) {
       return res.status(400).json({ error: "Invalid Stellar public key" });
     }
 
+    const network = requestNetwork(req, res);
+    if (!network) return;
+
     try {
-      let request = server
+      let request = serverFor(network.network)
         .payments()
         .forAccount(address)
         .limit(limit)
@@ -155,7 +208,7 @@ export function createApp({ horizon, env = process.env } = {}) {
           asset_code: p.asset_code || "XLM",
           transaction_hash: p.transaction_hash,
           created_at: p.created_at,
-          explorerUrl: `${EXPLORER_BASE}/tx/${p.transaction_hash}`,
+          explorerUrl: `${network.explorerBase}/tx/${p.transaction_hash}`,
         }));
 
       // A full page of raw records means there may be older ones; the cursor

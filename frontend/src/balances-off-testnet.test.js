@@ -48,11 +48,22 @@ afterEach(() => {
 });
 
 describe("Futurenet account balances", () => {
-  it("loads balances from Horizon without calling the backend", async () => {
+  it("reads Futurenet balances from the backend", async () => {
     setActiveNetwork("FUTURENET");
     fetchAccountViaApi.mockResolvedValue({
       balances: [{ key: "native", code: "XLM", balance: "9.0000000", isNative: true }],
     });
+
+    await expect(getAccountBalances("GTEST")).resolves.toEqual([
+      { key: "native", code: "XLM", balance: "9.0000000", isNative: true },
+    ]);
+    expect(fetchAccountViaApi).toHaveBeenCalledWith("GTEST", "FUTURENET");
+    expect(loadAccountMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to Futurenet Horizon only when the backend is unreachable", async () => {
+    setActiveNetwork("FUTURENET");
+    fetchAccountViaApi.mockRejectedValue(new Error("backend down"));
     loadAccountMock.mockResolvedValue({
       balances: [{ asset_type: "native", balance: "3.5000000" }],
     });
@@ -68,6 +79,5 @@ describe("Futurenet account balances", () => {
       },
     ]);
     expect(loadAccountMock).toHaveBeenCalledWith("GTEST");
-    expect(fetchAccountViaApi).not.toHaveBeenCalled();
   });
 });

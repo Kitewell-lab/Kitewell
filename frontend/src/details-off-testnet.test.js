@@ -48,9 +48,19 @@ afterEach(() => {
 });
 
 describe("Futurenet account details", () => {
-  it("loads details from Horizon with a Futurenet explorer URL", async () => {
+  it("asks the backend for Futurenet details", async () => {
     setActiveNetwork("FUTURENET");
-    fetchAccountViaApi.mockResolvedValue({ id: "GTEST" });
+    const payload = { id: "GTEST", explorerUrl: "futurenet" };
+    fetchAccountViaApi.mockResolvedValue(payload);
+
+    await expect(getAccountDetails("GTEST")).resolves.toBe(payload);
+    expect(fetchAccountViaApi).toHaveBeenCalledWith("GTEST", "FUTURENET");
+    expect(loadAccountMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to Futurenet Horizon with a Futurenet explorer URL", async () => {
+    setActiveNetwork("FUTURENET");
+    fetchAccountViaApi.mockRejectedValue(new Error("backend down"));
     loadAccountMock.mockResolvedValue({
       id: "GTEST",
       sequenceNumber: () => "123",
@@ -68,6 +78,5 @@ describe("Futurenet account details", () => {
       explorerUrl: "https://stellar.expert/explorer/futurenet/account/GTEST",
     });
     expect(loadAccountMock).toHaveBeenCalledWith("GTEST");
-    expect(fetchAccountViaApi).not.toHaveBeenCalled();
   });
 });

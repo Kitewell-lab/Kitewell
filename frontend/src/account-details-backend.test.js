@@ -47,7 +47,7 @@ describe("getAccountDetails backend success", () => {
     fetchAccountViaApi.mockResolvedValue(payload);
 
     await expect(getAccountDetails("GTEST")).resolves.toBe(payload);
-    expect(fetchAccountViaApi).toHaveBeenCalledWith("GTEST");
+    expect(fetchAccountViaApi).toHaveBeenCalledWith("GTEST", "TESTNET");
     expect(loadAccountMock).not.toHaveBeenCalled();
   });
 });

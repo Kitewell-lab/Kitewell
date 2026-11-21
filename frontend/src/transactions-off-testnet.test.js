@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 /**
- * Issue #102: off Testnet, payment history skips the backend and is read
- * straight from Horizon. Mocks mirror the ones in stellar.test.js.
+ * Issue #492: payment history now asks the backend for the selected network
+ * and only reads Horizon directly when the backend is unreachable.
  */
 
 vi.mock("./api", () => ({
@@ -45,8 +45,25 @@ afterEach(() => {
 });
 
 describe("getTransactions off Testnet", () => {
-  it("reads Futurenet history from Horizon without calling the backend", async () => {
+  it("asks the backend for Futurenet history", async () => {
     setActiveNetwork("FUTURENET");
+    const page = { records: [{ id: "1" }], nextCursor: "cursor-1" };
+    fetchPaymentsViaApi.mockResolvedValue(page);
+
+    await expect(getTransactions("GTEST")).resolves.toBe(page);
+
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith(
+      "GTEST",
+      15,
+      undefined,
+      "FUTURENET"
+    );
+    expect(paymentsCallMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to Futurenet Horizon when the backend is unreachable", async () => {
+    setActiveNetwork("FUTURENET");
+    fetchPaymentsViaApi.mockRejectedValue(new Error("backend down"));
     paymentsCallMock.mockResolvedValue({
       records: [
         {
@@ -64,7 +81,6 @@ describe("getTransactions off Testnet", () => {
 
     const { records, nextCursor } = await getTransactions("GTEST");
 
-    expect(fetchPaymentsViaApi).not.toHaveBeenCalled();
     expect(paymentsCallMock).toHaveBeenCalledTimes(1);
     expect(records).toHaveLength(1);
     expect(records[0].transaction_hash).toBe("abc");

@@ -148,6 +148,14 @@ impl Kitewell {
         env.storage().instance().get(&COUNT).unwrap_or(0)
     }
 
+    /// Whether registration is currently paused. Defaults to `false`.
+    ///
+    /// Read-only, so the Lab tab can disable the check-in action and show the
+    /// paused state without guessing at a transaction error.
+    pub fn paused(env: Env) -> bool {
+        env.storage().instance().get(&PAUSED).unwrap_or(false)
+    }
+
     /// Check in a builder nickname for `caller`. Overwrites previous name.
     ///
     /// Rejects an empty nickname, so a stored builder always has a name.
@@ -426,6 +434,25 @@ mod test {
 
         client.register(&a, &String::from_str(&env, "cem"));
         assert_eq!(client.builder_count(), 1);
+    }
+
+    #[test]
+    fn paused_defaults_false_and_follows_set_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+
+        // A contract that was never paused reports false, not a missing value.
+        assert!(!client.paused());
+
+        client.init(&admin);
+        client.set_paused(&admin, &true);
+        assert!(client.paused());
+
+        client.set_paused(&admin, &false);
+        assert!(!client.paused());
     }
 
     #[test]
