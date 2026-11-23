@@ -25,6 +25,181 @@ export function explorerTxUrl(hash) {
 
 export const MAX_ASSET_CODE_LENGTH = 12;
 
+/** Stellar account flag bits (from Stellar's `AccountFlags`). */
+export const ACCOUNT_FLAG_BITS = {
+  authRequired: 1,
+  authRevocable: 2,
+  authImmutable: 4,
+};
+
+/** Auth immutable is irreversible, so the UI demands an explicit confirmation. */
+export const IMMUTABLE_CONFIRMATION = "IMMUTABLE";
+export const MAX_HOME_DOMAIN_BYTES = 32;
+
+/**
+ * Normalize the account flag fields Horizon exposes (snake_case) into the
+ * camelCase shape the UI works with.
+ */
+export function mapAccountAuthConfig(account = {}) {
+  const flags = account.flags || {};
+  return {
+    authRequired: Boolean(flags.auth_required ?? flags.authRequired),
+    authRevocable: Boolean(flags.auth_revocable ?? flags.authRevocable),
+    authImmutable: Boolean(flags.auth_immutable ?? flags.authImmutable),
+    homeDomain: account.home_domain ?? account.homeDomain ?? "",
+  };
+}
+
+/**
+ * Read the current issuer flags + home domain straight from Horizon. The
+ * backend account cache does not carry flags, so this path always goes direct.
+ */
+export async function getAccountAuthConfig(publicKey) {
+  const account = await getServer().loadAccount(publicKey);
+  return mapAccountAuthConfig(account);
+}
+
+/**
+ * Pure validator/build step for a `setOptions` operation body.
+ *
+ * Flags are expressed as changes relative to `current`, so toggle controls can
+ * send only the bits that actually change. Turning immutable on needs the
+ * literal confirmation word, and turning it off is refused outright once it is
+ * reported as set — it cannot be undone on-chain.
+ */
+export function buildSetOptionsBody({
+  current = {},
+  homeDomain,
+  authRequired,
+  authRevocable,
+  authImmutable,
+  immutableConfirmation = "",
+} = {}) {
+  const currentRequired = Boolean(current.authRequired);
+  const currentRevocable = Boolean(current.authRevocable);
+  const currentImmutable = Boolean(current.authImmutable);
+
+  const wantRequired =
+    authRequired === undefined ? currentRequired : Boolean(authRequired);
+  const wantRevocable =
+    authRevocable === undefined ? currentRevocable : Boolean(authRevocable);
+  const wantImmutable =
+    authImmutable === undefined ? currentImmutable : Boolean(authImmutable);
+
+  if (currentImmutable && !wantImmutable) {
+    throw new Error("Auth immutable cannot be turned off once it is set.");
+  }
+
+  let setFlags = 0;
+  let clearFlags = 0;
+
+  if (wantRequired !== currentRequired) {
+    const bit = ACCOUNT_FLAG_BITS.authRequired;
+    if (wantRequired) setFlags |= bit;
+    else clearFlags |= bit;
+  }
+  if (wantRevocable !== currentRevocable) {
+    const bit = ACCOUNT_FLAG_BITS.authRevocable;
+    if (wantRevocable) setFlags |= bit;
+    else clearFlags |= bit;
+  }
+  if (wantImmutable && !currentImmutable) {
+    if (immutableConfirmation !== IMMUTABLE_CONFIRMATION) {
+      throw new Error("Type IMMUTABLE to confirm turning on auth immutable.");
+    }
+    setFlags |= ACCOUNT_FLAG_BITS.authImmutable;
+  }
+
+  let normalizedHomeDomain;
+  if (homeDomain !== undefined && homeDomain !== null) {
+    normalizedHomeDomain = String(homeDomain).trim();
+    if (
+      new TextEncoder().encode(normalizedHomeDomain).length >
+      MAX_HOME_DOMAIN_BYTES
+    ) {
+      throw new Error(
+        `Home domain must be ${MAX_HOME_DOMAIN_BYTES} bytes or fewer.`
+      );
+    }
+  }
+
+  return {
+    ...(normalizedHomeDomain !== undefined
+      ? { homeDomain: normalizedHomeDomain }
+      : {}),
+    ...(setFlags ? { setFlags } : {}),
+    ...(clearFlags ? { clearFlags } : {}),
+  };
+}
+
+/**
+ * List the accounts that hold assets issued by `publicKey`.
+ *
+ * Holder rows must come from Horizon's accounts-for-asset endpoint
+ * (`/accounts?asset=CODE:ISSUER`); the `/assets?asset_issuer=…` response only
+ * carries asset stats and has no holder account to authorize or revoke. When
+ * `assetCode` is omitted the issuer's asset codes are discovered from that
+ * stats endpoint, then each code is resolved through accounts-for-asset.
+ */
+export async function getIssuedAssetTrustlines(publicKey, assetCode) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  let codes;
+  if (assetCode !== undefined && assetCode !== null) {
+    const normalized = String(assetCode).trim().toUpperCase();
+    if (!normalized || normalized.length > MAX_ASSET_CODE_LENGTH) {
+      throw new Error(
+        `Asset code must be 1–${MAX_ASSET_CODE_LENGTH} characters.`
+      );
+    }
+    codes = [normalized];
+  } else {
+    const response = await getServer()
+      .assets()
+      .forIssuer(publicKey)
+      .limit(200)
+      .call();
+    codes = [
+      ...new Set((response.records || []).map((record) => record.asset_code)),
+    ];
+  }
+
+  const rows = [];
+  for (const code of codes) {
+    const asset = new StellarSdk.Asset(code, publicKey);
+    const response = await getServer()
+      .accounts()
+      .forAsset(asset)
+      .limit(200)
+      .call();
+
+    for (const account of response.records || []) {
+      const holder = account.account_id ?? account.id;
+      const balance = (account.balances || []).find(
+        (entry) =>
+          entry.asset_code === code && entry.asset_issuer === publicKey
+      );
+
+      rows.push({
+        key: `${code}:${holder}`,
+        assetCode: code,
+        assetIssuer: publicKey,
+        holder,
+        balance: balance?.balance ?? "0",
+        limit: balance?.limit ?? null,
+        isAuthorized:
+          typeof balance?.is_authorized === "boolean"
+            ? balance.is_authorized
+            : null,
+      });
+    }
+  }
+
+  return rows;
+}
+
 /**
  * Convert a simple UI asset descriptor into an SDK Asset.
  * Native XLM is `{ isNative: true }`; a credit asset is
@@ -96,7 +271,55 @@ export async function fundWithFriendbot(publicKey) {
   return response.json();
 }
 
-function mapHorizonBalances(account) {
+/**
+ * Spendable balance after reserves and selling liabilities.
+ * Native XLM keeps the base reserve for the account plus each subentry.
+ * Credit assets only subtract selling liabilities. Buying liabilities are reported, not subtracted.
+ */
+export function calculateAvailableBalance(
+  balance,
+  isNative,
+  subentryCount = 0,
+  baseReserve = 0.5
+) {
+  const total = parseFloat(balance.balance || "0");
+  const sellingLiabilities = parseFloat(balance.selling_liabilities || "0");
+
+  if (isNative) {
+    const minBalance = baseReserve * (2 + subentryCount);
+    return Math.max(0, total - minBalance - sellingLiabilities).toFixed(7);
+  }
+
+  return Math.max(0, total - sellingLiabilities).toFixed(7);
+}
+
+function liabilityFields(balance, isNative, subentryCount, baseReserve) {
+  const sellingLiabilities = parseFloat(balance.selling_liabilities || "0");
+  const buyingLiabilities = parseFloat(balance.buying_liabilities || "0");
+  return {
+    sellingLiabilities: sellingLiabilities.toFixed(7),
+    buyingLiabilities: buyingLiabilities.toFixed(7),
+    available: calculateAvailableBalance(balance, isNative, subentryCount, baseReserve),
+  };
+}
+
+async function readBaseReserve() {
+  let baseReserve = 0.5;
+  try {
+    if (getServer().ledgers) {
+      const ledgerInfo = await getServer().ledgers().order("desc").limit(1).call();
+      if (ledgerInfo.records[0]?.base_reserve_in_stroops) {
+        baseReserve = parseFloat(ledgerInfo.records[0].base_reserve_in_stroops) / 10000000;
+      }
+    }
+  } catch {
+    // Keep the protocol default when the ledgers endpoint is unavailable.
+  }
+  return baseReserve;
+}
+
+function mapHorizonBalances(account, baseReserve = 0.5) {
+  const subentryCount = account.subentry_count || 0;
   return account.balances.map((b) => {
     if (b.asset_type === "liquidity_pool_shares") {
       return {
@@ -119,6 +342,7 @@ function mapHorizonBalances(account) {
         limit: null,
         sponsor: b.sponsor ?? null,
         isNative: true,
+        ...liabilityFields(b, true, subentryCount, baseReserve),
       };
     }
     return {
@@ -129,6 +353,7 @@ function mapHorizonBalances(account) {
       limit: b.limit,
       sponsor: b.sponsor ?? null,
       isNative: false,
+      ...liabilityFields(b, false, subentryCount, baseReserve),
     };
   });
 }
@@ -145,7 +370,7 @@ export async function getAccountBalances(publicKey) {
   }
 
   const account = await getServer().loadAccount(publicKey);
-  return mapHorizonBalances(account);
+  return mapHorizonBalances(account, await readBaseReserve());
 }
 
 export async function getAccountDetails(publicKey) {
@@ -163,7 +388,7 @@ export async function getAccountDetails(publicKey) {
     sequence: account.sequenceNumber(),
     subentryCount: account.subentry_count,
     thresholds: account.thresholds,
-    balances: mapHorizonBalances(account),
+    balances: mapHorizonBalances(account, await readBaseReserve()),
     explorerUrl: explorerAccountUrl(publicKey),
   };
 }

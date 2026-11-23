@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import {
   checkFreighterInstalled,
   connectFreighterWallet,
@@ -9,7 +9,15 @@ import {
   revokeTrustlineSponsorshipWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  setAccountOptionsWithFreighter,
+  allowTrustWithFreighter,
+  readContractInstanceTtl,
+  extendContractTtlWithFreighter,
+  readContractTTL,
+  extendCodeTTL,
+  readKitewellEvents,
   submitFailureResult,
+  signChallengeWithFreighter,
 } from "./freighter";
 import {
   createFailedSubmitLog,
@@ -24,10 +32,14 @@ import {
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
+  getAccountAuthConfig,
+  getIssuedAssetTrustlines,
+  IMMUTABLE_CONFIRMATION,
 } from "./stellar";
 import { poolShareRows } from "./poolShare";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
+import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
 import {
   NETWORKS,
   getActiveNetworkId,
@@ -36,18 +48,31 @@ import {
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
 import { decodeTransactionEnvelope } from "./txInspector";
+import { completeWebAuthChallenge } from "./sep10WebAuth";
+import { loadIssuerCurrencyList } from "./issuerToml";
+import { createPaymentStreamController } from "./paymentStream";
+import {
+  normaliseTxHash,
+  txStatusPresentation,
+  watchTransactionStatus,
+} from "./txStatusWatch";
+import { buildTransactionExplorerUrl } from "./explorerLink";
 import "./App.css";
 
 const TABS = [
   "Wallet",
   "Fund",
   "Assets",
+  "Issuer",
   "Send",
   "Path",
   "History",
   "Inspect",
+  "Issuer",
+  "Web auth",
   "Lab",
 ];
+const EVENT_POLL_MS = 6000;
 const PATH_MODE_FIELDS = {
   strictSend: {
     amountLabel: "Amount to send",
@@ -97,6 +122,7 @@ export default function App() {
     memo: "",
   });
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
+  const [limitChangeForm, setLimitChangeForm] = useState({});
   const [pathForm, setPathForm] = useState({
     mode: "strictSend",
     destination: "",
@@ -114,6 +140,7 @@ export default function App() {
   const [unsignedEnvelope, setUnsignedEnvelope] = useState(null);
   const [labInfo, setLabInfo] = useState(null);
   const [labError, setLabError] = useState(null);
+  const [simulationFees, setSimulationFees] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
@@ -125,6 +152,59 @@ export default function App() {
   const [accountDetails, setAccountDetails] = useState(null);
   const [failedSubmits, setFailedSubmits] = useState([]);
   const failedSubmitLogRef = useRef(createFailedSubmitLog());
+  const [webAuthForm, setWebAuthForm] = useState({ endpoint: "", serverAccount: "" });
+  const [webAuthResult, setWebAuthResult] = useState(null);
+  const [webAuthError, setWebAuthError] = useState(null);
+  const [issuerInput, setIssuerInput] = useState("");
+  const [issuerResult, setIssuerResult] = useState(null);
+  const [issuerError, setIssuerError] = useState(null);
+  const [streamedPayments, setStreamedPayments] = useState([]);
+  const [streamState, setStreamState] = useState(null);
+  const [txWatch, setTxWatch] = useState(null);
+  const [txWatchError, setTxWatchError] = useState(null);
+  const [hashForm, setHashForm] = useState("");
+  const [hashError, setHashError] = useState(null);
+  const streamSessionRef = useRef(null);
+  const watchTokenRef = useRef(0);
+
+  // Issue #512: the controller owns the streamed payments and their paging
+  // tokens, so a duplicate event can never reach the list twice; this only
+  // mirrors its state into React.
+  const paymentStream = useMemo(
+    () =>
+      createPaymentStreamController({
+        onChange: (records, state) => {
+          setStreamedPayments(records);
+          setStreamState(state);
+        },
+      }),
+    []
+  );
+
+  // Issuer auth flags + trustlines the connected account issued.
+  const [issuerConfig, setIssuerConfig] = useState(null);
+  const [issuerConfigError, setIssuerConfigError] = useState(null);
+  const [issuerForm, setIssuerForm] = useState({
+    homeDomain: "",
+    authRequired: false,
+    authRevocable: false,
+    authImmutable: false,
+    confirmation: "",
+  });
+  const [issuedTrustlines, setIssuedTrustlines] = useState([]);
+  const [issuedTrustlinesError, setIssuedTrustlinesError] = useState(null);
+
+  // Contract instance TTL + event tail in the Lab tab.
+  const [ttlInfo, setTtlInfo] = useState(null);
+  const [ttlError, setTtlError] = useState(null);
+  const [ttlForm, setTtlForm] = useState({ extendTo: "" });
+  const [ttlResult, setTtlResult] = useState(null);
+  const [codeTtl, setCodeTtl] = useState(null);
+  const [codeTtlError, setCodeTtlError] = useState(null);
+  const [labEvents, setLabEvents] = useState([]);
+  const [labEventsError, setLabEventsError] = useState(null);
+  const eventCursorRef = useRef(null);
+  const eventStartLedgerRef = useRef(null);
 
   const showToast = (message, type = "success", explorerUrl = null) => {
     setToast({ message, type, explorerUrl });
@@ -161,6 +241,7 @@ export default function App() {
     setUnsignedEnvelope(null);
   };
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
+  const configuredContractId = labInfo?.network?.contract?.kitewell;
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -196,6 +277,84 @@ export default function App() {
       cancelled = true;
     };
   }, [balances]);
+
+  // Issue #512: payments stream only while the history tab is open on a
+  // connected account. Every way the issue closes the stream names itself here,
+  // and a network switch is handled by `start`, which closes the old stream
+  // before opening the new one.
+  useEffect(() => {
+    const previous = streamSessionRef.current;
+
+    if (activeTab !== "History" || !publicKey) {
+      if (paymentStream.isOpen()) {
+        paymentStream.stop(
+          !publicKey
+            ? "disconnect"
+            : previous?.networkId !== networkId
+              ? "network-change"
+              : "tab-hidden"
+        );
+      }
+      streamSessionRef.current = null;
+      return;
+    }
+
+    if (
+      paymentStream.isOpen() &&
+      previous &&
+      previous.publicKey === publicKey &&
+      previous.networkId === networkId
+    ) {
+      return;
+    }
+
+    streamSessionRef.current = { publicKey, networkId };
+    try {
+      paymentStream.start({ publicKey, networkId });
+    } catch (err) {
+      paymentStream.fail(err);
+    }
+  }, [activeTab, publicKey, networkId, paymentStream]);
+
+  useEffect(
+    () => () => {
+      if (paymentStream.isOpen()) paymentStream.stop("tab-hidden");
+      streamSessionRef.current = null;
+    },
+    [paymentStream]
+  );
+
+  // Issue #513: one watch runs at a time, so a token makes an older watch's
+  // remaining polls invisible instead of letting two hashes fight over the box.
+  const startTxWatch = useCallback(
+    (hash) => {
+      const token = watchTokenRef.current + 1;
+      watchTokenRef.current = token;
+      setTxWatchError(null);
+      setTxWatch({
+        hash,
+        attempts: 0,
+        ...txStatusPresentation({
+          status: "pending",
+          explorerUrl: buildTransactionExplorerUrl(networkId, hash),
+        }),
+      });
+
+      watchTransactionStatus({
+        hash,
+        networkId,
+        onUpdate: (snapshot) => {
+          if (watchTokenRef.current !== token) return;
+          setTxWatch({ ...snapshot, ...txStatusPresentation(snapshot) });
+        },
+      }).catch((err) => {
+        if (watchTokenRef.current !== token) return;
+        setTxWatch(null);
+        setTxWatchError(err.message || "The transaction watch could not read this hash.");
+      });
+    },
+    [networkId]
+  );
 
   const refreshBalances = useCallback(async () => {
     if (!publicKey) return;
@@ -245,6 +404,8 @@ export default function App() {
     setBalances([]);
     setTransactions([]);
     setAccountDetails(null);
+    setIssuerConfig(null);
+    setIssuedTrustlines([]);
     showToast("Disconnected.");
   };
 
@@ -293,7 +454,7 @@ export default function App() {
     }
     setLoading("trust");
     try {
-      await changeTrustWithFreighter(
+      const result = await changeTrustWithFreighter(
         publicKey,
         code,
         trustForm.issuer,
@@ -303,9 +464,52 @@ export default function App() {
       setBalances(next);
       setTrustForm({ code: "", issuer: "", limit: "1000000" });
       showToast(`Trustline for ${code} submitted.`);
+      startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("changeTrust", err);
       showToast(err.message || "Change trust failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleChangeLimit = async (asset) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    const newLimit = limitChangeForm[asset.key];
+    if (!newLimit || newLimit.trim() === "") {
+      return showToast("Enter a new limit.", "error");
+    }
+
+    const limitNum = parseFloat(newLimit);
+    if (Number.isNaN(limitNum) || limitNum < 0) {
+      return showToast("Limit must be a non-negative number.", "error");
+    }
+
+    const balance = parseFloat(asset.balance);
+    if (limitNum < balance) {
+      return showToast(
+        `Limit (${newLimit}) cannot be below current balance (${asset.balance}).`,
+        "error"
+      );
+    }
+
+    setLoading(`limit-${asset.key}`);
+    try {
+      const result = await changeTrustWithFreighter(
+        publicKey,
+        asset.code,
+        asset.issuer,
+        newLimit
+      );
+      const next = await getAccountBalances(publicKey);
+      setBalances(next);
+      setLimitChangeForm({ ...limitChangeForm, [asset.key]: "" });
+      showToast(`${asset.code} trustline limit updated to ${newLimit}.`);
+      startTxWatch(result.hash);
+    } catch (err) {
+      trackFailedSubmit("changeTrust", err);
+      showToast(err.message || `Could not change ${asset.code} trustline limit.`, "error");
     } finally {
       setLoading("");
     }
@@ -322,10 +526,11 @@ export default function App() {
 
     setLoading(`remove-${asset.key}`);
     try {
-      await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
+      const result = await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
       const next = await getAccountBalances(publicKey);
       setBalances(next);
       showToast(`${asset.code} trustline removed.`);
+      startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("changeTrust", err);
       showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
@@ -384,9 +589,10 @@ export default function App() {
       showToast("Choose an asset you hold a trustline for.", "error");
       return null;
     }
-    if (parseFloat(amount) > parseFloat(selected.balance)) {
+    const available = parseFloat(selected.available || selected.balance);
+    if (parseFloat(amount) > available) {
       showToast(
-        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
+        `Insufficient ${selected.code} balance. Available: ${available.toFixed(7)} (after reserves and liabilities).`,
         "error"
       );
       return null;
@@ -478,6 +684,7 @@ export default function App() {
         "success",
         explorerTxUrl(result.hash)
       );
+      startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("payment", err);
       showToast(err.message || "Payment failed.", "error");
@@ -533,6 +740,7 @@ export default function App() {
         /* balance refresh is best-effort */
       }
       showToast(`Path payment submitted · ${result.hash.slice(0, 12)}…`);
+      startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("pathPayment", err);
       showToast(err.message || "Path payment failed.", "error");
@@ -571,27 +779,87 @@ export default function App() {
     }
   };
 
+  // Issue #513: the same watch that follows a submit also serves a pasted hash,
+  // so the hash is validated before it reaches Horizon.
+  const handleWatchHash = (e) => {
+    e.preventDefault();
+    setHashError(null);
+    let hash;
+    try {
+      hash = normaliseTxHash(hashForm);
+    } catch (err) {
+      return setHashError(err.message || "Enter the 64-character transaction hash.");
+    }
+    setHashForm("");
+    startTxWatch(hash);
+  };
+
+  // Issue #510: the panel sends the challenge to Freighter to sign and holds
+  // the returned JWT only as long as this render needs it.
+  const handleWebAuth = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    setLoading("webauth");
+    setWebAuthError(null);
+    setWebAuthResult(null);
+    try {
+      const result = await completeWebAuthChallenge({
+        endpoint: webAuthForm.endpoint,
+        account: publicKey,
+        serverAccount: webAuthForm.serverAccount,
+        sign: (unsignedXdr) => signChallengeWithFreighter(unsignedXdr, publicKey),
+      });
+      setWebAuthResult({ requestUrl: result.requestUrl, ...result.challenge, session: result.session });
+      showToast("Web authentication complete.");
+    } catch (err) {
+      setWebAuthError(err.message || "Web authentication failed.");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  // Issue #511: an issuer account resolves to its home domain first, so the
+  // same form accepts either an account or a domain.
+  const handleIssuerLookup = async (e) => {
+    e.preventDefault();
+    setLoading("issuer");
+    setIssuerError(null);
+    setIssuerResult(null);
+    try {
+      setIssuerResult(await loadIssuerCurrencyList({ accountOrDomain: issuerInput }));
+    } catch (err) {
+      setIssuerError(err.message || "Could not read the issuer's stellar.toml.");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const requireWallet = !publicKey;
+  const visibleTransactions = mergeStreamedPayments(streamedPayments, transactions);
 
   const loadLabInfo = async () => {
     setLoading("lab");
     setLabError(null);
     try {
       const [health, network] = await Promise.all([fetchHealth(), fetchNetworkInfo()]);
-      setLabInfo({ health, network });
+      const info = { health, network };
+      setLabInfo(info);
+      return info;
     } catch (e) {
       setLabInfo(null);
       setLabError(
         e.message ||
           "Backend offline. Start it with: npm run dev:backend"
       );
+      return null;
     } finally {
       setLoading("");
     }
   };
 
-  const refreshLabState = useCallback(async () => {
-    const contractId = labInfo?.network?.contract?.kitewell;
+  const refreshLabState = useCallback(async (explicitContractId) => {
+    const contractId = explicitContractId ?? labInfo?.network?.contract?.kitewell;
     if (!contractId) {
       setLabState(null);
       setLabStateError(null);
@@ -640,6 +908,7 @@ export default function App() {
           : `Submitted · ${result.hash.slice(0, 12)}…`,
         "success"
       );
+      startTxWatch(result.hash);
       const state = await readKitewellState(contractId, publicKey);
       setLabState(state);
     } catch (err) {
@@ -649,6 +918,225 @@ export default function App() {
       setLoading("");
     }
   };
+
+  const refreshIssuerPanel = async () => {
+    if (!publicKey) return;
+    setLoading("issuer");
+    try {
+      const config = await getAccountAuthConfig(publicKey);
+      setIssuerConfig(config);
+      setIssuerConfigError(null);
+      setIssuerForm({
+        homeDomain: config.homeDomain || "",
+        authRequired: config.authRequired,
+        authRevocable: config.authRevocable,
+        authImmutable: config.authImmutable,
+        confirmation: "",
+      });
+    } catch (err) {
+      setIssuerConfig(null);
+      setIssuerConfigError(err.message || "Could not read account flags.");
+    }
+
+    try {
+      setIssuedTrustlines(await getIssuedAssetTrustlines(publicKey));
+      setIssuedTrustlinesError(null);
+    } catch (err) {
+      setIssuedTrustlines([]);
+      setIssuedTrustlinesError(err.message || "Could not read issued trustlines.");
+    }
+    setLoading("");
+  };
+
+  const handleSetIssuerOptions = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("issuer-update");
+    try {
+      await setAccountOptionsWithFreighter(publicKey, {
+        current: issuerConfig || {},
+        homeDomain: issuerForm.homeDomain,
+        authRequired: issuerForm.authRequired,
+        authRevocable: issuerForm.authRevocable,
+        authImmutable: issuerForm.authImmutable,
+        immutableConfirmation: issuerForm.confirmation,
+      });
+      showToast("Account flags updated.");
+      // A successful update refreshes both the flags and the account balances.
+      await refreshIssuerPanel();
+      await refreshBalances();
+    } catch (err) {
+      showToast(err.message || "Could not update account flags.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleAllowTrust = async (entry, authorize) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`allow-${entry.key}`);
+    try {
+      await allowTrustWithFreighter(publicKey, {
+        holder: entry.holder,
+        assetCode: entry.assetCode,
+        assetIssuer: entry.assetIssuer,
+        authorize,
+      });
+      showToast(
+        `${authorize ? "Authorized" : "Revoked"} ${shortenAddress(entry.holder)} for ${entry.assetCode}.`
+      );
+      await refreshIssuerPanel();
+    } catch (err) {
+      showToast(err.message || "Could not update the trustline.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const refreshTtlInfo = async (explicitContractId) => {
+    const contractId = explicitContractId ?? configuredContractId;
+    if (!contractId) {
+      setTtlInfo(null);
+      setTtlError(null);
+      return;
+    }
+    setLoading("ttl");
+    setTtlError(null);
+    try {
+      const info = await readContractInstanceTtl(contractId);
+      setTtlInfo(info);
+      setTtlForm({
+        extendTo: String((info.liveUntilLedgerSeq || info.latestLedger || 0) + 5000),
+      });
+    } catch (err) {
+      setTtlInfo(null);
+      setTtlError(err.message || "Could not read the instance TTL.");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const refreshCodeTtl = useCallback(async () => {
+    if (!configuredContractId) {
+      setCodeTtl(null);
+      setCodeTtlError(null);
+      return;
+    }
+    setLoading("code-ttl");
+    setCodeTtlError(null);
+    try {
+      const ttlData = await readContractTTL(configuredContractId);
+      setCodeTtl(ttlData);
+    } catch (err) {
+      setCodeTtl(null);
+      setCodeTtlError(err.message || "Could not read the contract code TTL.");
+    } finally {
+      setLoading("");
+    }
+  }, [configuredContractId]);
+
+  const handleExtendCodeTtl = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!configuredContractId) {
+      return showToast("No contract id configured.", "error");
+    }
+    if (!codeTtl?.wasmHash || !codeTtl?.currentLedger) {
+      return showToast("Refresh the code TTL first.", "error");
+    }
+
+    const extendTo = codeTtl.currentLedger + 100000;
+    setLoading("extend-code");
+    try {
+      const result = await extendCodeTTL(
+        publicKey,
+        codeTtl.wasmHash,
+        extendTo,
+        codeTtl.currentLedger
+      );
+      showToast(`Code TTL extended to ledger ${result.deadline}.`, "success");
+      await refreshCodeTtl();
+    } catch (err) {
+      showToast(err.message || "Failed to extend code TTL.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleExtendTtl = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!configuredContractId) {
+      return showToast("No contract id configured — deploy first.", "error");
+    }
+    setLoading("ttl-extend");
+    try {
+      const result = await extendContractTtlWithFreighter(
+        publicKey,
+        configuredContractId,
+        ttlForm.extendTo,
+        {
+          currentDeadline: ttlInfo?.liveUntilLedgerSeq ?? undefined,
+          latestLedger: ttlInfo?.latestLedger ?? undefined,
+        }
+      );
+      setTtlResult({
+        hash: result.hash,
+        liveUntilLedgerSeq: result.liveUntilLedgerSeq,
+      });
+      showToast(
+        result.confirmed
+          ? `TTL extended to ledger ${result.liveUntilLedgerSeq}.`
+          : `TTL extension submitted · ${result.hash.slice(0, 12)}…`
+      );
+      await refreshTtlInfo(configuredContractId);
+    } catch (err) {
+      showToast(err.message || "Could not extend the instance TTL.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const pollLabEvents = useCallback(async (contractId) => {
+    if (!contractId) return;
+    try {
+      const result = await readKitewellEvents(contractId, {
+        cursor: eventCursorRef.current || undefined,
+        startLedger: eventStartLedgerRef.current || undefined,
+      });
+      if (eventStartLedgerRef.current === null && result.latestLedger) {
+        eventStartLedgerRef.current = result.latestLedger;
+      }
+      if (result.cursor) eventCursorRef.current = result.cursor;
+      setLabEvents((previous) => {
+        const byId = new Map(previous.map((event) => [event.id, event]));
+        result.events.forEach((event) => byId.set(event.id, event));
+        return [...byId.values()];
+      });
+      setLabEventsError(null);
+    } catch (err) {
+      setLabEventsError(err.message || "Could not read contract events.");
+    }
+  }, []);
+
+  // Start the tail at the ledger open when the Lab tab is first shown, and
+  // poll for new register / pause events while it stays open.
+  useEffect(() => {
+    if (activeTab !== "Lab" || !configuredContractId) {
+      if (activeTab !== "Lab") {
+        eventCursorRef.current = null;
+        eventStartLedgerRef.current = null;
+      }
+      return undefined;
+    }
+    eventCursorRef.current = null;
+    eventStartLedgerRef.current = null;
+    pollLabEvents(configuredContractId);
+    const timer = setInterval(
+      () => pollLabEvents(configuredContractId),
+      EVENT_POLL_MS
+    );
+    return () => clearInterval(timer);
+  }, [activeTab, configuredContractId, pollLabEvents]);
 
   const handleInspect = (event) => {
     event.preventDefault();
@@ -667,11 +1155,47 @@ export default function App() {
     setActiveTab(tab);
     if (tab === "History") handleHistory();
     if (tab === "Lab") {
-      loadLabInfo();
-      refreshLabState();
+      loadLabInfo().then((info) => {
+        const contractId = info?.network?.contract?.kitewell;
+        refreshLabState(contractId);
+        refreshTtlInfo(contractId);
+      });
     }
+    if (tab === "Issuer") refreshIssuerPanel();
     if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
       refreshBalances();
+    }
+  };
+
+  const handleSimulateRegister = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+    if (!registerForm.name.trim()) {
+      return showToast("Enter a builder name to register.", "error");
+    }
+
+    setLoading("simulate");
+    setSimulationFees(null);
+    try {
+      const fees = await simulateRegisterBuilder(
+        publicKey,
+        contractId,
+        registerForm.name
+      );
+      setSimulationFees(fees);
+      if (fees.error) {
+        showToast(`Simulation failed: ${fees.error}`, "error");
+      }
+    } catch (err) {
+      showToast(err.message || "Simulation failed.", "error");
+    } finally {
+      setLoading("");
     }
   };
 
@@ -688,6 +1212,73 @@ export default function App() {
     activateTab(TABS[nextIndex]);
     tabRefs.current[nextIndex]?.focus();
   };
+
+  // Issue #513: one element reused by every tab that submits, because only one
+  // watch runs at a time and it must be visible right where the hash appeared.
+  const txWatchPanel = (
+    <div className="section">
+      <h2>Transaction status</h2>
+      <p className="muted">
+        A transaction submitted here is followed until it reaches the ledger, fails, or passes
+        its max time.
+      </p>
+
+      {txWatch && (
+        <div
+          className={
+            txWatch.status === "failed" || txWatch.status === "expired"
+              ? "info-box info-box--warning"
+              : "info-box"
+          }
+          role="status"
+          aria-live="polite"
+        >
+          <span className="eyebrow">
+            <code>{txWatch.hash}</code> · {txWatch.status}
+          </span>
+          <p className="muted">{txWatch.text}</p>
+          <a
+            className="text-link"
+            href={txWatch.explorerUrl}
+            target="_blank"
+            rel="noreferrer"
+            style={{ marginTop: 6, display: "inline-block" }}
+          >
+            Explorer ↗
+          </a>
+        </div>
+      )}
+      {txWatchError && (
+        <div className="info-box info-box--warning">
+          <span className="eyebrow">Transaction watch</span>
+          <p className="muted">{txWatchError}</p>
+        </div>
+      )}
+
+      <form className="form" onSubmit={handleWatchHash}>
+        <label className="label" htmlFor="watch-tx-hash">
+          Watch a transaction hash
+        </label>
+        <input
+          id="watch-tx-hash"
+          className="input"
+          type="text"
+          placeholder="64 hexadecimal characters"
+          maxLength={64}
+          value={hashForm}
+          onChange={(e) => setHashForm(e.target.value)}
+          aria-describedby="watch-tx-hash-help"
+          required
+        />
+        <p className="muted" id="watch-tx-hash-help" role={hashError ? "alert" : undefined}>
+          {hashError || "Paste any transaction hash from this network to follow it."}
+        </p>
+        <button className="btn btn--primary" type="submit">
+          Watch status
+        </button>
+      </form>
+    </div>
+  );
 
   return (
     <div className="app">
@@ -819,7 +1410,7 @@ export default function App() {
         <nav className="tabs" aria-label="Lab sections" role="tablist">
           {TABS.map((t, index) => {
             const isActive = activeTab === t;
-            const tabId = `tab-${t.toLowerCase()}`;
+            const tabId = `tab-${tabSlug(t)}`;
 
             return (
               <button
@@ -845,9 +1436,9 @@ export default function App() {
 
         <section
           className="panel"
-          id={`panel-${activeTab.toLowerCase()}`}
+          id={`panel-${tabSlug(activeTab)}`}
           role="tabpanel"
-          aria-labelledby={`tab-${activeTab.toLowerCase()}`}
+          aria-labelledby={`tab-${tabSlug(activeTab)}`}
           tabIndex={0}
         >
           {activeTab === "Wallet" && (
@@ -993,7 +1584,8 @@ export default function App() {
                       </div>
                       <div className="balance-row__actions">
                         <span>
-                          {parseFloat(b.balance).toLocaleString(undefined, {
+                          Available{" "}
+                          {parseFloat(b.available || b.balance).toLocaleString(undefined, {
                             maximumFractionDigits: 7,
                           })}
                         </span>
@@ -1015,6 +1607,41 @@ export default function App() {
                           </>
                         )}
                       </div>
+                      {!b.isNative && (
+                        <div className="balance-row__actions">
+                          <span className="muted">
+                            Limit:{" "}
+                            {b.limit
+                              ? parseFloat(b.limit).toLocaleString(undefined, {
+                                  maximumFractionDigits: 7,
+                                })
+                              : "—"}
+                          </span>
+                          <input
+                            className="input"
+                            type="number"
+                            placeholder="New limit"
+                            value={limitChangeForm[b.key] || ""}
+                            onChange={(e) =>
+                              setLimitChangeForm({
+                                ...limitChangeForm,
+                                [b.key]: e.target.value,
+                              })
+                            }
+                            disabled={loading === `limit-${b.key}`}
+                          />
+                          <button
+                            className="btn btn--secondary btn--sm"
+                            type="button"
+                            onClick={() => handleChangeLimit(b)}
+                            disabled={
+                              loading === `limit-${b.key}` || !limitChangeForm[b.key]
+                            }
+                          >
+                            {loading === `limit-${b.key}` ? "Changing…" : "Change limit"}
+                          </button>
+                        </div>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -1152,6 +1779,253 @@ export default function App() {
                   )}
                 </button>
               </form>
+
+              {txWatchPanel}
+            </div>
+          )}
+
+          {activeTab === "Issuer" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Issuer controls</h2>
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={refreshIssuerPanel}
+                  disabled={loading === "issuer" || requireWallet}
+                >
+                  {loading === "issuer" ? (
+                    <>
+                      <Spinner /> Loading…
+                    </>
+                  ) : (
+                    "Refresh"
+                  )}
+                </button>
+              </div>
+              <p className="muted">
+                Reads auth flags from Horizon and signs <code>setOptions</code> /{" "}
+                <code>allowTrust</code> with Freighter.
+              </p>
+
+              {requireWallet ? (
+                <p className="muted">Connect Freighter to manage an issuer.</p>
+              ) : (
+                <>
+                  {issuerConfigError && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Account flags</span>
+                      <p className="muted">{issuerConfigError}</p>
+                    </div>
+                  )}
+
+                  {issuerConfig && (
+                    <form className="form" onSubmit={handleSetIssuerOptions}>
+                      <div className="info-box">
+                        <span className="eyebrow">Current account flags</span>
+                        <div className="metadata-grid">
+                          <div>
+                            <span className="metadata-label">Home domain</span>
+                            <span className="metadata-value">
+                              {issuerConfig.homeDomain || "—"}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Auth required</span>
+                            <span className="metadata-value">
+                              {String(issuerConfig.authRequired)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Auth revocable</span>
+                            <span className="metadata-value">
+                              {String(issuerConfig.authRevocable)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Auth immutable</span>
+                            <span className="metadata-value">
+                              {String(issuerConfig.authImmutable)}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <label className="label" htmlFor="issuer-home-domain">
+                        Home domain (32 bytes max)
+                      </label>
+                      <input
+                        id="issuer-home-domain"
+                        className="input"
+                        type="text"
+                        value={issuerForm.homeDomain}
+                        onChange={(e) =>
+                          setIssuerForm({
+                            ...issuerForm,
+                            homeDomain: e.target.value,
+                          })
+                        }
+                        disabled={issuerConfig.authImmutable}
+                      />
+
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={issuerForm.authRequired}
+                          onChange={(e) =>
+                            setIssuerForm({
+                              ...issuerForm,
+                              authRequired: e.target.checked,
+                            })
+                          }
+                          disabled={issuerConfig.authImmutable}
+                        />
+                        Auth required — holders need approval
+                      </label>
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={issuerForm.authRevocable}
+                          onChange={(e) =>
+                            setIssuerForm({
+                              ...issuerForm,
+                              authRevocable: e.target.checked,
+                            })
+                          }
+                          disabled={issuerConfig.authImmutable}
+                        />
+                        Auth revocable — the issuer can revoke holders
+                      </label>
+
+                      {!issuerConfig.authImmutable && (
+                        <div className="info-box info-box--warning">
+                          <span className="eyebrow">Irreversible</span>
+                          <p className="muted">
+                            Auth immutable can never be turned off. It is a
+                            separate control from the two flags above.
+                          </p>
+                        </div>
+                      )}
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={issuerConfig.authImmutable || issuerForm.authImmutable}
+                          onChange={(e) =>
+                            setIssuerForm({
+                              ...issuerForm,
+                              authImmutable: e.target.checked,
+                              confirmation: "",
+                            })
+                          }
+                          disabled={issuerConfig.authImmutable}
+                        />
+                        Auth immutable (one-way)
+                      </label>
+
+                      {issuerForm.authImmutable && !issuerConfig.authImmutable && (
+                        <>
+                          <label
+                            className="label"
+                            htmlFor="immutable-confirmation"
+                          >
+                            Type {IMMUTABLE_CONFIRMATION} to confirm
+                          </label>
+                          <input
+                            id="immutable-confirmation"
+                            className="input"
+                            type="text"
+                            value={issuerForm.confirmation}
+                            onChange={(e) =>
+                              setIssuerForm({
+                                ...issuerForm,
+                                confirmation: e.target.value,
+                              })
+                            }
+                            placeholder={IMMUTABLE_CONFIRMATION}
+                          />
+                        </>
+                      )}
+
+                      <button
+                        className="btn btn--primary"
+                        type="submit"
+                        disabled={
+                          loading === "issuer-update" ||
+                          issuerConfig.authImmutable ||
+                          (issuerForm.authImmutable &&
+                            issuerForm.confirmation !== IMMUTABLE_CONFIRMATION)
+                        }
+                      >
+                        {loading === "issuer-update" ? (
+                          <>
+                            <Spinner /> Signing…
+                          </>
+                        ) : (
+                          "Sign setOptions"
+                        )}
+                      </button>
+                      {issuerConfig.authImmutable && (
+                        <p className="muted">
+                          Flags are locked on-chain — auth immutable is already
+                          set.
+                        </p>
+                      )}
+                    </form>
+                  )}
+
+                  <h3 className="subhead">Trustlines you issued</h3>
+                  {issuedTrustlinesError && (
+                    <div className="info-box info-box--warning">
+                      <p className="muted">{issuedTrustlinesError}</p>
+                    </div>
+                  )}
+                  {issuedTrustlines.length > 0 ? (
+                    <ul className="balance-list">
+                      {issuedTrustlines.map((entry) => (
+                        <li key={entry.key} className="balance-row">
+                          <div>
+                            <strong>{entry.assetCode}</strong>
+                            <span className="muted balance-row__issuer">
+                              {shortenAddress(entry.holder)} · {entry.balance}
+                            </span>
+                          </div>
+                          <div className="balance-row__actions">
+                            <span className="muted">
+                              {entry.isAuthorized === null
+                                ? "status unknown"
+                                : entry.isAuthorized
+                                  ? "authorized"
+                                  : "not authorized"}
+                            </span>
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              type="button"
+                              onClick={() => handleAllowTrust(entry, true)}
+                              disabled={loading === `allow-${entry.key}`}
+                            >
+                              Authorize
+                            </button>
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              type="button"
+                              onClick={() => handleAllowTrust(entry, false)}
+                              disabled={loading === `allow-${entry.key}`}
+                            >
+                              Revoke
+                            </button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    !issuedTrustlinesError && (
+                      <p className="muted">
+                        No accounts hold an asset issued by this address.
+                      </p>
+                    )
+                  )}
+                </>
+              )}
             </div>
           )}
 
@@ -1294,6 +2168,8 @@ export default function App() {
                   </button>
                 </div>
               </form>
+
+              {txWatchPanel}
             </div>
           )}
 
@@ -1477,6 +2353,8 @@ export default function App() {
                   </a>
                 </div>
               )}
+
+              {txWatchPanel}
             </div>
           )}
 
@@ -1651,8 +2529,57 @@ export default function App() {
                         "Sign & register"
                       )}
                     </button>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={handleSimulateRegister}
+                      disabled={loading === "simulate" || requireWallet}
+                    >
+                      {loading === "simulate" ? (
+                        <>
+                          <Spinner /> Simulating…
+                        </>
+                      ) : (
+                        "Simulate fees"
+                      )}
+                    </button>
                     {!publicKey && <p className="muted">Connect Freighter to sign.</p>}
                   </form>
+                  {simulationFees && (
+                    <div className="info-box">
+                      <span className="eyebrow">Simulated fees (stroops)</span>
+                      {simulationFees.error ? (
+                        <p className="muted">
+                          Simulation failed: fees are unavailable.
+                        </p>
+                      ) : (
+                        <div className="metadata-grid">
+                          <div>
+                            <span className="metadata-label">Inclusion fee</span>
+                            <span className="metadata-value">
+                              {formatSimulationFee(simulationFees.inclusionFee)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Resource fee</span>
+                            <span className="metadata-value">
+                              {formatSimulationFee(simulationFees.resourceFee)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Total fee</span>
+                            <span className="metadata-value">
+                              {formatSimulationFee(simulationFees.totalFee)}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                      <p className="muted">
+                        Simulation does not submit. Press Sign &amp; register to sign
+                        with these fees.
+                      </p>
+                    </div>
+                  )}
                   {lastRegisterTx && (
                     <div className="info-box">
                       <span className="eyebrow">Register tx</span>
@@ -1666,6 +2593,217 @@ export default function App() {
                         Explorer ↗
                       </a>
                     </div>
+                  )}
+
+                  <div className="section__row">
+                    <div className="subhead">Contract instance TTL</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={() => refreshTtlInfo()}
+                      disabled={loading === "ttl" || !configuredContractId}
+                    >
+                      {loading === "ttl" ? (
+                        <>
+                          <Spinner /> Reading…
+                        </>
+                      ) : (
+                        "Refresh"
+                      )}
+                    </button>
+                  </div>
+                  {!configuredContractId && (
+                    <p className="muted">
+                      No contract id configured — set one in the backend to read
+                      or extend its TTL.
+                    </p>
+                  )}
+                  {ttlError && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Soroban RPC</span>
+                      <p className="muted">{ttlError}</p>
+                    </div>
+                  )}
+                  {ttlInfo && (
+                    <div className="info-box">
+                      <span className="eyebrow">Instance lifetime</span>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">Latest ledger</span>
+                          <span className="metadata-value">
+                            {ttlInfo.latestLedger}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Expires at ledger</span>
+                          <span className="metadata-value">
+                            {ttlInfo.liveUntilLedgerSeq ?? "—"}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">
+                            Ledgers remaining
+                          </span>
+                          <span className="metadata-value">
+                            {ttlInfo.ledgersRemaining}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <form className="form" onSubmit={handleExtendTtl}>
+                    <label className="label" htmlFor="ttl-deadline">
+                      Extend to ledger
+                    </label>
+                    <input
+                      id="ttl-deadline"
+                      className="input"
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={ttlForm.extendTo}
+                      onChange={(e) =>
+                        setTtlForm({ extendTo: e.target.value })
+                      }
+                      disabled={!ttlInfo}
+                    />
+                    <p className="muted">
+                      Must be later than the current deadline. This sends only
+                      an <code>extendFootprintTtl</code> op — never register,
+                      pause, or unregister.
+                    </p>
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={
+                        loading === "ttl-extend" ||
+                        requireWallet ||
+                        !configuredContractId ||
+                        !ttlInfo ||
+                        !ttlForm.extendTo
+                      }
+                    >
+                      {loading === "ttl-extend" ? (
+                        <>
+                          <Spinner /> Signing in Freighter…
+                        </>
+                      ) : (
+                        "Extend TTL"
+                      )}
+                    </button>
+                  </form>
+                  {ttlResult && (
+                    <div className="info-box">
+                      <span className="eyebrow">New deadline</span>
+                      <code>
+                        Ledger {ttlResult.liveUntilLedgerSeq} ·{" "}
+                        {ttlResult.hash}
+                      </code>
+                    </div>
+                  )}
+
+                  <div className="section__row">
+                    <div className="subhead">Contract code TTL</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={refreshCodeTtl}
+                      disabled={loading === "code-ttl" || !configuredContractId}
+                    >
+                      {loading === "code-ttl" ? "Reading…" : "Refresh code TTL"}
+                    </button>
+                  </div>
+                  <p className="muted">
+                    Extends the Wasm code entry on its own. The instance TTL above is left unchanged.
+                  </p>
+                  {codeTtlError && (
+                    <div className="info-box info-box--warning">
+                      <p className="muted">{codeTtlError}</p>
+                    </div>
+                  )}
+                  {codeTtl && (
+                    <div className="info-box">
+                      <span className="eyebrow">Code lifetime</span>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">Current ledger</span>
+                          <span className="metadata-value">{codeTtl.currentLedger}</span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Code TTL</span>
+                          <span className="metadata-value">
+                            {codeTtl.codeTTL ? `Ledger ${codeTtl.codeTTL}` : "—"}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Wasm hash</span>
+                          <span className="metadata-value">
+                            {codeTtl.wasmHash ? `${codeTtl.wasmHash.slice(0, 16)}…` : "—"}
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        className="btn btn--secondary btn--sm"
+                        type="button"
+                        onClick={handleExtendCodeTtl}
+                        disabled={
+                          loading === "extend-code" ||
+                          !publicKey ||
+                          !codeTtl.wasmHash
+                        }
+                      >
+                        {loading === "extend-code" ? "Extending…" : "Extend code TTL"}
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="section__row">
+                    <div className="subhead">Contract event tail</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={() => pollLabEvents(configuredContractId)}
+                      disabled={!configuredContractId}
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                  {!configuredContractId && (
+                    <p className="muted">
+                      No contract id configured — no events to show.
+                    </p>
+                  )}
+                  {labEventsError && (
+                    <div className="info-box info-box--warning">
+                      <p className="muted">{labEventsError}</p>
+                    </div>
+                  )}
+                  {labEvents.length > 0 ? (
+                    <ul className="balance-list">
+                      {labEvents.map((event) => (
+                        <li key={event.id} className="balance-row">
+                          <div>
+                            <strong>{event.type}</strong>
+                            <span className="muted balance-row__issuer">
+                              ledger {event.ledger}
+                            </span>
+                          </div>
+                          <div className="muted">
+                            {event.type === "register"
+                              ? `${event.name ?? "—"} · ${shortenAddress(event.caller)} · ${
+                                  event.isNew ? "new builder" : "existing"
+                                }`
+                              : `paused = ${String(event.paused)}`}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    !labEventsError && (
+                      <p className="muted">
+                        No register or pause events since this tab opened.
+                      </p>
+                    )
                   )}
                 </>
               )}
@@ -1690,6 +2828,8 @@ export default function App() {
                   Download failed JSON
                 </button>
               </div>
+
+              {txWatchPanel}
             </div>
           )}
 
@@ -1712,9 +2852,12 @@ export default function App() {
                   )}
                 </button>
               </div>
-              {transactions.length > 0 ? (
+              <p className="muted" aria-live="polite">
+                {streamStatusLabel(streamState)}
+              </p>
+              {visibleTransactions.length > 0 ? (
                 <div className="tx-list">
-                  {transactions.map((tx) => {
+                  {visibleTransactions.map((tx) => {
                     const isOutgoing = tx.from === publicKey;
                     const createdAt = formatCreatedAt(tx.created_at);
                     return (
@@ -1772,6 +2915,397 @@ export default function App() {
                       "Load more"
                     )}
                   </button>
+                </div>
+              )}
+
+              {txWatchPanel}
+            </div>
+          )}
+
+          {activeTab === "Issuer" && (
+            <div className="section">
+              <h2>Issuer stellar.toml</h2>
+              <p className="muted">
+                An issuer account is looked up for the home domain it publishes, then that
+                domain&apos;s stellar.toml is read over HTTPS only. A file that does not parse
+                shows the failure and no rows.
+              </p>
+
+              <form className="form" onSubmit={handleIssuerLookup}>
+                <label className="label" htmlFor="issuer-account-or-domain">
+                  Issuer account or home domain
+                </label>
+                <input
+                  id="issuer-account-or-domain"
+                  className="input"
+                  type="text"
+                  placeholder="G… or example.org"
+                  value={issuerInput}
+                  onChange={(e) => setIssuerInput(e.target.value)}
+                  required
+                />
+                <button
+                  className="btn btn--primary"
+                  type="submit"
+                  disabled={loading === "issuer"}
+                >
+                  {loading === "issuer" ? (
+                    <>
+                      <Spinner /> Reading…
+                    </>
+                  ) : (
+                    "Read stellar.toml"
+                  )}
+                </button>
+              </form>
+
+              {issuerError && (
+                <div className="info-box info-box--warning">
+                  <span className="eyebrow">stellar.toml</span>
+                  <p className="muted">{issuerError}</p>
+                </div>
+              )}
+
+              {issuerResult && (
+                <>
+                  <div className="info-box">
+                    <span className="eyebrow">
+                      Published by {issuerResult.homeDomain}
+                    </span>
+                    <p className="muted">
+                      Organisation: {issuerResult.orgName ?? "not published"}
+                    </p>
+                    {issuerResult.account && (
+                      <a
+                        className="text-link"
+                        href={explorerAccountUrl(issuerResult.account)}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Issuer account on explorer ↗
+                      </a>
+                    )}
+                  </div>
+
+                  <div className="subhead">DOCUMENTATION</div>
+                  {Object.keys(issuerResult.documentation ?? {}).length > 0 ? (
+                    <div className="metadata-grid">
+                      {Object.entries(issuerResult.documentation).map(([key, value]) => (
+                        <div key={key}>
+                          <span className="metadata-label">{key}</span>
+                          <span className="metadata-value">{String(value)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">No DOCUMENTATION table is published.</p>
+                  )}
+
+                  <div className="subhead">Currencies</div>
+                  {issuerResult.rows.length > 0 ? (
+                    <ul className="balance-list">
+                      {issuerResult.rows.map((row, index) => (
+                        <li
+                          key={`${row.code ?? "unspecified"}-${index}`}
+                          className="balance-row"
+                        >
+                          <div>
+                            <strong>{row.code ?? "code not published"}</strong>
+                            {row.issuer && (
+                              <span className="muted balance-row__issuer">
+                                {shortenAddress(row.issuer)}
+                              </span>
+                            )}
+                          </div>
+                          <div className="balance-row__actions">
+                            <span>
+                              display decimals {row.displayDecimals ?? "not published"}
+                            </span>
+                            {row.issuer && (
+                              <a
+                                className="text-link"
+                                href={explorerAccountUrl(row.issuer)}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                Explorer ↗
+                              </a>
+                            )}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="muted">No CURRENCIES rows are published.</p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {activeTab === "Web auth" && (
+            <div className="section">
+              <h2>Web authentication</h2>
+              <p className="muted">
+                Ask an anchor for a sign-in challenge, check it, sign it in Freighter, and show
+                what the returned session says. The session lives in this panel only — it is
+                never stored.
+              </p>
+
+              <form className="form" onSubmit={handleWebAuth}>
+                <label className="label" htmlFor="webauth-endpoint">
+                  Web-auth endpoint
+                </label>
+                <input
+                  id="webauth-endpoint"
+                  className="input"
+                  type="text"
+                  placeholder="https://auth.example.org/auth"
+                  value={webAuthForm.endpoint}
+                  onChange={(e) =>
+                    setWebAuthForm({ ...webAuthForm, endpoint: e.target.value })
+                  }
+                  required
+                />
+                <label className="label" htmlFor="webauth-server-account">
+                  Endpoint&apos;s server account
+                </label>
+                <input
+                  id="webauth-server-account"
+                  className="input"
+                  type="text"
+                  placeholder="G…"
+                  value={webAuthForm.serverAccount}
+                  onChange={(e) =>
+                    setWebAuthForm({ ...webAuthForm, serverAccount: e.target.value })
+                  }
+                  required
+                />
+                <p className="muted">
+                  A challenge whose source account is not this one is refused before anything is
+                  signed, and so is one that has already expired.
+                </p>
+                <button
+                  className="btn btn--primary"
+                  type="submit"
+                  disabled={loading === "webauth" || requireWallet}
+                >
+                  {loading === "webauth" ? (
+                    <>
+                      <Spinner /> Signing in Freighter…
+                    </>
+                  ) : (
+                    "Request & sign challenge"
+                  )}
+                </button>
+                {requireWallet && <p className="muted">Connect Freighter to sign.</p>}
+              </form>
+
+              {webAuthError && (
+                <div className="info-box info-box--warning">
+                  <span className="eyebrow">Web authentication</span>
+                  <p className="muted">{webAuthError}</p>
+                </div>
+              )}
+
+              {webAuthResult && (
+                <div className="info-box" role="status" aria-live="polite">
+                  <span className="eyebrow">Signed challenge</span>
+                  <div className="metadata-grid">
+                    <div>
+                      <span className="metadata-label">Server</span>
+                      <span className="metadata-value">
+                        {shortenAddress(webAuthResult.serverAccount)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="metadata-label">Operation</span>
+                      <span className="metadata-value">
+                        {webAuthResult.operationName} · {webAuthResult.operationCount}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="metadata-label">Valid until</span>
+                      <span className="metadata-value">
+                        {formatCreatedAt(webAuthResult.expiresAtMs) ?? "—"}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="metadata-label">Session subject</span>
+                      <span className="metadata-value">
+                        {shortenAddress(webAuthResult.session.subject)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="metadata-label">Session expires</span>
+                      <span className="metadata-value">
+                        {formatCreatedAt(webAuthResult.session.expiresAtMs) ?? "—"}
+                      </span>
+                    </div>
+                  </div>
+                  <p className="muted">
+                    {webAuthResult.session.expired
+                      ? "The session token has already expired."
+                      : "The session token is current."}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === "Decode" && (
+            <div className="section">
+              <h2>Decode envelope</h2>
+              <p className="muted">
+                Paste a signed or unsigned transaction envelope XDR. A Soroban invoke
+                names its contract, function, and arguments; classic envelopes keep the
+                fee, sequence, and signatures only.
+              </p>
+              <form onSubmit={handleDecodeEnvelope} className="form">
+                <label className="label" htmlFor="envelope-xdr">
+                  Envelope XDR
+                </label>
+                <textarea
+                  id="envelope-xdr"
+                  className="input"
+                  rows={5}
+                  placeholder="AAAAAgAAAA..."
+                  value={envelopeXdr}
+                  onChange={(e) => setEnvelopeXdr(e.target.value)}
+                />
+                <button
+                  className="btn btn--primary"
+                  type="submit"
+                  disabled={!envelopeXdr.trim()}
+                >
+                  Decode
+                </button>
+              </form>
+
+              {decodeError && (
+                <div className="info-box info-box--warning">
+                  <span className="eyebrow">Decode failed</span>
+                  <p className="muted">{decodeError}</p>
+                </div>
+              )}
+
+              {decodedEnvelope && (
+                <div className="section">
+                  <div className="info-box">
+                    <span className="eyebrow">Envelope</span>
+                    <div className="metadata-grid">
+                      <div>
+                        <span className="metadata-label">Kind</span>
+                        <span className="metadata-value">
+                          {decodedEnvelope.kind === "feeBump" ? "Fee bump" : "Transaction"}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="metadata-label">Fee</span>
+                        <span className="metadata-value">
+                          {decodedEnvelope.fee} stroops
+                        </span>
+                      </div>
+                      {decodedEnvelope.innerFee !== null && (
+                        <div>
+                          <span className="metadata-label">Inner fee</span>
+                          <span className="metadata-value">
+                            {decodedEnvelope.innerFee} stroops
+                          </span>
+                        </div>
+                      )}
+                      <div>
+                        <span className="metadata-label">Sequence</span>
+                        <span className="metadata-value">{decodedEnvelope.sequence}</span>
+                      </div>
+                      <div>
+                        <span className="metadata-label">Source</span>
+                        <span className="metadata-value">
+                          {shortenAddress(decodedEnvelope.source)}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="metadata-label">Signatures</span>
+                        <span className="metadata-value">
+                          {decodedEnvelope.signatures.length}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {decodedEnvelope.operations.map((operation, index) => (
+                    <div key={`${operation.type}-${index}`} className="info-box">
+                      <span className="eyebrow">
+                        Operation {index + 1} · {operation.type}
+                      </span>
+                      {operation.contract && (
+                        <div className="metadata-grid">
+                          <div>
+                            <span className="metadata-label">Contract</span>
+                            <span className="metadata-value">
+                              {operation.contract.address ?? "No contract address"}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Function</span>
+                            <span className="metadata-value">
+                              {operation.contract.function ?? "—"}
+                            </span>
+                          </div>
+                          {operation.contract.args.length > 0 && (
+                            <div>
+                              <span className="metadata-label">Arguments</span>
+                              <ul className="balance-list">
+                                {operation.contract.args.map((argument, argIndex) => (
+                                  <li
+                                    key={`${argument.type}-${argIndex}`}
+                                    className="metadata-value"
+                                  >
+                                    <code>{argument.type}</code>{" · "}
+                                    {formatArgumentValue(argument)}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {operation.type === "payment" && (
+                        <div className="metadata-grid">
+                          <div>
+                            <span className="metadata-label">Destination</span>
+                            <span className="metadata-value">
+                              {shortenAddress(operation.destination)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Asset</span>
+                            <span className="metadata-value">
+                              {operation.asset ?? "—"}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Amount</span>
+                            <span className="metadata-value">{operation.amount}</span>
+                          </div>
+                        </div>
+                      )}
+                      {operation.type === "changeTrust" && (
+                        <div className="metadata-grid">
+                          <div>
+                            <span className="metadata-label">Asset</span>
+                            <span className="metadata-value">
+                              {operation.asset ?? "—"}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Limit</span>
+                            <span className="metadata-value">{operation.limit}</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -1871,6 +3405,36 @@ function TransactionDetails({ transaction }) {
       ))}
     </>
   );
+}
+
+function tabSlug(tab) {
+  return tab.toLowerCase().replace(/\s+/g, "-");
+}
+
+/**
+ * Issue #512: a payment the stream already prepended stays at the top when a
+ * manual refresh re-reads it, so the paged rows drop any id the stream showed.
+ */
+function mergeStreamedPayments(streamed, paged) {
+  const streamedIds = new Set(streamed.map((tx) => tx.id));
+  return [...streamed, ...paged.filter((tx) => !streamedIds.has(tx.id))];
+}
+
+const STREAM_CLOSED_LINES = {
+  disconnect: "Payments stream closed: the wallet was disconnected.",
+  "network-change": "Payments stream closed: the network changed.",
+  "tab-hidden": "Payments stream closed: this tab was left.",
+};
+
+/** Issue #512: what the history tab says about its own stream. */
+function streamStatusLabel(state) {
+  if (!state) return "New payments appear at the top of this list as they arrive.";
+  if (state.failure) return state.failure;
+  if (state.status === "open") return "Streaming new payments into the top of the list.";
+  if (state.status === "closed") {
+    return STREAM_CLOSED_LINES[state.reason] ?? "Payments stream closed.";
+  }
+  return "Payments stream not running.";
 }
 
 function formatCreatedAt(value) {

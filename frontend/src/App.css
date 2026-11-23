@@ -345,6 +345,26 @@ body {
   font-weight: 600;
   color: var(--muted);
 }
+.checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text);
+  cursor: pointer;
+}
+.checkbox-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--sun-deep);
+  flex: none;
+}
+.checkbox-row:has(input:disabled) {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
 .input {
   width: 100%;
   background: var(--panel-2);
