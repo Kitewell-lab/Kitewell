@@ -35,6 +35,9 @@ test("mapBalance maps a credit_alphanum4 asset balance", () => {
     balance: "123.4567890",
     limit: "1000000.0000000",
     isNative: false,
+    isAuthorized: null,
+    isAuthorizedToMaintainLiabilities: null,
+    isClawbackEnabled: null,
   });
 });
 
@@ -90,4 +93,33 @@ test("mapBalance stores a missing credit limit as null", () => {
 
   assert.equal(result.limit, null);
   assert.equal(result.code, "USDC");
+});
+
+test("mapBalance preserves Horizon trustline authorization flags", () => {
+  const result = mapBalance({
+    asset_type: "credit_alphanum4",
+    asset_code: "USDC",
+    asset_issuer: "GISSUER",
+    balance: "1.0000000",
+    is_authorized: false,
+    is_authorized_to_maintain_liabilities: true,
+    is_clawback_enabled: true,
+  });
+
+  assert.equal(result.isAuthorized, false);
+  assert.equal(result.isAuthorizedToMaintainLiabilities, true);
+  assert.equal(result.isClawbackEnabled, true);
+});
+
+test("mapBalance marks omitted trustline authorization flags unknown", () => {
+  const result = mapBalance({
+    asset_type: "credit_alphanum4",
+    asset_code: "USDC",
+    asset_issuer: "GISSUER",
+    balance: "1.0000000",
+  });
+
+  assert.equal(result.isAuthorized, null);
+  assert.equal(result.isAuthorizedToMaintainLiabilities, null);
+  assert.equal(result.isClawbackEnabled, null);
 });

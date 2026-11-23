@@ -35,6 +35,11 @@ import {
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
 import { decodeTransactionEnvelope } from "./txInspector";
+import {
+  flagLabel,
+  isCreditAssetSendable,
+  trustlineAuthorizationLabel,
+} from "./trustlineAuthorization";
 import "./App.css";
 
 const TABS = [
@@ -360,6 +365,15 @@ export default function App() {
     const selected = balances.find((b) => b.key === sendForm.assetKey);
     if (!selected) {
       showToast("Choose an asset you hold a trustline for.", "error");
+      return null;
+    }
+    if (!selected.isNative && !isCreditAssetSendable(selected)) {
+      showToast(
+        selected.isAuthorized === false
+          ? `${selected.code} is unauthorized and cannot be sent.`
+          : `Authorization for ${selected.code} is unknown, so it cannot be sent.`,
+        "error"
+      );
       return null;
     }
     if (parseFloat(amount) > parseFloat(selected.balance)) {
@@ -968,6 +982,11 @@ export default function App() {
                             {shortenAddress(b.issuer)}
                           </span>
                         )}
+                        {!b.isNative && !b.isPoolShare && (
+                          <span className="muted balance-row__authorization">
+                            {trustlineAuthorizationLabel(b)} · liabilities: {flagLabel(b.isAuthorizedToMaintainLiabilities, "yes", "no")} · clawback: {flagLabel(b.isClawbackEnabled, "enabled", "disabled")}
+                          </span>
+                        )}
                       </div>
                       <div className="balance-row__actions">
                         <span>
@@ -1134,7 +1153,12 @@ export default function App() {
                 >
                   <option value="native">XLM (native)</option>
                   {balances
-                    .filter((b) => !b.isNative && !b.isPoolShare)
+                    .filter(
+                      (b) =>
+                        !b.isNative &&
+                        !b.isPoolShare &&
+                        isCreditAssetSendable(b)
+                    )
                     .map((b) => (
                       <option key={b.key} value={b.key}>
                         {b.code} ·{" "}

@@ -43,6 +43,10 @@ export function mapBalance(balance) {
     balance: balance.balance,
     limit: balance.limit ?? null,
     isNative: false,
+    isAuthorized: balance.is_authorized ?? null,
+    isAuthorizedToMaintainLiabilities:
+      balance.is_authorized_to_maintain_liabilities ?? null,
+    isClawbackEnabled: balance.is_clawback_enabled ?? null,
   };
 }
 

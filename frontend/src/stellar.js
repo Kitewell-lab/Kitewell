@@ -127,6 +127,10 @@ function mapHorizonBalances(account) {
       balance: b.balance,
       limit: b.limit,
       isNative: false,
+      isAuthorized: b.is_authorized ?? null,
+      isAuthorizedToMaintainLiabilities:
+        b.is_authorized_to_maintain_liabilities ?? null,
+      isClawbackEnabled: b.is_clawback_enabled ?? null,
     };
   });
 }
