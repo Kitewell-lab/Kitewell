@@ -735,8 +735,6 @@ export async function allowTrustWithFreighter(
     .setTimeout(180)
     .build();
 
-  // Deliberately do not pre-check the holder's balance: if a revoke is invalid
-  // (e.g. the trustline still holds a balance), Horizon's error is surfaced.
   return signAndSubmit(transaction, publicKey);
 }
 
