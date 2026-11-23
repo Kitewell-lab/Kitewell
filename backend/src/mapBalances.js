@@ -19,6 +19,7 @@ export function mapBalance(balance) {
       issuer: null,
       balance: balance.balance,
       limit: null,
+      ...(balance.sponsor ? { sponsor: balance.sponsor } : {}),
       isNative: false,
       isPoolShare: true,
       poolId: balance.liquidity_pool_id,
@@ -32,6 +33,7 @@ export function mapBalance(balance) {
       issuer: null,
       balance: balance.balance,
       limit: null,
+      ...(balance.sponsor ? { sponsor: balance.sponsor } : {}),
       isNative: true,
     };
   }
@@ -42,6 +44,7 @@ export function mapBalance(balance) {
     issuer: balance.asset_issuer,
     balance: balance.balance,
     limit: balance.limit ?? null,
+    ...(balance.sponsor ? { sponsor: balance.sponsor } : {}),
     isNative: false,
   };
 }

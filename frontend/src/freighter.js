@@ -556,3 +556,33 @@ export async function changeTrustWithFreighter(
 
   return signAndSubmit(transaction, publicKey);
 }
+
+/** Revoke this account's sponsorship of one of its sponsored trustlines. */
+export async function revokeTrustlineSponsorshipWithFreighter(
+  publicKey,
+  assetCode,
+  assetIssuer
+) {
+  if (!assetCode || assetCode.length > 12) {
+    throw new Error("Asset code must be 1–12 characters.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(assetIssuer)) {
+    throw new Error("Issuer must be a valid Stellar public key (G…).");
+  }
+
+  const asset = new StellarSdk.Asset(assetCode.toUpperCase(), assetIssuer);
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.revokeSponsorship({
+        trustline: { account: publicKey, asset },
+      })
+    )
+    .setTimeout(180)
+    .build();
+
+  return signAndSubmit(transaction, publicKey);
+}

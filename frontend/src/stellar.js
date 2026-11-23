@@ -117,6 +117,7 @@ function mapHorizonBalances(account) {
         issuer: null,
         balance: b.balance,
         limit: null,
+        sponsor: b.sponsor ?? null,
         isNative: true,
       };
     }
@@ -126,6 +127,7 @@ function mapHorizonBalances(account) {
       issuer: b.asset_issuer,
       balance: b.balance,
       limit: b.limit,
+      sponsor: b.sponsor ?? null,
       isNative: false,
     };
   });

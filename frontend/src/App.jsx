@@ -6,6 +6,7 @@ import {
   submitEnvelopeWithFreighter,
   pathPaymentWithFreighter,
   changeTrustWithFreighter,
+  revokeTrustlineSponsorshipWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
   submitFailureResult,
@@ -147,6 +148,7 @@ export default function App() {
 
   const xlmBalance = balances.find((b) => b.isNative)?.balance ?? null;
   const assetBalances = balances.filter((b) => !b.isPoolShare);
+  const sponsoredTrustlines = assetBalances.filter((b) => b.sponsor === publicKey);
   const poolShares = poolShareRows(balances, liquidityPools);
   const memoField = MEMO_FIELDS[sendForm.memoType];
   const activeNetwork = NETWORKS[networkId];
@@ -327,6 +329,26 @@ export default function App() {
     } catch (err) {
       trackFailedSubmit("changeTrust", err);
       showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleRevokeSponsorship = async (asset) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`revoke-${asset.key}`);
+    try {
+      await revokeTrustlineSponsorshipWithFreighter(
+        publicKey,
+        asset.code,
+        asset.issuer
+      );
+      const next = await getAccountBalances(publicKey);
+      setBalances(next);
+      showToast(`${asset.code} sponsorship revoked.`);
+    } catch (err) {
+      trackFailedSubmit("revokeSponsorship", err);
+      showToast(err.message || `Could not revoke the ${asset.code} sponsorship.`, "error");
     } finally {
       setLoading("");
     }
@@ -953,8 +975,8 @@ export default function App() {
             <div className="section">
               <h2>Balances & trustlines</h2>
               <p className="muted">
-                View holdings, open a trustline, or remove an empty one with Freighter{" "}
-                <code>signTransaction</code>. Removing sets the limit to 0.
+                View holdings, open a trustline, remove an empty one, or revoke a sponsored
+                trustline with Freighter <code>signTransaction</code>.
               </p>
 
               {assetBalances.length > 0 ? (
@@ -976,21 +998,21 @@ export default function App() {
                           })}
                         </span>
                         {!b.isNative && (
-                          <button
-                            className="btn btn--secondary btn--sm"
-                            type="button"
-                            onClick={() => handleRemoveTrust(b)}
-                            disabled={loading === `remove-${b.key}`}
-                            title={
-                              parseFloat(b.balance) > 0
-                                ? "Balance must be 0 before removing this trustline"
-                                : `Remove the ${b.code} trustline`
-                            }
-                          >
-                            {loading === `remove-${b.key}`
-                              ? "Removing…"
-                              : "Remove"}
-                          </button>
+                          <>
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              type="button"
+                              onClick={() => handleRemoveTrust(b)}
+                              disabled={loading === `remove-${b.key}`}
+                              title={
+                                parseFloat(b.balance) > 0
+                                  ? "Balance must be 0 before removing this trustline"
+                                  : `Remove the ${b.code} trustline`
+                              }
+                            >
+                              {loading === `remove-${b.key}` ? "Removing…" : "Remove"}
+                            </button>
+                          </>
                         )}
                       </div>
                     </li>
@@ -1003,6 +1025,36 @@ export default function App() {
                     : "No balances yet — fund the account first."}
                 </p>
               )}
+
+              <div className="section">
+                <h3 className="subhead">Trustlines you sponsor</h3>
+                {sponsoredTrustlines.length === 0 ? (
+                  <p className="muted">You are not sponsoring any trustlines.</p>
+                ) : (
+                  <ul className="balance-list">
+                    {sponsoredTrustlines.map((asset) => (
+                      <li key={asset.key} className="balance-row">
+                        <div>
+                          <strong>{asset.code}</strong>
+                          <span className="muted balance-row__issuer">
+                            {shortenAddress(asset.issuer)}
+                          </span>
+                        </div>
+                        <button
+                          className="btn btn--secondary btn--sm"
+                          type="button"
+                          onClick={() => handleRevokeSponsorship(asset)}
+                          disabled={loading === `revoke-${asset.key}`}
+                        >
+                          {loading === `revoke-${asset.key}`
+                            ? "Revoking…"
+                            : "Revoke sponsorship"}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
 
               {poolShares.length > 0 && (
                 <div className="section">

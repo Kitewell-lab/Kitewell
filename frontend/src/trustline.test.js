@@ -42,7 +42,10 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
 });
 
 const StellarSdk = await import("@stellar/stellar-sdk");
-const { changeTrustWithFreighter } = await import("./freighter");
+const {
+  changeTrustWithFreighter,
+  revokeTrustlineSponsorshipWithFreighter,
+} = await import("./freighter");
 
 const SOURCE = StellarSdk.Keypair.random().publicKey();
 const ISSUER = StellarSdk.Keypair.random().publicKey();
@@ -75,6 +78,17 @@ describe("changeTrustWithFreighter", () => {
 
     const op = submitTransactionMock.mock.calls[0][0].operations[0];
     expect(parseFloat(op.limit)).toBeGreaterThan(0);
+  });
+
+  it("builds revokeSponsorship for a sponsored trustline without removing it", async () => {
+    await revokeTrustlineSponsorshipWithFreighter(SOURCE, "usdc", ISSUER);
+
+    const operations = submitTransactionMock.mock.calls[0][0].operations;
+    expect(operations).toHaveLength(1);
+    expect(operations[0].type).toBe("revokeSponsorship");
+    expect(operations[0].trustLine.accountId()).toBe(SOURCE);
+    expect(operations[0].trustLine.asset.getCode()).toBe("USDC");
+    expect(operations[0].trustLine.asset.getIssuer()).toBe(ISSUER);
   });
 
   it("rejects an invalid issuer before submitting", async () => {
