@@ -91,3 +91,17 @@ test("mapBalance stores a missing credit limit as null", () => {
   assert.equal(result.limit, null);
   assert.equal(result.code, "USDC");
 });
+
+test("mapBalance preserves the Horizon sponsor on a credit trustline", () => {
+  const sponsor = "GSPONSOR";
+  const result = mapBalance({
+    asset_type: "credit_alphanum4",
+    asset_code: "USDC",
+    asset_issuer: "GISSUER",
+    balance: "0.0000000",
+    limit: "1000.0000000",
+    sponsor,
+  });
+
+  assert.equal(result.sponsor, sponsor);
+});
