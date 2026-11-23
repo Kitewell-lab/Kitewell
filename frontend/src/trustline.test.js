@@ -85,7 +85,7 @@ describe("changeTrustWithFreighter", () => {
 
     const operations = submitTransactionMock.mock.calls[0][0].operations;
     expect(operations).toHaveLength(1);
-    expect(operations[0].type).toBe("revokeSponsorship");
+    expect(operations[0].type).toBe("revokeTrustlineSponsorship");
     expect(operations[0].trustLine.accountId()).toBe(SOURCE);
     expect(operations[0].trustLine.asset.getCode()).toBe("USDC");
     expect(operations[0].trustLine.asset.getIssuer()).toBe(ISSUER);

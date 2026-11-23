@@ -340,7 +340,7 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
         issuer: null,
         balance: b.balance,
         limit: null,
-        sponsor: b.sponsor ?? null,
+        ...(b.sponsor ? { sponsor: b.sponsor } : {}),
         isNative: true,
         ...liabilityFields(b, true, subentryCount, baseReserve),
       };
@@ -351,7 +351,7 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
       issuer: b.asset_issuer,
       balance: b.balance,
       limit: b.limit,
-      sponsor: b.sponsor ?? null,
+      ...(b.sponsor ? { sponsor: b.sponsor } : {}),
       isNative: false,
       ...liabilityFields(b, false, subentryCount, baseReserve),
     };

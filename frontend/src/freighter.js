@@ -658,8 +658,9 @@ export async function revokeTrustlineSponsorshipWithFreighter(
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
-      StellarSdk.Operation.revokeSponsorship({
-        trustline: { account: publicKey, asset },
+      StellarSdk.Operation.revokeTrustlineSponsorship({
+        account: publicKey,
+        asset,
       })
     )
     .setTimeout(180)
