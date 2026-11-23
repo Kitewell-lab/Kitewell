@@ -14,9 +14,11 @@ vi.mock("./api", () => ({
   fetchPaymentsViaApi: vi.fn(),
 }));
 
-const { loadAccountMock, paymentsCallMock } = vi.hoisted(() => ({
+const { loadAccountMock, paymentsCallMock, claimableCallMock, assetCallMock } = vi.hoisted(() => ({
   loadAccountMock: vi.fn(),
   paymentsCallMock: vi.fn(),
+  claimableCallMock: vi.fn(),
+  assetCallMock: vi.fn(),
 }));
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
@@ -34,6 +36,12 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
                 order: () => ({ call: paymentsCallMock }),
               }),
             }),
+          }),
+          claimableBalances: () => ({
+            forSponsor: () => ({ limit: () => ({ call: claimableCallMock }) }),
+          }),
+          assets: () => ({
+            forCode: () => ({ forIssuer: () => ({ call: assetCallMock }) }),
           }),
         };
       }),
@@ -82,6 +90,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   loadAccountMock.mockReset();
   paymentsCallMock.mockReset();
+  claimableCallMock.mockReset();
+  assetCallMock.mockReset();
 });
 
 afterEach(() => {
@@ -323,5 +333,49 @@ describe("getTransactions", () => {
       nextCursor: null,
     });
     expect(paymentsCallMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("getClaimableBalances", () => {
+  it("lists only creator balances and enables clawback only for an issuer asset", async () => {
+    const { getClaimableBalances } = await import("./stellar");
+    claimableCallMock.mockResolvedValue({
+      records: [
+        {
+          id: "a".repeat(64),
+          asset: "KITE:GTEST",
+          amount: "4.0000000",
+          sponsor: "GCREATOR",
+          last_modified_time: "2026-01-01T00:00:00Z",
+        },
+        { id: "b".repeat(64), asset: "KITE:GOTHER", amount: "2", sponsor: "OTHER" },
+      ],
+    });
+    assetCallMock.mockResolvedValue({
+      records: [{ flags: { auth_clawback_enabled: true } }],
+    });
+
+    await expect(getClaimableBalances("GCREATOR")).resolves.toEqual([
+      expect.objectContaining({
+        id: "a".repeat(64),
+        code: "KITE",
+        issuer: "GTEST",
+        createdByAccount: true,
+        clawbackEnabled: true,
+      }),
+    ]);
+    expect(claimableCallMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides clawback when the issuer asset does not allow clawback", async () => {
+    const { getClaimableBalances } = await import("./stellar");
+    claimableCallMock.mockResolvedValue({
+      records: [{ id: "c".repeat(64), asset: "KITE:GISSUER", sponsor: "GISSUER" }],
+    });
+    assetCallMock.mockResolvedValue({ records: [{ flags: { auth_clawback_enabled: false } }] });
+
+    await expect(getClaimableBalances("GISSUER")).resolves.toEqual([
+      expect.objectContaining({ clawbackEnabled: false }),
+    ]);
   });
 });

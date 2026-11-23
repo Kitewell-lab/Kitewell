@@ -556,3 +556,26 @@ export async function changeTrustWithFreighter(
 
   return signAndSubmit(transaction, publicKey);
 }
+
+/** Claw back an unclaimed balance for an issued asset. */
+export async function clawbackClaimableBalanceWithFreighter(publicKey, balanceId) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!/^[0-9a-fA-F]{64}$/.test(balanceId || "")) {
+    throw new Error("Claimable balance ID must be 32-byte hexadecimal XDR.");
+  }
+
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.clawbackClaimableBalance({ balanceId })
+    )
+    .setTimeout(180)
+    .build();
+
+  return signAndSubmit(transaction, publicKey);
+}

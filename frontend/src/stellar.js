@@ -131,6 +131,57 @@ function mapHorizonBalances(account) {
   });
 }
 
+function mapClaimableBalance(record, publicKey) {
+  const [code, issuer] = (record.asset || "").split(":");
+  return {
+    id: record.id,
+    amount: record.amount,
+    code: code || "XLM",
+    issuer: issuer || null,
+    createdByAccount: record.sponsor === publicKey,
+    clawbackEnabled: Boolean(record.asset && issuer && record.flags?.auth_clawback_enabled),
+    claimants: record.claimants || [],
+    createdAt: record.last_modified_time || null,
+  };
+}
+
+/**
+ * Load claimable balances sponsored by the connected account. Horizon's
+ * sponsor filter is the creator for balances created by this account; keep
+ * the filter server-side so another account's balance is never offered for
+ * clawback.
+ */
+export async function getClaimableBalances(publicKey) {
+  const records = await getServer()
+    .claimableBalances()
+    .forSponsor(publicKey)
+    .limit(200)
+    .call();
+
+  const balances = await Promise.all(
+    (records.records || []).map(async (record) => {
+      const mapped = mapClaimableBalance(record, publicKey);
+      if (!mapped.issuer) return mapped;
+
+      try {
+        const assets = await getServer()
+          .assets()
+          .forCode(mapped.code)
+          .forIssuer(mapped.issuer)
+          .call();
+        return {
+          ...mapped,
+          clawbackEnabled: Boolean(assets.records?.[0]?.flags?.auth_clawback_enabled),
+        };
+      } catch {
+        return { ...mapped, clawbackEnabled: false };
+      }
+    })
+  );
+
+  return balances.filter((balance) => balance.createdByAccount);
+}
+
 /** Prefer the Kitewell backend on Testnet; otherwise read Horizon directly. */
 export async function getAccountBalances(publicKey) {
   if (backendIsUsable()) {
