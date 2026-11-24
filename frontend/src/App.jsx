@@ -79,7 +79,7 @@ import { validatePaymentAmount } from "./validatePaymentAmount";
 import { filterTransactionHistory } from "./txHistoryFilter";
 import { fetchHealth, fetchNetworkInfo } from "./api";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
-import { formatSimulationFee } from "./simulationFees";
+import { formatSimulationFee, isSimulationReady } from "./simulationFees";
 import {
   NETWORKS,
   getActiveNetwork,
@@ -1962,10 +1962,11 @@ export default function App() {
     labInfo?.network?.contract?.kitewell,
     registerForm.name.trim(),
   ]);
-  const registerSimulationReady =
-    Boolean(simulationFees) &&
-    !simulationFees.error &&
-    simulatedRegisterKey === currentRegisterSimulationKey;
+  const registerSimulationReady = isSimulationReady(
+    simulationFees,
+    simulatedRegisterKey,
+    currentRegisterSimulationKey
+  );
   const historyAssets = [
     ...new Set(
       visibleTransactions
@@ -2795,6 +2796,7 @@ export default function App() {
         resourceFee: null,
         totalFee: null,
         returnValue: null,
+        authAddresses: [],
       });
       showToast(error, "error");
     } finally {
@@ -5446,6 +5448,28 @@ export default function App() {
                                 {formatSimulationFee(simulationFees.totalFee)}
                               </span>
                             </div>
+                          </div>
+                          <div>
+                            <span className="metadata-label">
+                              Authorization entries
+                            </span>
+                            {simulationFees.authAddresses.length > 0 ? (
+                              <ul>
+                                {simulationFees.authAddresses.map((address) => (
+                                  <li key={address}>
+                                    <code>{address}</code>{" "}
+                                    {address === publicKey
+                                      ? "(connected wallet)"
+                                      : "(someone else's)"}
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p className="muted">
+                                Connected wallet ({shortenAddress(publicKey)}) is
+                                the only signer.
+                              </p>
+                            )}
                           </div>
                           <p className="muted">
                             Simulation does not submit. Press Sign &amp; register to sign

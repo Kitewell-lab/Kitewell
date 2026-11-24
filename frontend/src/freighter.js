@@ -22,7 +22,10 @@ import {
 } from "./stellar";
 import { parseHorizonError } from "./horizonErrorParse";
 import { formatTrustlineLimit } from "./trustlineLimitFormat";
-import { parseSimulationFees } from "./simulationFees";
+import {
+  parseSimulationAuthorizationAddresses,
+  parseSimulationFees,
+} from "./simulationFees";
 import { getFeePerOperation } from "./feeSetting";
 import {
   HORIZON_FAILURE_CODE,
@@ -103,7 +106,10 @@ function buildContractTx(contract, method, args, sourceAccount, timeout = 60) {
   return new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
     networkPassphrase: currentPassphrase(),
-  });
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(timeout)
+    .build();
 }
 
 /** Send prepared XDR to Freighter and return the signed transaction. */
@@ -351,34 +357,13 @@ export async function proposeAdminWithFreighter(
 ) {
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
     throw new Error("Current admin address is invalid.");
- * Simulate the builder registration without signing or submitting it, so the
- * panel can show the return value and fee breakdown before the user signs.
- *
- * @returns {Promise<{
- *   error: string|null,
- *   inclusionFee: string|null,
- *   resourceFee: string|null,
- *   totalFee: string|null,
- *   returnValue: unknown,
- * }>} Fees in stroops.
- */
-export async function simulateRegisterBuilder(publicKey, contractId, name) {
-  const trimmed = (name || "").trim();
-  if ([...trimmed].length > 64) {
-    throw new Error("Builder name must be 64 characters or fewer.");
-  }
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
   }
   if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error(
-      "Contract ID must be a valid Soroban contract strkey (C…)."
-    );
+    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
   }
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(newAdminAddress)) {
     throw new Error("New admin address must be a valid Stellar public key (G…).");
   }
-
   const contract = new StellarSdk.Contract(contractId);
   const sourceAccount = await sorobanRpc.getAccount(publicKey);
   const transaction = buildContractTx(
@@ -387,10 +372,6 @@ export async function simulateRegisterBuilder(publicKey, contractId, name) {
     [
       StellarSdk.nativeToScVal(publicKey, { type: "address" }),
       StellarSdk.nativeToScVal(newAdminAddress, { type: "address" }),
-    "register",
-    [
-      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
-      StellarSdk.nativeToScVal(trimmed, { type: "string" }),
     ],
     sourceAccount
   );
@@ -405,7 +386,6 @@ export async function simulateRegisterBuilder(publicKey, contractId, name) {
     );
   }
 
-  // Poll for confirmation
   for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
     const status = await sorobanRpc.getTransaction(sendResult.hash);
     if (status.status === "SUCCESS") {
@@ -420,6 +400,64 @@ export async function simulateRegisterBuilder(publicKey, contractId, name) {
   }
 
   return { hash: sendResult.hash, confirmed: false };
+}
+
+/**
+ * Simulate the builder registration without signing or submitting it, so the
+ * panel can show the return value, fees, and authorization addresses first.
+ *
+ * @returns {Promise<{
+ *   error: string|null,
+ *   inclusionFee: string|null,
+ *   resourceFee: string|null,
+ *   totalFee: string|null,
+ *   returnValue: unknown,
+ *   authAddresses: string[],
+ * }>}
+ */
+export async function simulateRegisterBuilder(publicKey, contractId, name) {
+  const trimmed = (name || "").trim();
+  if ([...trimmed].length > 64) {
+    throw new Error("Builder name must be 64 characters or fewer.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = buildContractTx(
+    contract,
+    "register",
+    [
+      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
+      StellarSdk.nativeToScVal(trimmed, { type: "string" }),
+    ],
+    sourceAccount
+  );
+  const simulation = await sorobanRpc.simulateTransaction(transaction);
+  const fees = parseSimulationFees(simulation, transaction.fee);
+  const hasReturnValue =
+    simulation?.result &&
+    Object.prototype.hasOwnProperty.call(simulation.result, "retval");
+
+  return {
+    ...fees,
+    error:
+      fees.error || (hasReturnValue ? null : "Simulation returned no result."),
+    returnValue:
+      fees.error || !hasReturnValue
+        ? null
+        : StellarSdk.scValToNative(simulation.result.retval),
+    authAddresses: parseSimulationAuthorizationAddresses(
+      simulation?.result?.auth
+    ),
+  };
 }
 
 /**
@@ -475,96 +513,6 @@ export async function acceptAdminWithFreighter(publicKey, contractId) {
   }
 
   return { hash: sendResult.hash, confirmed: false };
-  // Simulation only: the user still has to press Sign to submit.
-  const simulation = await sorobanRpc.simulateTransaction(transaction);
-  const fees = parseSimulationFees(simulation, transaction.fee);
-  const hasReturnValue =
-    simulation?.result &&
-    Object.prototype.hasOwnProperty.call(simulation.result, "retval");
-  return {
-    ...fees,
-    error:
-      fees.error || (hasReturnValue ? null : "Simulation returned no result."),
-    returnValue:
-      fees.error || !hasReturnValue
-        ? null
-        : StellarSdk.scValToNative(simulation.result.retval),
-  };
-}
-
-/**
- * Check in a builder: builds + simulates a Soroban `register(caller, name)`
- * invoke, lets Freighter sign it, then submits via Soroban RPC and waits for
- * on-chain confirmation.
- *
- * @returns {{ hash: string, returnValue: unknown, confirmed: boolean }}
- */
-export async function registerBuilderWithFreighter(
-  publicKey,
-  contractId,
-  name
-) {
-  const trimmed = (name || "").trim();
-  if (!trimmed) {
-    throw new Error("Enter a builder name to register.");
-  }
-  if ([...trimmed].length > 64) {
-    throw new Error("Builder name must be 64 characters or fewer.");
-  }
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
-  }
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error(
-      "Contract ID must be a valid Soroban contract strkey (C…)."
-    );
-  }
-
-  const contract = new StellarSdk.Contract(contractId);
-  const sourceAccount = await sorobanRpc.getAccount(publicKey);
-  const transaction = buildContractTx(
-    contract,
-    "register",
-    [
-      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
-      StellarSdk.nativeToScVal(trimmed, { type: "string" }),
-    ],
-    sourceAccount
-  );
-
-  // Simulation fills in auth entries + resource fees for the invoke.
-  const prepared = await sorobanRpc.prepareTransaction(transaction);
-  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
-  const sendResult = await sorobanRpc.sendTransaction(signedTx);
-
-  if (sendResult.status === "ERROR") {
-    throw new Error(
-      `Contract invoke rejected by the network. Tx hash: ${sendResult.hash}`
-    );
-  }
-
-  // RPC submission is asynchronous: poll getTransaction until applied.
-  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
-    const status = await sorobanRpc.getTransaction(sendResult.hash);
-    if (status.status === "SUCCESS") {
-      return {
-        hash: sendResult.hash,
-        confirmed: true,
-      };
-    }
-    if (status.status === "FAILED") {
-      throw new Error(
-        `Contract invoke failed on-chain. Tx hash: ${sendResult.hash}`
-      );
-    }
-    await sleep(POLL_INTERVAL_MS);
-  }
-
-  // Still pending after the polling window; the tx may land shortly.
-  return { hash: sendResult.hash, confirmed: false };
-  // Simulation only: the user still has to press Sign to submit.
-  const simulation = await sorobanRpc.simulateTransaction(transaction);
-  return parseSimulationFees(simulation, transaction.fee);
 }
 
 /**
@@ -590,14 +538,52 @@ export async function registerBuilderWithFreighter(
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
     throw new Error("Connect a valid Freighter address first.");
   }
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
 
-  await assertFreighterNetwork(expectedPassphrase);
+  if (expectedPassphrase !== currentPassphrase()) {
+    throw new Error("The selected network does not match the contract network.");
+  }
+  await assertFreighterNetworkMatches();
 
-  return kitewellClient(contractId).register(
-    publicKey,
-    trimmed,
-    freighterSigner(publicKey)
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = buildContractTx(
+    contract,
+    "register",
+    [
+      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
+      StellarSdk.nativeToScVal(trimmed, { type: "string" }),
+    ],
+    sourceAccount
   );
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `Contract invoke rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return { hash: sendResult.hash, confirmed: true };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(
+        `Contract invoke failed on-chain. Tx hash: ${sendResult.hash}`
+      );
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  return { hash: sendResult.hash, confirmed: false };
 }
 
 /**
@@ -1487,20 +1473,70 @@ export async function allowTrustWithFreighter(
   return signAndSubmit(transaction, publicKey);
 }
 
-/**
- * Update an issuer's home domain and/or auth flags with `setOptions`, signed by
- * the connected account. Validation (including the immutable confirmation
- * gate) lives in `buildSetOptionsBody`, so an unsafe combination never reaches
- * Freighter.
- */
-export async function setAccountOptionsWithFreighter(publicKey, options = {}) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
-  }
-}
-
 async function dryRunPaymentTransaction(transaction) {
   if (typeof fetch !== "function") return;
+
+  const network = getActiveNetwork();
+  if (!network?.horizonUrl) return;
+
+  try {
+    const endpoint = new URL("transactions", `${network.horizonUrl}/`);
+    endpoint.searchParams.set("dry_run", "true");
+
+    const response = await fetch(endpoint.toString(), {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ tx: transaction.toXDR() }).toString(),
+    });
+
+    if ([404, 405, 501].includes(response.status)) return;
+
+    let result = null;
+    try {
+      result = await response.json();
+    } catch {
+      result = null;
+    }
+
+    if (response.ok) return;
+
+    const resultCodes = result?.extras?.result_codes;
+    const transactionCode =
+      resultCodes?.transaction || result?.transaction_result_code;
+    const horizonRejected =
+      !response.ok &&
+      ([400, 422].includes(response.status) ||
+        Boolean(resultCodes || result?.transaction_result_code));
+    const operationCodes = Array.isArray(resultCodes?.operations)
+      ? resultCodes.operations.filter(Boolean).join(", ")
+      : null;
+    const unsuccessfulDryRun = Boolean(
+      transactionCode &&
+        transactionCode !== "tx_success" &&
+        transactionCode !== "success"
+    );
+
+    if (!horizonRejected && !unsuccessfulDryRun) return;
+
+    throw new Error(
+      `Horizon rejected this payment${
+        transactionCode
+          ? ` (${transactionCode}${
+              operationCodes ? `: ${operationCodes}` : ""
+            })`
+          : ""
+      }.`
+    );
+  } catch (error) {
+    if (error?.message?.startsWith("Horizon rejected this payment")) {
+      throw error;
+    }
+    // The endpoint or parameter is not exposed; fee calculation + review still work.
+  }
+}
 
 function eventContractId(event) {
   const id = event?.contractId;
