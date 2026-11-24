@@ -1,5 +1,8 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { describeFriendbotResult } from "./friendbotResult";
+import { parseHexDataValue } from "./dataHex";
+import { checkPathPaymentDestination, validateStrictReceiveCap } from "./pathPaymentGuards";
 import {
   checkFreighterInstalled,
   connectFreighterWallet,
@@ -268,6 +271,7 @@ export default function App() {
   const [loadingOffers, setLoadingOffers] = useState(false);
   const [pathResult, setPathResult] = useState(null);
   const [pathQuote, setPathQuote] = useState(null);
+  const [friendbotResult, setFriendbotResult] = useState(null);
   const [unsignedEnvelope, setUnsignedEnvelope] = useState(null);
   const [signingConfirmationOpen, setSigningConfirmationOpen] = useState(false);
   const [labInfo, setLabInfo] = useState(null);
@@ -643,7 +647,11 @@ export default function App() {
 
     setLoading("data-set");
     try {
-      await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
+      await manageDataWithFreighter(
+        publicKey,
+        dataForm.name,
+        dataForm.hex ? parseHexDataValue(dataForm.value) : dataForm.value
+      );
       setDataForm({ name: "", value: "" });
       await refreshAccountDetails();
       showToast("Account data submitted.");
@@ -683,7 +691,11 @@ export default function App() {
     if (!dataForm.name) return showToast("Data name is required.", "error");
     setLoading("data-set");
     try {
-      await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
+      await manageDataWithFreighter(
+        publicKey,
+        dataForm.name,
+        dataForm.hex ? parseHexDataValue(dataForm.value) : dataForm.value
+      );
       setDataForm({ name: "", value: "" });
       await refreshAccountDetails();
       showToast("Account data submitted.");
@@ -992,10 +1004,12 @@ export default function App() {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     setLoading("fund");
     try {
-      await fundWithFriendbot(publicKey);
+      setFriendbotResult(null);
+      const funded = describeFriendbotResult(await fundWithFriendbot(publicKey));
+      setFriendbotResult(funded);
       const next = await getAccountBalances(publicKey);
       setBalances(next);
-      showToast("Funded with Testnet XLM via Friendbot.");
+      showToast(funded.message);
     } catch (e) {
       showToast(e.message || "Funding failed.", "error");
     } finally {
@@ -1451,10 +1465,29 @@ export default function App() {
       return;
     }
 
+    const capCheck = validateStrictReceiveCap({
+      mode: pathForm.mode,
+      sendMax: pathForm.bound,
+      quotes: pathQuote?.paths,
+    });
+    if (!capCheck.ok) {
+      submitGuardRef.current.end("path");
+      return showToast(capCheck.message, "error");
+    }
+
     setLoading("path");
     setTransactionFailure(null);
     setPathResult(null);
     try {
+      const destinationCheck = await checkPathPaymentDestination(
+        pathForm.destination,
+        pathDestAsset
+      );
+      if (!destinationCheck.ok) {
+        const blocked = new Error(destinationCheck.message);
+        blocked.preSign = true;
+        throw blocked;
+      }
       const result = await pathPaymentWithFreighter({
         publicKey,
         destination: pathForm.destination,
@@ -1481,7 +1514,7 @@ export default function App() {
       showToast(`Path payment submitted · ${result.hash.slice(0, 12)}…`);
       startTxWatch(result.hash);
     } catch (err) {
-      trackFailedSubmit("pathPayment", err);
+      if (!err.preSign) trackFailedSubmit("pathPayment", err);
       setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || "Path payment failed.", "error");
     } finally {
@@ -3243,6 +3276,17 @@ export default function App() {
                 <div className="info-box">
                   <span className="eyebrow">Funding address</span>
                   <code>{publicKey}</code>
+                </div>
+              )}
+              {friendbotResult && (
+                <div className="info-box" role="status">
+                  <span className="eyebrow">Friendbot funding</span>
+                  <p className="muted">{friendbotResult.message}</p>
+                  {friendbotResult.hash && (
+                    <a href={friendbotResult.explorerUrl} target="_blank" rel="noreferrer">
+                      <code>{friendbotResult.hash}</code>
+                    </a>
+                  )}
                 </div>
               )}
               <button
