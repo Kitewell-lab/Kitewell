@@ -40,6 +40,7 @@ import {
   getOpenOffers,
   getPendingTransactions,
   getClaimableBalances,
+  getSponsoredTrustlines,
   getLiquidityPool,
   getOrderBook,
   getTransactions,
@@ -142,6 +143,10 @@ export default function App() {
   const [networkId, setNetworkId] = useState(getActiveNetworkId());
   const [freighterInstalled, setFreighterInstalled] = useState(null);
   const [balances, setBalances] = useState([]);
+  const [sponsoredTrustlines, setSponsoredTrustlines] = useState([]);
+  const [sponsoredTrustlinesLoading, setSponsoredTrustlinesLoading] = useState(false);
+  const [sponsoredTrustlinesError, setSponsoredTrustlinesError] = useState(null);
+  const [sponsoredTrustlineRefresh, setSponsoredTrustlineRefresh] = useState(0);
   const [claimableBalances, setClaimableBalances] = useState([]);
   const [liquidityPools, setLiquidityPools] = useState({});
   const [transactions, setTransactions] = useState([]);
@@ -312,7 +317,6 @@ export default function App() {
 
   const xlmBalance = balances.find((b) => b.isNative)?.balance ?? null;
   const assetBalances = balances.filter((b) => !b.isPoolShare);
-  const sponsoredTrustlines = assetBalances.filter((b) => b.sponsor === publicKey);
   const poolShares = poolShareRows(balances, liquidityPools);
   const memoField = MEMO_FIELDS[sendForm.memoType];
   const activeNetwork = NETWORKS[networkId];
@@ -372,6 +376,40 @@ export default function App() {
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
   }, []);
+
+  useEffect(() => {
+    if (!publicKey) return;
+
+    let cancelled = false;
+    const controller = new AbortController();
+
+    Promise.resolve()
+      .then(() => {
+        if (cancelled) return null;
+        setSponsoredTrustlines([]);
+        setSponsoredTrustlinesError(null);
+        setSponsoredTrustlinesLoading(true);
+        return getSponsoredTrustlines(publicKey, { signal: controller.signal });
+      })
+      .then((trustlines) => {
+        if (!cancelled && trustlines) setSponsoredTrustlines(trustlines);
+      })
+      .catch((error) => {
+        if (cancelled || error?.name === "AbortError") return;
+        setSponsoredTrustlines([]);
+        setSponsoredTrustlinesError(
+          error.message || "Could not load sponsored trustlines."
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setSponsoredTrustlinesLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [publicKey, networkId, sponsoredTrustlineRefresh]);
 
   useEffect(() => () => cancelHorizonReads(), []);
 
@@ -568,6 +606,9 @@ export default function App() {
       const address = await connectFreighterWallet();
       setPublicKey(address);
       setBalances([]);
+      setSponsoredTrustlines([]);
+      setSponsoredTrustlinesError(null);
+      setSponsoredTrustlinesLoading(false);
       setOpenOffers([]);
       setOfferPrices({});
       setOfferResult(null);
@@ -594,6 +635,9 @@ export default function App() {
     setFailedSubmits([]);
     setPublicKey(null);
     setBalances([]);
+    setSponsoredTrustlines([]);
+    setSponsoredTrustlinesError(null);
+    setSponsoredTrustlinesLoading(false);
     setOpenOffers([]);
     setOfferPrices({});
     setOfferResult(null);
@@ -614,6 +658,9 @@ export default function App() {
       const next = setActiveNetwork(id);
       setNetworkId(id);
       setBalances([]);
+      setSponsoredTrustlines([]);
+      setSponsoredTrustlinesError(null);
+      setSponsoredTrustlinesLoading(false);
       setOpenOffers([]);
       setOfferPrices({});
       setOfferResult(null);
@@ -831,11 +878,22 @@ export default function App() {
       await revokeTrustlineSponsorshipWithFreighter(
         publicKey,
         asset.code,
-        asset.issuer
+        asset.issuer,
+        asset.holder
       );
-      const next = await getAccountBalances(publicKey);
-      setBalances(next);
+      setSponsoredTrustlineRefresh((refresh) => refresh + 1);
       showToast(`${asset.code} sponsorship revoked.`);
+      try {
+        const next = await getAccountBalances(publicKey);
+        setBalances(next);
+      } catch (refreshError) {
+        showToast(
+          `Sponsorship was revoked, but balances could not be refreshed: ${
+            refreshError.message || "unknown error"
+          }`,
+          "error"
+        );
+      }
     } catch (err) {
       trackFailedSubmit("revokeSponsorship", err);
       showToast(err.message || `Could not revoke the ${asset.code} sponsorship.`, "error");
@@ -2250,7 +2308,11 @@ export default function App() {
 
               <div className="section">
                 <h3 className="subhead">Trustlines you sponsor</h3>
-                {sponsoredTrustlines.length === 0 ? (
+                {sponsoredTrustlinesLoading ? (
+                  <p className="muted">Loading sponsored trustlines…</p>
+                ) : sponsoredTrustlinesError ? (
+                  <p className="muted">{sponsoredTrustlinesError}</p>
+                ) : sponsoredTrustlines.length === 0 ? (
                   <p className="muted">You are not sponsoring any trustlines.</p>
                 ) : (
                   <ul className="balance-list">
@@ -2260,6 +2322,11 @@ export default function App() {
                           <strong>{asset.code}</strong>
                           <span className="muted balance-row__issuer">
                             {shortenAddress(asset.issuer)}
+                          </span>
+                          <span className="muted balance-row__issuer">
+                            {asset.holder === publicKey
+                              ? "Held by connected account"
+                              : `Held by ${shortenAddress(asset.holder)}`}
                           </span>
                         </div>
                         <button

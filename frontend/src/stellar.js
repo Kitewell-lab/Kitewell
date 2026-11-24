@@ -598,6 +598,53 @@ export async function getAccountBalances(publicKey, options = {}) {
   }, options);
 }
 
+/** Load trustlines whose subentry sponsorship is provided by `publicKey`. */
+export async function getSponsoredTrustlines(publicKey, options = {}) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  return withHorizon429Backoff(async () => {
+    let page = await getServer()
+      .accounts()
+      .sponsor(publicKey)
+      .limit(200)
+      .call();
+    const trustlines = [];
+
+    while (page.records.length > 0) {
+      for (const account of page.records) {
+        const holder = account.account_id ?? account.id;
+        if (!holder) {
+          throw new Error("Horizon returned a sponsored account without an ID.");
+        }
+
+        for (const balance of account.balances || []) {
+          if (
+            balance.sponsor !== publicKey ||
+            !balance.asset_code ||
+            !balance.asset_issuer
+          ) {
+            continue;
+          }
+
+          trustlines.push({
+            key: `${holder}:${balance.asset_code}:${balance.asset_issuer}`,
+            holder,
+            code: balance.asset_code,
+            issuer: balance.asset_issuer,
+          });
+        }
+      }
+
+      if (page.records.length < 200) break;
+      page = await page.next();
+    }
+
+    return trustlines;
+  }, options);
+}
+
 export async function getAccountDetails(publicKey, options = {}) {
   if (backendIsUsable()) {
     try {
@@ -607,16 +654,6 @@ export async function getAccountDetails(publicKey, options = {}) {
     }
   }
 
-  const account = await getServer().loadAccount(publicKey);
-  return {
-    id: account.id,
-    sequence: account.sequenceNumber(),
-    subentryCount: account.subentry_count,
-    thresholds: account.thresholds,
-    signers: account.signers,
-    balances: mapHorizonBalances(account),
-    explorerUrl: explorerAccountUrl(publicKey),
-  };
   return withHorizon429Backoff(async () => {
     const account = await getServer().loadAccount(publicKey);
     const baseReserve = await readBaseReserve();
@@ -625,6 +662,7 @@ export async function getAccountDetails(publicKey, options = {}) {
       sequence: account.sequenceNumber(),
       subentryCount: account.subentry_count,
       thresholds: account.thresholds,
+      signers: account.signers,
       balances: mapHorizonBalances(account, baseReserve),
       explorerUrl: explorerAccountUrl(publicKey),
     };

@@ -696,13 +696,17 @@ export async function changeTrustWithFreighter(
 export async function revokeTrustlineSponsorshipWithFreighter(
   publicKey,
   assetCode,
-  assetIssuer
+  assetIssuer,
+  trustlineAccount = publicKey
 ) {
   if (!assetCode || assetCode.length > 12) {
     throw new Error("Asset code must be 1–12 characters.");
   }
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(assetIssuer)) {
     throw new Error("Issuer must be a valid Stellar public key (G…).");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(trustlineAccount)) {
+    throw new Error("Trustline account must be a valid Stellar public key (G…).");
   }
 
   const asset = new StellarSdk.Asset(assetCode.toUpperCase(), assetIssuer);
@@ -713,7 +717,7 @@ export async function revokeTrustlineSponsorshipWithFreighter(
   })
     .addOperation(
       StellarSdk.Operation.revokeTrustlineSponsorship({
-        account: publicKey,
+        account: trustlineAccount,
         asset,
       })
     )

@@ -91,6 +91,20 @@ describe("changeTrustWithFreighter", () => {
     expect(operations[0].asset.getIssuer()).toBe(ISSUER);
   });
 
+  it("uses the holder account for a trustline sponsored on another account", async () => {
+    const holder = StellarSdk.Keypair.random().publicKey();
+    await revokeTrustlineSponsorshipWithFreighter(
+      SOURCE,
+      "usdc",
+      ISSUER,
+      holder
+    );
+
+    const operation = submitTransactionMock.mock.calls[0][0].operations[0];
+    expect(loadAccountMock).toHaveBeenCalledWith(SOURCE);
+    expect(operation.account).toBe(holder);
+  });
+
   it("rejects an invalid issuer before submitting", async () => {
     await expect(
       changeTrustWithFreighter(SOURCE, "USDC", "not-a-key", "0")
