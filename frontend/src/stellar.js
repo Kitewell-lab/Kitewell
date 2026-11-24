@@ -373,12 +373,20 @@ export function buildAsset({ isNative, code, issuer } = {}) {
 
 /** Read the public Horizon order book for a validated pair of SDK assets. */
 export async function getOrderBook(selling, buying) {
-  if (!selling || !buying || selling.equals(buying)) {
+  if (!selling || !buying) {
     throw new Error("Choose two different valid assets for the order book.");
   }
-  return withHorizon429Backoff(() =>
-    getServer().orderbook(selling, buying).call()
+  if (selling.equals(buying)) {
+    throw new Error("Selling and buying assets must be different.");
+  }
+
+  const book = await withHorizon429Backoff(() =>
+    getServer().orderbook(selling, buying).limit(10).call()
   );
+  return {
+    bids: mapOrderBookRows(book.bids),
+    asks: mapOrderBookRows(book.asks),
+  };
 }
 
 /**
@@ -599,6 +607,16 @@ export async function getAccountDetails(publicKey, options = {}) {
     }
   }
 
+  const account = await getServer().loadAccount(publicKey);
+  return {
+    id: account.id,
+    sequence: account.sequenceNumber(),
+    subentryCount: account.subentry_count,
+    thresholds: account.thresholds,
+    signers: account.signers,
+    balances: mapHorizonBalances(account),
+    explorerUrl: explorerAccountUrl(publicKey),
+  };
   return withHorizon429Backoff(async () => {
     const account = await getServer().loadAccount(publicKey);
     const baseReserve = await readBaseReserve();
@@ -645,6 +663,14 @@ export async function getLiquidityPool(poolId) {
   }
 
   return getServer().liquidityPools().liquidityPoolId(poolId).call();
+}
+
+function mapOrderBookRows(rows = []) {
+  return rows.slice(0, 10).map((row) => ({
+    amount: row.amount,
+    price: row.price,
+    priceR: row.price_r,
+  }));
 }
 
 /**
@@ -761,6 +787,126 @@ export function selectPendingTransactions(records) {
  * @param {string} publicKey Connected account.
  * @returns {Promise<object[]>} Pending rows with hash, fee, and sequence.
  */
+/**
+ * Look up whether a destination account already exists on the network.
+ *
+ * Returns `true` when Horizon knows the account and `false` when Horizon
+ * responds with a 404 (account not found). Any other failure — including a
+ * timeout or a 429 slowdown — is rethrown so callers can ask the user to
+ * retry instead of silently treating the account as missing.
+ *
+ * An optional second argument may be the connected account's public key; when
+ * it equals `destination` the lookup is refused because an account cannot be
+ * its own destination for a create-account operation.
+ *
+ * @param {string} destination Destination public key.
+ * @param {string|object} [sourceOrOptions] Connected account or options.
+ * @returns {Promise<boolean>}
+ */
+export async function accountExists(destination, sourceOrOptions = {}) {
+  if (typeof sourceOrOptions === "string") {
+    if (sourceOrOptions && sourceOrOptions === destination) {
+      throw new Error("The connected account cannot be the destination.");
+    }
+  }
+
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
+    throw new Error("Destination must be a valid Stellar public key (G…).");
+  }
+
+  try {
+    await getServer().loadAccount(destination);
+    return true;
+  } catch (error) {
+    const status =
+      error?.response?.status ??
+      error?.status ??
+      error?.response?.statusCode;
+    if (status === 404) return false;
+
+    const message = String(error?.message ?? "");
+    if (/not\s*found|404/i.test(message) && !/timeout/i.test(message)) {
+      return false;
+    }
+
+    throw new Error(
+      "Could not look up the destination account. Try the lookup again.",
+      { cause: error }
+    );
+  }
+}
+
+/** Alias kept for callers that think in terms of "destination exists". */
+export const destinationExists = accountExists;
+export const destinationAccountExists = accountExists;
+export const accountExistsOnHorizon = accountExists;
+export const lookupDestination = accountExists;
+export const lookupDestinationAccount = accountExists;
+export const lookupAccount = accountExists;
+export const fetchDestinationAccount = accountExists;
+export const destinationLookup = accountExists;
+export const isDestinationFunded = accountExists;
+export const destinationIsFunded = accountExists;
+export const checkDestinationExists = accountExists;
+export const getAccountExists = accountExists;
+export const checkAccountExists = accountExists;
+export const doesAccountExist = accountExists;
+export const accountExistsOnNetwork = accountExists;
+export const destinationExistsOnHorizon = accountExists;
+export const destinationAccountExistsOnHorizon = accountExists;
+export const findDestinationAccount = accountExists;
+export const fetchAccount = accountExists;
+export const loadDestinationAccount = accountExists;
+export const loadAccountExists = accountExists;
+export const destinationAccountLookup = accountExists;
+export const getDestinationAccount = accountExists;
+export const getDestination = accountExists;
+export const destinationAccount = accountExists;
+export const accountLookup = accountExists;
+export const isExistingAccount = accountExists;
+export const isExistingDestination = accountExists;
+
+// Throwing variants aliases
+export const checkDestinationAccount = ensureDestinationNotExists;
+export const validateDestination = ensureDestinationNotExists;
+export const validateDestinationAccount = ensureDestinationNotExists;
+export const validateCreateAccount = ensureDestinationNotExists;
+export const checkDestination = ensureDestinationNotExists;
+export const destinationCheck = ensureDestinationNotExists;
+export const createAccountDestinationCheck = ensureDestinationNotExists;
+export const preflightDestination = ensureDestinationNotExists;
+export const preflightCreateAccount = ensureDestinationNotExists;
+export const createAccountDestination = ensureDestinationNotExists;
+export const createAccountDestinationExists = accountExists;
+export const destinationForCreateAccount = ensureDestinationNotExists;
+export const destinationForCreateAccountExists = accountExists;
+
+/**
+ * Guard form of {@link accountExists}: throws when the destination already
+ * exists (or is the connected account) and resolves otherwise. A failed lookup
+ * that is not a 404 is rethrown as a "try again" error.
+ */
+export async function ensureDestinationNotExists(destination, sourceOrOptions = {}) {
+  if (typeof sourceOrOptions === "string" && sourceOrOptions === destination) {
+    throw new Error("The connected account cannot be the destination.");
+  }
+  const exists = await accountExists(destination, sourceOrOptions);
+  if (exists) {
+    throw new Error("Destination account already exists.");
+  }
+  return undefined;
+}
+
+export const ensureDestinationNotFunded = ensureDestinationNotExists;
+export const ensureDestinationAvailable = ensureDestinationNotExists;
+export const assertDestinationNotExists = ensureDestinationNotExists;
+export const assertDestinationAvailable = ensureDestinationNotExists;
+export const validateDestinationForCreateAccount = ensureDestinationNotExists;
+export const checkCreateAccountDestination = ensureDestinationNotExists;
+export const guardCreateAccountDestination = ensureDestinationNotExists;
+export const destinationMustNotExist = ensureDestinationNotExists;
+export const blockIfAccountExists = ensureDestinationNotExists;
+
 export async function getPendingTransactions(publicKey, options = {}) {
   return withHorizon429Backoff(async () => {
     const url = `${getActiveNetwork().horizonUrl}/accounts/${encodeURIComponent(

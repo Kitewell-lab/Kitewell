@@ -4,6 +4,7 @@ import {
   connectFreighterWallet,
   buildPaymentEnvelope,
   submitEnvelopeWithFreighter,
+  sendPaymentWithFreighter,
   pathPaymentWithFreighter,
   changeOfferPriceWithFreighter,
   changeTrustWithFreighter,
@@ -33,12 +34,14 @@ import {
 } from "./addressFormat";
 import {
   fundWithFriendbot,
+  buildAsset,
   getAccountBalances,
   getAccountDetails,
   getOpenOffers,
   getPendingTransactions,
   getClaimableBalances,
   getLiquidityPool,
+  getOrderBook,
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
@@ -47,7 +50,6 @@ import {
   statusWatchHref,
   getAccountAuthConfig,
   getIssuedAssetTrustlines,
-  getOrderBook,
   IMMUTABLE_CONFIRMATION,
 } from "./stellar";
 import {
@@ -68,6 +70,7 @@ import {
   setActiveNetwork,
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
+import { checkThresholds } from "./thresholdCheck";
 import { decodeTransactionEnvelope } from "./txInspector";
 import TransactionHashLookup from "./TransactionHashLookup";
 import { completeWebAuthChallenge } from "./sep10WebAuth";
@@ -89,6 +92,7 @@ const TABS = [
   "Issuer",
   "Send",
   "Path",
+  "Offer",
   "Book",
   "History",
   "Pending",
@@ -98,6 +102,7 @@ const TABS = [
   "Web auth",
   "Muxed",
   "Lab",
+  "Issue",
 ];
 const PENDING_REFRESH_MS = 8000;
 const EVENT_POLL_MS = 6000;
@@ -173,7 +178,23 @@ export default function App() {
     destIssuer: "",
     path: "",
   });
+  const [issueForm, setIssueForm] = useState({
+    code: "",
+    destination: "",
+    amount: "",
+  });
   const [pathResult, setPathResult] = useState(null);
+  const [offerForm, setOfferForm] = useState({
+    sellingType: "native",
+    sellingCode: "",
+    sellingIssuer: "",
+    buyingType: "credit",
+    buyingCode: "",
+    buyingIssuer: "",
+    price: "",
+  });
+  const [orderBook, setOrderBook] = useState(null);
+  const [orderBookError, setOrderBookError] = useState(null);
   const [bookPair, setBookPair] = useState(readStoredOrderBookPair);
   const [bookResult, setBookResult] = useState(null);
   const bookClearGenerationRef = useRef(0);
@@ -199,6 +220,7 @@ export default function App() {
   const tabRefs = useRef([]);
   const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
+  const [selectedSigners, setSelectedSigners] = useState([]);
   const [horizonNotice, setHorizonNotice] = useState(null);
   const [failedSubmits, setFailedSubmits] = useState([]);
   const failedSubmitLogRef = useRef(createFailedSubmitLog());
@@ -297,6 +319,7 @@ export default function App() {
   const friendbotAvailable = isFriendbotAvailable();
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
   const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
+  const updateOfferForm = (changes) => setOfferForm((prev) => ({ ...prev, ...changes }));
   // Any edit changes the operation list, so the previewed envelope is stale.
   const updateSendForm = (changes) => {
     setSendForm((prev) => ({ ...prev, ...changes }));
@@ -336,6 +359,15 @@ export default function App() {
       });
     return () => { cancelled = true; };
   }, [activeTab, bookPair, bookKey]);
+
+  const getOfferAsset = (side) => {
+    const type = offerForm[`${side}Type`];
+    return buildAsset({
+      isNative: type === "native",
+      code: offerForm[`${side}Code`],
+      issuer: offerForm[`${side}Issuer`],
+    });
+  };
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -569,6 +601,7 @@ export default function App() {
     setPendingTransactions([]);
     setPendingError(null);
     setAccountDetails(null);
+    setSelectedSigners([]);
     setIssuerConfig(null);
     setIssuedTrustlines([]);
     showToast("Disconnected.");
@@ -680,6 +713,46 @@ export default function App() {
     } catch (err) {
       trackFailedSubmit("changeTrust", err);
       showToast(err.message || "Change trust failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleIssue = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    let code;
+    let amount;
+    try {
+      code = validateAssetCode(issueForm.code);
+      amount = validatePaymentAmount(issueForm.amount, "Issuance amount");
+    } catch (err) {
+      return showToast(err.message, "error");
+    }
+
+    if (!issueForm.destination.trim()) {
+      return showToast("Holder account is required.", "error");
+    }
+
+    setLoading("issue");
+    try {
+      const result = await sendPaymentWithFreighter(
+        publicKey,
+        issueForm.destination.trim(),
+        amount,
+        { isNative: false, code, issuer: publicKey }
+      );
+      setIssueForm({ code: "", destination: "", amount: "" });
+      showToast(
+        `Issued ${amount} ${code} · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+      startTxWatch(result.hash);
+    } catch (err) {
+      trackFailedSubmit("issue", err);
+      showToast(err.message || "Issue failed.", "error");
     } finally {
       setLoading("");
     }
@@ -968,6 +1041,25 @@ export default function App() {
     }
   };
 
+  const handleOrderBook = async (e) => {
+    e.preventDefault();
+    setLoading("order-book");
+    setOrderBookError(null);
+    setOrderBook(null);
+    try {
+      const book = await getOrderBook(getOfferAsset("selling"), getOfferAsset("buying"));
+      setOrderBook(book);
+    } catch (error) {
+      setOrderBookError(
+        error.message === "Selling and buying assets must be different."
+          ? error.message
+          : "The order book could not be read. Try again in a moment."
+      );
+    } finally {
+      setLoading("");
+    }
+  };
+
   const handleOfferPriceChange = async (event, offer) => {
     event.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -992,6 +1084,11 @@ export default function App() {
     } finally {
       setLoading("");
     }
+  };
+
+  const selectBookPrice = (row) => {
+    const price = row.price ?? (Number(row.priceR?.n) / Number(row.priceR?.d)).toString();
+    updateOfferForm({ price });
   };
 
   const handleHistory = async () => {
@@ -1578,7 +1675,11 @@ export default function App() {
         <p className="muted" id="watch-tx-hash-help" role={hashError ? "alert" : undefined}>
           {hashError || "Paste any transaction hash from this network to follow it."}
         </p>
-        <button className="btn btn--primary" type="submit">
+        <button
+          className="btn btn--primary"
+          type="submit"
+          disabled={loading === "issue"}
+        >
           Watch status
         </button>
       </form>
@@ -1809,9 +1910,9 @@ export default function App() {
                         <div>
                           <span className="metadata-label">Thresholds</span>
                           <span className="metadata-value">
-                            {accountDetails.thresholds?.low ? accountDetails.thresholds.low : "—"},
-                            {accountDetails.thresholds?.medium ? accountDetails.thresholds.medium : "—"},
-                            {accountDetails.thresholds?.high ? accountDetails.thresholds.high : "—"}
+                            {accountDetails.thresholds?.low_threshold ?? "—"},{" "}
+                            {accountDetails.thresholds?.med_threshold ?? "—"},{" "}
+                            {accountDetails.thresholds?.high_threshold ?? "—"}
                           </span>
                         </div>
                       </div>
@@ -1824,6 +1925,116 @@ export default function App() {
                       >
                         StellarExpert ↗
                       </a>
+                    </div>
+                  )}
+                  {accountDetails?.signers && accountDetails.signers.length > 0 && (
+                    <div className="info-box">
+                      <span className="eyebrow">Signers & thresholds</span>
+                      <p className="muted" style={{ marginBottom: 12 }}>
+                        Tick signers to check if they meet the low, medium, and high thresholds.
+                      </p>
+                      <div style={{ marginBottom: 12 }}>
+                        {accountDetails.signers
+                          .filter((s) => s.weight > 0)
+                          .map((signer) => (
+                            <label
+                              key={signer.key}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                marginBottom: 8,
+                                cursor: "pointer",
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={selectedSigners.includes(signer.key)}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedSigners([...selectedSigners, signer.key]);
+                                  } else {
+                                    setSelectedSigners(
+                                      selectedSigners.filter((k) => k !== signer.key)
+                                    );
+                                  }
+                                }}
+                                style={{ cursor: "pointer" }}
+                              />
+                              <code style={{ flex: 1 }}>{shortenAddress(signer.key)}</code>
+                              <span className="muted">
+                                weight: {signer.weight}
+                                {signer.key === publicKey && " (master)"}
+                              </span>
+                            </label>
+                          ))}
+                      </div>
+                      {(() => {
+                        const thresholds = {
+                          low: accountDetails.thresholds?.low_threshold || 0,
+                          medium: accountDetails.thresholds?.med_threshold || 0,
+                          high: accountDetails.thresholds?.high_threshold || 0,
+                        };
+                        const result = checkThresholds(
+                          accountDetails.signers,
+                          selectedSigners,
+                          thresholds
+                        );
+                        return (
+                          <>
+                            <div style={{ marginBottom: 12 }}>
+                              <div className="metadata-grid">
+                                <div>
+                                  <span className="metadata-label">
+                                    Low ({thresholds.low})
+                                  </span>
+                                  <span
+                                    className="metadata-value"
+                                    style={{ color: result.low ? "#4ade80" : "#f87171" }}
+                                  >
+                                    {result.low ? "✓ Pass" : "✗ Fail"}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="metadata-label">
+                                    Medium ({thresholds.medium})
+                                  </span>
+                                  <span
+                                    className="metadata-value"
+                                    style={{ color: result.medium ? "#4ade80" : "#f87171" }}
+                                  >
+                                    {result.medium ? "✓ Pass" : "✗ Fail"}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="metadata-label">
+                                    High ({thresholds.high})
+                                  </span>
+                                  <span
+                                    className="metadata-value"
+                                    style={{ color: result.high ? "#4ade80" : "#f87171" }}
+                                  >
+                                    {result.high ? "✓ Pass" : "✗ Fail"}
+                                  </span>
+                                </div>
+                              </div>
+                              <div style={{ marginTop: 8 }}>
+                                <span className="metadata-label">Selected weight total</span>
+                                <span className="metadata-value"> {result.totalWeight}</span>
+                              </div>
+                            </div>
+                            {!result.canMeetHigh && (
+                              <div className="info-box info-box--warning" style={{ marginTop: 0 }}>
+                                <span className="eyebrow">⚠ Account locked out</span>
+                                <p className="muted">
+                                  No combination of existing signers can meet the high threshold.
+                                  The account cannot perform high-threshold operations.
+                                </p>
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
                     </div>
                   )}
                   <button className="btn btn--secondary" type="button" onClick={handleDisconnect}>
@@ -2784,6 +2995,67 @@ export default function App() {
             </div>
           )}
 
+          {activeTab === "Offer" && (
+            <div className="section">
+              <h2>Price an offer</h2>
+              <p className="muted">
+                Read the live order book before pricing an offer. Selecting a row only fills the
+                price; nothing is signed or submitted.
+              </p>
+              <form onSubmit={handleOrderBook} className="form">
+                <label className="label" htmlFor="offer-selling-type">Selling asset</label>
+                <select id="offer-selling-type" className="input" value={offerForm.sellingType}
+                  onChange={(e) => updateOfferForm({ sellingType: e.target.value })}>
+                  <option value="native">XLM (native)</option>
+                  <option value="credit">Credit asset</option>
+                </select>
+                {offerForm.sellingType === "credit" && <>
+                  <input className="input" placeholder="Selling asset code, e.g. USDC" maxLength={12}
+                    value={offerForm.sellingCode} onChange={(e) => updateOfferForm({ sellingCode: e.target.value })} required />
+                  <input className="input" placeholder="Selling asset issuer G…"
+                    value={offerForm.sellingIssuer} onChange={(e) => updateOfferForm({ sellingIssuer: e.target.value })} required />
+                </>}
+                <label className="label" htmlFor="offer-buying-type">Buying asset</label>
+                <select id="offer-buying-type" className="input" value={offerForm.buyingType}
+                  onChange={(e) => updateOfferForm({ buyingType: e.target.value })}>
+                  <option value="native">XLM (native)</option>
+                  <option value="credit">Credit asset</option>
+                </select>
+                {offerForm.buyingType === "credit" && <>
+                  <input className="input" placeholder="Buying asset code, e.g. USDC" maxLength={12}
+                    value={offerForm.buyingCode} onChange={(e) => updateOfferForm({ buyingCode: e.target.value })} required />
+                  <input className="input" placeholder="Buying asset issuer G…"
+                    value={offerForm.buyingIssuer} onChange={(e) => updateOfferForm({ buyingIssuer: e.target.value })} required />
+                </>}
+                <label className="label" htmlFor="offer-price">Offer price (buying per selling)</label>
+                <input id="offer-price" className="input" type="number" min="0" step="any"
+                  value={offerForm.price} onChange={(e) => updateOfferForm({ price: e.target.value })}
+                  placeholder="Choose a bid or ask below" />
+                <button className="btn btn--primary" type="submit" disabled={loading === "order-book"}>
+                  {loading === "order-book" ? <><Spinner /> Loading book…</> : "Load order book"}
+                </button>
+              </form>
+              {orderBookError && <div className="info-box info-box--warning" role="alert">
+                <span className="eyebrow">Order book</span><p className="muted">{orderBookError}</p>
+              </div>}
+              {orderBook && <div className="order-book" aria-label="Order book">
+                {[['Bids', orderBook.bids], ['Asks', orderBook.asks]].map(([label, rows]) => (
+                  <div key={label} className="order-book__side">
+                    <h3 className="subhead">{label}</h3>
+                    {rows.length === 0 ? <p className="muted">No {label.toLowerCase()} available.</p> : (
+                      <div className="order-book__rows">
+                        {rows.map((row, index) => <button key={`${label}-${index}`} type="button"
+                          className="order-book__row" onClick={() => selectBookPrice(row)}>
+                          <span>{row.price}</span><span>{row.amount}</span>
+                        </button>)}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                <div className="order-book__header"><span>Price</span><span>Amount</span></div>
+              </div>}
+            </div>
+          )}
           {activeTab === "Book" && (
             <div className="section">
               <div className="section__row">
@@ -3428,6 +3700,74 @@ export default function App() {
               </div>
 
               {txWatchPanel}
+            </div>
+          )}
+
+          {activeTab === "Issue" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Issue Credit Asset</h2>
+                <p className="muted">
+                  Send a new credit asset from your issuer account to a holder.
+                </p>
+              </div>
+              {publicKey ? (
+                <form className="form" onSubmit={handleIssue}>
+                  <label className="label" htmlFor="issue-asset-code">
+                    Asset code
+                  </label>
+                  <input
+                    id="issue-asset-code"
+                    className="input"
+                    value={issueForm.code}
+                    onChange={(e) =>
+                      setIssueForm({ ...issueForm, code: e.target.value })
+                    }
+                    placeholder="e.g. MYASSET"
+                    maxLength={12}
+                    required
+                  />
+                  <label className="label" htmlFor="issue-destination">
+                    Holder account
+                  </label>
+                  <input
+                    id="issue-destination"
+                    className="input"
+                    type="text"
+                    placeholder="G…"
+                    value={issueForm.destination}
+                    onChange={(e) =>
+                      setIssueForm({ ...issueForm, destination: e.target.value })
+                    }
+                    required
+                  />
+                  <label className="label" htmlFor="issue-amount">
+                    Amount to issue
+                  </label>
+                  <input
+                    id="issue-amount"
+                    className="input"
+                    type="number"
+                    min="0.0000001"
+                    step="0.0000001"
+                    placeholder="e.g. 1000000"
+                    value={issueForm.amount}
+                    onChange={(e) =>
+                      setIssueForm({ ...issueForm, amount: e.target.value })
+                    }
+                    required
+                  />
+                  <p className="muted">
+                    The holder must already have a trustline for this asset.
+                    Connected issuer: <code>{publicKey}</code>
+                  </p>
+                  <button className="btn btn--primary" type="submit">
+                    {loading === "issue" ? "Issuing…" : "Issue to holder"}
+                  </button>
+                </form>
+              ) : (
+                <p className="muted">Connect Freighter to issue an asset.</p>
+              )}
             </div>
           )}
 

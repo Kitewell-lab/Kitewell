@@ -483,6 +483,53 @@ body {
   flex-direction: column;
   gap: 8px;
 }
+
+.order-book {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 24px;
+}
+
+.order-book__side {
+  min-width: 0;
+}
+
+.order-book__rows {
+  display: grid;
+  gap: 4px;
+}
+
+.order-book__row {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+.order-book__row:hover,
+.order-book__row:focus-visible {
+  border-color: var(--accent);
+  background: var(--surface-raised);
+}
+
+.order-book__header {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  display: flex;
+  justify-content: space-between;
+  padding: 0 10px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
 .balance-row {
   display: flex;
   justify-content: space-between;

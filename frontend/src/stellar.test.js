@@ -31,14 +31,16 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
       Server: vi.fn(function () {
         return {
           loadAccount: loadAccountMock,
-          orderbook: (selling, buying) => ({
-            call: () => orderBookCallMock(selling, buying),
-          }),
           payments: () => ({
             forAccount: () => ({
               limit: () => ({
                 order: () => ({ call: paymentsCallMock }),
               }),
+            }),
+          }),
+          orderbook: (selling, buying) => ({
+            limit: () => ({
+              call: () => orderBookCallMock(selling, buying),
             }),
           }),
           claimableBalances: () => ({
@@ -166,6 +168,36 @@ describe("asset + path helpers", () => {
   });
 });
 
+describe("getOrderBook", () => {
+  const issuer = StellarSdk.Keypair.random().publicKey();
+
+  it("limits and maps fixture bids and asks", async () => {
+    orderBookCallMock.mockResolvedValue({
+      bids: Array.from({ length: 12 }, (_, index) => ({ amount: `${index + 1}`, price: `${index + 2}` })),
+      asks: [{ amount: "4", price: "1.25" }],
+    });
+
+    await expect(getOrderBook(StellarSdk.Asset.native(), new StellarSdk.Asset("USDC", issuer)))
+      .resolves.toEqual({
+        bids: Array.from({ length: 10 }, (_, index) => ({ amount: `${index + 1}`, price: `${index + 2}`, priceR: undefined })),
+        asks: [{ amount: "4", price: "1.25", priceR: undefined }],
+      });
+    expect(orderBookCallMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a same-asset pair before Horizon", async () => {
+    await expect(getOrderBook(StellarSdk.Asset.native(), StellarSdk.Asset.native()))
+      .rejects.toThrow("Selling and buying assets must be different.");
+    expect(orderBookCallMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves an empty book as empty arrays", async () => {
+    orderBookCallMock.mockResolvedValue({ bids: [], asks: [] });
+    await expect(getOrderBook(StellarSdk.Asset.native(), new StellarSdk.Asset("USDC", issuer)))
+      .resolves.toEqual({ bids: [], asks: [] });
+  });
+});
+
 describe("order book read", () => {
   const issuer = StellarSdk.Keypair.random().publicKey();
 
@@ -175,13 +207,18 @@ describe("order book read", () => {
     const fixture = { asks: [{ price: "2", amount: "10" }], bids: [] };
     orderBookCallMock.mockResolvedValue(fixture);
 
-    await expect(getOrderBook(selling, buying)).resolves.toEqual(fixture);
+    await expect(getOrderBook(selling, buying)).resolves.toEqual({
+      asks: [{ ...fixture.asks[0], priceR: undefined }],
+      bids: [],
+    });
     expect(orderBookCallMock).toHaveBeenCalledWith(selling, buying);
   });
 
   it("refuses an invalid pair before calling Horizon", async () => {
     const native = StellarSdk.Asset.native();
-    await expect(getOrderBook(native, native)).rejects.toThrow(/two different valid assets/);
+    await expect(getOrderBook(native, native)).rejects.toThrow(
+      "Selling and buying assets must be different."
+    );
     await expect(getOrderBook(null, native)).rejects.toThrow(/two different valid assets/);
     expect(orderBookCallMock).not.toHaveBeenCalled();
   });
