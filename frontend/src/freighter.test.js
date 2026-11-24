@@ -222,6 +222,8 @@ describe("readKitewellState", () => {
       labName: "Kitewell",
       builderCount: 2,
       builder: "alice",
+      paused: false,
+      admin: USER,
       archived: false,
     });
 
@@ -250,7 +252,14 @@ describe("readKitewellState", () => {
 
     const state = await readKitewellState(CONTRACT_ID, null);
 
-    expect(state).toEqual({ labName: "Kitewell", builderCount: 0, builder: null, archived: false });
+    expect(state).toEqual({
+      labName: "Kitewell",
+      builderCount: 0,
+      builder: null,
+      paused: false,
+      admin: null,
+      archived: false,
+    });
   });
 
   it("falls back to the zero address when no viewer is passed", async () => {

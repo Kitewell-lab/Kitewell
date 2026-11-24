@@ -23,6 +23,7 @@ import {
 import { parseHorizonError } from "./horizonErrorParse";
 import { formatTrustlineLimit } from "./trustlineLimitFormat";
 import { parseSimulationFees } from "./simulationFees";
+import { createKitewellClient } from "./kitewellClient";
 import { getFeePerOperation } from "./feeSetting";
 import {
   HORIZON_FAILURE_CODE,
@@ -104,6 +105,40 @@ function buildContractTx(contract, method, args, sourceAccount, timeout = 60) {
     fee: StellarSdk.BASE_FEE,
     networkPassphrase: currentPassphrase(),
   });
+}
+
+/** Read public contract state; the optional viewer only scopes get_builder. */
+export async function readKitewellState(contractId, viewerAddress = null) {
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  const client = createKitewellClient({
+    contractId,
+    networkPassphrase: currentPassphrase(),
+    server: getActiveRpcServer(),
+  });
+
+  try {
+    return {
+      ...(await client.readState(viewerAddress)),
+      archived: false,
+    };
+  } catch (error) {
+    if (/archived/i.test(error.message || "")) {
+      return {
+        labName: null,
+        builderCount: 0,
+        builder: null,
+        paused: false,
+        admin: null,
+        archived: true,
+      };
+    }
+    throw error;
+  }
 }
 
 /** Send prepared XDR to Freighter and return the signed transaction. */
