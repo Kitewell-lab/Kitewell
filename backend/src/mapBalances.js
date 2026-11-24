@@ -46,6 +46,14 @@ export function mapBalance(balance) {
     limit: balance.limit ?? null,
     ...(balance.sponsor ? { sponsor: balance.sponsor } : {}),
     isNative: false,
+    isAuthorized:
+      typeof balance.is_authorized === "boolean" ? balance.is_authorized : null,
+    isAuthorizedToMaintainLiabilities:
+      typeof balance.is_authorized_to_maintain_liabilities === "boolean"
+        ? balance.is_authorized_to_maintain_liabilities
+        : null,
+    clawbackEnabled:
+      typeof balance.clawback_enabled === "boolean" ? balance.clawback_enabled : null,
   };
 }
 

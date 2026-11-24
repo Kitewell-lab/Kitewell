@@ -473,8 +473,13 @@ export async function buildPaymentEnvelope(
   memoType = "text",
   memo = ""
 ) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
-    throw new Error("Destination must be a valid Stellar public key (G…).");
+  const isAccountAddress =
+    StellarSdk.StrKey.isValidEd25519PublicKey(destination) ||
+    StellarSdk.StrKey.isValidMed25519PublicKey(destination);
+  if (!isAccountAddress) {
+    throw new Error(
+      "Destination must be a valid Stellar public key (G…). A muxed address (M…) is also accepted."
+    );
   }
 
   return buildUnsignedEnvelope(
@@ -601,6 +606,54 @@ export async function pathPaymentWithFreighter({
     .build();
 
   return signAndSubmit(transaction, publicKey);
+}
+
+/** Reprice one open offer, keeping its offer id and remaining selling amount. */
+export async function changeOfferPriceWithFreighter(publicKey, offer, newPrice) {
+  if (!offer || !/^[1-9]\d*$/.test(String(offer.id))) {
+    throw new Error("Select an open offer to reprice.");
+  }
+  const price = String(newPrice ?? "").trim();
+  if (!/^\d+(\.\d+)?$/.test(price) || !/[1-9]/.test(price)) {
+    throw new Error("New price must be greater than zero.");
+  }
+
+  // A partial fill may have changed the remaining amount since the list loaded.
+  const currentOffer = await getServer().offers().offer(String(offer.id)).call();
+  if (currentOffer.seller !== publicKey) {
+    throw new Error("This offer is no longer open for the connected account.");
+  }
+
+  const selling = buildAsset({
+    isNative: currentOffer.selling.asset_type === "native",
+    code: currentOffer.selling.asset_code,
+    issuer: currentOffer.selling.asset_issuer,
+  });
+  const buying = buildAsset({
+    isNative: currentOffer.buying.asset_type === "native",
+    code: currentOffer.buying.asset_code,
+    issuer: currentOffer.buying.asset_issuer,
+  });
+  const amount = normalizeAmount(currentOffer.amount, "Remaining offer amount");
+  const operation = StellarSdk.Operation.manageSellOffer({
+    selling,
+    buying,
+    amount,
+    price,
+    offerId: String(offer.id),
+  });
+
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(operation)
+    .setTimeout(180)
+    .build();
+
+  const result = await signAndSubmit(transaction, publicKey);
+  return { ...result, oldPrice: currentOffer.price };
 }
 
 /**
@@ -893,10 +946,17 @@ function eventContractId(event) {
   return String(id);
 }
 
+function rawTopic(value) {
+  const native = nativeOrValue(value);
+  if (native === null || ["string", "number", "boolean", "bigint"].includes(typeof native)) {
+    return String(native);
+  }
+  return typeof value?.toXDR === "function" ? value.toXDR("base64") : String(native);
+}
+
 /**
- * Turn raw Soroban RPC contract events into the two Lab-facing shapes:
- * `register` (caller / name / isNew) and `paused` (new flag). Events from any
- * other contract are dropped, as are event types we do not display.
+ * Decode the Kitewell event topics and data for the Lab. Unrecognized or
+ * malformed events retain their topics so they can still be inspected.
  */
 export function mapKitewellEvents(rawEvents = [], contractId) {
   return (rawEvents || [])
@@ -904,28 +964,36 @@ export function mapKitewellEvents(rawEvents = [], contractId) {
     .map((event) => {
       const topic = event.topic || [];
       const kind = topic[0] ? nativeOrValue(topic[0]) : null;
-      const value = event.value ? nativeOrValue(event.value) : null;
+      const value = event.value != null ? nativeOrValue(event.value) : null;
       const common = {
         id: event.id ?? `${event.ledger ?? event.ledgerSeq ?? 0}-${kind}`,
         ledger: event.ledger ?? event.ledgerSeq ?? null,
       };
 
-      if (kind === "register") {
-        const [name, isNew] = Array.isArray(value) ? value : [null, null];
+      const caller = topic[1] ? nativeOrValue(topic[1]) : null;
+      const addressTopic = typeof topic[1]?.switch !== "function" ||
+        topic[1].switch() === StellarSdk.xdr.ScValType.scvAddress();
+      const validCaller = typeof caller === "string" && (
+        StellarSdk.StrKey.isValidEd25519PublicKey(caller) ||
+        StellarSdk.StrKey.isValidContract(caller)
+      );
+      if (kind === "register" && addressTopic && validCaller && Array.isArray(value) &&
+          typeof value[0] === "string" && typeof value[1] === "boolean") {
+        const [name, isNew] = value;
         return {
           ...common,
           type: "register",
-          caller: topic[1] ? nativeOrValue(topic[1]) : null,
+          functionName: "register",
+          caller,
           name: name ?? null,
           isNew: Boolean(isNew),
         };
       }
-      if (kind === "paused") {
-        return { ...common, type: "paused", paused: Boolean(value) };
+      if (kind === "paused" && typeof value === "boolean") {
+        return { ...common, type: "paused", functionName: "set_paused", paused: value };
       }
-      return null;
-    })
-    .filter(Boolean);
+      return { ...common, type: "unknown", functionName: null, topics: topic.map(rawTopic) };
+    });
 }
 
 /**

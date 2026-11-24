@@ -79,6 +79,7 @@ describe("mapKitewellEvents", () => {
     expect(mapped.find((event) => event.type === "register")).toMatchObject({
       id: "evt-register",
       type: "register",
+      functionName: "register",
       caller: CALLER,
       name: "alice",
       isNew: true,
@@ -87,25 +88,54 @@ describe("mapKitewellEvents", () => {
     expect(mapped.find((event) => event.type === "paused")).toMatchObject({
       id: "evt-paused",
       type: "paused",
+      functionName: "set_paused",
       paused: true,
       ledger: 1235,
     });
     expect(mapped.some((event) => event.id === "evt-other")).toBe(false);
   });
 
-  it("drops event types the Lab does not display", () => {
+  it("keeps unknown events with their raw topics and ledger", () => {
     const mapped = mapKitewellEvents(
       [
         {
           id: "evt-unknown",
+          ledger: 1236,
           contractId: CONTRACT_ID,
-          topic: [StellarSdk.xdr.ScVal.scvSymbol("unregister")],
+          topic: [
+            StellarSdk.xdr.ScVal.scvSymbol("unregister"),
+            StellarSdk.xdr.ScVal.scvSymbol("not_an_address"),
+          ],
           value: StellarSdk.xdr.ScVal.scvBool(true),
         },
       ],
       CONTRACT_ID
     );
-    expect(mapped).toEqual([]);
+    expect(mapped).toEqual([{
+      id: "evt-unknown",
+      ledger: 1236,
+      type: "unknown",
+      functionName: null,
+      topics: ["unregister", "not_an_address"],
+    }]);
+  });
+
+  it("does not treat a non-address register topic as a builder address", () => {
+    const event = registerEvent(CONTRACT_ID, "evt-malformed", CALLER, "alice", true);
+    event.topic[1] = StellarSdk.nativeToScVal(CALLER, { type: "string" });
+
+    expect(mapKitewellEvents([event], CONTRACT_ID)).toEqual([{
+      id: "evt-malformed",
+      ledger: 1234,
+      type: "unknown",
+      functionName: null,
+      topics: ["register", CALLER],
+    }]);
+  });
+
+  it("decodes the new state when the contract is unpaused", () => {
+    expect(mapKitewellEvents([pausedEvent(CONTRACT_ID, "evt-unpaused", false)], CONTRACT_ID))
+      .toMatchObject([{ type: "paused", functionName: "set_paused", paused: false, ledger: 1235 }]);
   });
 });
 

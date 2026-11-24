@@ -1,5 +1,6 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { fetchAccountViaApi, fetchPaymentsViaApi } from "./api";
+import { normaliseTxHash } from "./txStatusWatch";
 import {
   getActiveNetwork,
   getActiveNetworkId,
@@ -370,6 +371,16 @@ export function buildAsset({ isNative, code, issuer } = {}) {
   return new StellarSdk.Asset(normalizedCode.toUpperCase(), issuer);
 }
 
+/** Read the public Horizon order book for a validated pair of SDK assets. */
+export async function getOrderBook(selling, buying) {
+  if (!selling || !buying || selling.equals(buying)) {
+    throw new Error("Choose two different valid assets for the order book.");
+  }
+  return withHorizon429Backoff(() =>
+    getServer().orderbook(selling, buying).call()
+  );
+}
+
 /**
  * Parse a comma-separated intermediate path (e.g. `USDC:G…, XLM`) into SDK
  * Assets. An empty string yields an empty path, which lets Horizon route
@@ -498,6 +509,14 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
       limit: b.limit,
       ...(b.sponsor ? { sponsor: b.sponsor } : {}),
       isNative: false,
+      isAuthorized:
+        typeof b.is_authorized === "boolean" ? b.is_authorized : null,
+      isAuthorizedToMaintainLiabilities:
+        typeof b.is_authorized_to_maintain_liabilities === "boolean"
+          ? b.is_authorized_to_maintain_liabilities
+          : null,
+      clawbackEnabled:
+        typeof b.clawback_enabled === "boolean" ? b.clawback_enabled : null,
       ...liabilityFields(b, false, subentryCount, baseReserve),
     };
   });
@@ -547,6 +566,20 @@ export async function getBalance(publicKey, options = {}) {
   const balances = await getAccountBalances(publicKey, options);
   const xlm = balances.find((b) => b.isNative);
   return xlm ? xlm.balance : "0";
+}
+
+/** Load all open offers owned by the connected account from Horizon. */
+export async function getOpenOffers(publicKey, options = {}) {
+  return withHorizon429Backoff(async () => {
+    let page = await getServer().offers().forAccount(publicKey).limit(200).call();
+    const offers = [];
+    while (page.records.length > 0) {
+      offers.push(...page.records);
+      if (page.records.length < 200) break;
+      page = await page.next();
+    }
+    return offers;
+  }, options);
 }
 
 /**
@@ -606,6 +639,31 @@ export async function getTransactions(publicKey, limit = 15, cursor, options = {
       // Paging straight off Horizon is out of scope, so this path is the last page.
       nextCursor: null,
     };
+  }, options);
+}
+
+/** Read one transaction and all its operations directly from the active Horizon. */
+export async function getTransactionByHash(input, options = {}) {
+  const hash = normaliseTxHash(input);
+  const base = getActiveNetwork().horizonUrl;
+
+  const read = async (url) => {
+    const response = await fetch(url, { signal: options.signal });
+    if (response.status === 404) {
+      throw new Error("Transaction not found on this network.");
+    }
+    if (!response.ok) {
+      const error = new Error(`Could not load transaction (HTTP ${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    return response.json();
+  };
+
+  return withHorizon429Backoff(async () => {
+    const transaction = await read(`${base}/transactions/${hash}`);
+    const operationPage = await read(`${base}/transactions/${hash}/operations?limit=200`);
+    return { transaction, operations: operationPage?._embedded?.records || [] };
   }, options);
 }
 
