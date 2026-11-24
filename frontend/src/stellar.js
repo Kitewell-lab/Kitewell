@@ -6,8 +6,153 @@ import {
   isFriendbotAvailable,
 } from "./network";
 
+/** Shown in the lab panel when Horizon asks the client to slow down. */
+export const HORIZON_SLOWDOWN_MESSAGE =
+  "The network asked the lab to slow down.";
+
+const HORIZON_429_BASE_WAIT_SEC = 2;
+const HORIZON_429_MAX_WAIT_SEC = 30;
+
+/**
+ * Shared per-network 429 backoff clock. Balance and history reads (and any
+ * other lab Horizon reads) advance the same streak for the active network.
+ * @type {Map<string, { streak: number }>}
+ */
+const horizon429BackoffByNetwork = new Map();
+
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
+}
+
+/** @param {unknown} error */
+export function isHorizon429(error) {
+  const status = error?.response?.status ?? error?.status;
+  if (status === 429) return true;
+  const message = String(error?.message ?? "");
+  return /too many requests/i.test(message);
+}
+
+/** @param {unknown} error */
+export function isHorizonSlowdownError(error) {
+  return error instanceof Error && error.message === HORIZON_SLOWDOWN_MESSAGE;
+}
+
+/** @param {unknown} error */
+function readRetryAfterSeconds(error) {
+  const headers = error?.response?.headers;
+  if (!headers) return null;
+
+  const raw =
+    typeof headers.get === "function"
+      ? headers.get("retry-after") ?? headers.get("Retry-After")
+      : headers["retry-after"] ?? headers["Retry-After"];
+
+  if (raw == null || raw === "") return null;
+
+  const asNumber = Number(raw);
+  if (Number.isFinite(asNumber) && asNumber >= 0) return asNumber;
+
+  const asDate = Date.parse(String(raw));
+  if (!Number.isNaN(asDate)) {
+    return Math.max(0, (asDate - Date.now()) / 1000);
+  }
+
+  return null;
+}
+
+/** @param {number} streak 1-based count of consecutive 429s on this network */
+export function computeHorizon429WaitSeconds(streak) {
+  const safeStreak = Math.max(1, streak);
+  return Math.min(
+    HORIZON_429_BASE_WAIT_SEC * 2 ** (safeStreak - 1),
+    HORIZON_429_MAX_WAIT_SEC
+  );
+}
+
+function resetHorizon429Backoff(networkId = getActiveNetworkId()) {
+  horizon429BackoffByNetwork.delete(networkId);
+}
+
+/**
+ * Record a 429 for the active network and return how long to wait (seconds).
+ * Prefers Horizon's Retry-After when present; otherwise 2 → 4 → 8 … capped at 30.
+ * @param {unknown} error
+ * @returns {number}
+ */
+export function recordHorizon429(error) {
+  const networkId = getActiveNetworkId();
+  const prior = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
+  const streak = prior.streak + 1;
+  horizon429BackoffByNetwork.set(networkId, { streak });
+
+  const retryAfter = readRetryAfterSeconds(error);
+  if (retryAfter != null) return retryAfter;
+  return computeHorizon429WaitSeconds(streak);
+}
+
+/** Test helper: clear the shared backoff clocks. */
+export function resetHorizon429BackoffForTests() {
+  horizon429BackoffByNetwork.clear();
+}
+
+function abortError() {
+  const error = new Error("Aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function defaultSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    function onAbort() {
+      clearTimeout(timer);
+      reject(abortError());
+    }
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Run a Horizon lab read with shared per-network 429 backoff.
+ *
+ * On 429: waits Retry-After (or 2/4/8…≤30s), then rejects with
+ * {@link HORIZON_SLOWDOWN_MESSAGE}. A later success resets the clock.
+ * A 500 (or any non-429) is rethrown unchanged. The wait is cancelled when
+ * `signal` aborts (unmount / network change).
+ *
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @param {object} [options]
+ * @param {AbortSignal} [options.signal]
+ * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [options.sleep]
+ * @returns {Promise<T>}
+ */
+export async function withHorizon429Backoff(fn, options = {}) {
+  const { signal, sleep = defaultSleep } = options;
+
+  if (signal?.aborted) throw abortError();
+
+  try {
+    const result = await fn();
+    resetHorizon429Backoff();
+    return result;
+  } catch (error) {
+    if (!isHorizon429(error)) throw error;
+
+    const waitSeconds = recordHorizon429(error);
+    await sleep(waitSeconds * 1000, signal);
+    throw new Error(HORIZON_SLOWDOWN_MESSAGE, { cause: error });
+  }
 }
 
 /** The Kitewell backend is configured for Testnet, so skip it elsewhere. */
@@ -359,7 +504,7 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
 }
 
 /** Prefer the Kitewell backend on Testnet; otherwise read Horizon directly. */
-export async function getAccountBalances(publicKey) {
+export async function getAccountBalances(publicKey, options = {}) {
   if (backendIsUsable()) {
     try {
       const data = await fetchAccountViaApi(publicKey);
@@ -369,11 +514,13 @@ export async function getAccountBalances(publicKey) {
     }
   }
 
-  const account = await getServer().loadAccount(publicKey);
-  return mapHorizonBalances(account, await readBaseReserve());
+  return withHorizon429Backoff(async () => {
+    const account = await getServer().loadAccount(publicKey);
+    return mapHorizonBalances(account, await readBaseReserve());
+  }, options);
 }
 
-export async function getAccountDetails(publicKey) {
+export async function getAccountDetails(publicKey, options = {}) {
   if (backendIsUsable()) {
     try {
       return await fetchAccountViaApi(publicKey);
@@ -382,19 +529,22 @@ export async function getAccountDetails(publicKey) {
     }
   }
 
-  const account = await getServer().loadAccount(publicKey);
-  return {
-    id: account.id,
-    sequence: account.sequenceNumber(),
-    subentryCount: account.subentry_count,
-    thresholds: account.thresholds,
-    balances: mapHorizonBalances(account, await readBaseReserve()),
-    explorerUrl: explorerAccountUrl(publicKey),
-  };
+  return withHorizon429Backoff(async () => {
+    const account = await getServer().loadAccount(publicKey);
+    const baseReserve = await readBaseReserve();
+    return {
+      id: account.id,
+      sequence: account.sequenceNumber(),
+      subentryCount: account.subentry_count,
+      thresholds: account.thresholds,
+      balances: mapHorizonBalances(account, baseReserve),
+      explorerUrl: explorerAccountUrl(publicKey),
+    };
+  }, options);
 }
 
-export async function getBalance(publicKey) {
-  const balances = await getAccountBalances(publicKey);
+export async function getBalance(publicKey, options = {}) {
+  const balances = await getAccountBalances(publicKey, options);
   const xlm = balances.find((b) => b.isNative);
   return xlm ? xlm.balance : "0";
 }
@@ -423,7 +573,7 @@ export async function getLiquidityPool(poolId) {
  * @returns {Promise<{ records: object[], nextCursor: string|null }>} The
  *   mapped records plus the cursor for the next page (null on the last page).
  */
-export async function getTransactions(publicKey, limit = 15, cursor) {
+export async function getTransactions(publicKey, limit = 15, cursor, options = {}) {
   if (backendIsUsable()) {
     try {
       return await fetchPaymentsViaApi(publicKey, limit, cursor);
@@ -432,27 +582,101 @@ export async function getTransactions(publicKey, limit = 15, cursor) {
     }
   }
 
-  const payments = await getServer()
-    .payments()
-    .forAccount(publicKey)
-    .limit(limit)
-    .order("desc")
-    .call();
+  return withHorizon429Backoff(async () => {
+    const payments = await getServer()
+      .payments()
+      .forAccount(publicKey)
+      .limit(limit)
+      .order("desc")
+      .call();
+
+    return {
+      records: payments.records
+        .filter((p) => p.type === "payment")
+        .map((p) => ({
+          id: p.id,
+          from: p.from,
+          to: p.to,
+          amount: p.amount,
+          asset_type: p.asset_type,
+          asset_code: p.asset_code || "XLM",
+          transaction_hash: p.transaction_hash,
+          created_at: p.created_at,
+        })),
+      // Paging straight off Horizon is out of scope, so this path is the last page.
+      nextCursor: null,
+    };
+  }, options);
+}
+
+/** Deep-link into the hash status watch panel for a transaction. */
+export function statusWatchHref(hash) {
+  return `#status-watch/${encodeURIComponent(hash)}`;
+}
+
+/**
+ * Map a Horizon pending-queue record into the fields the panel renders.
+ * Accepts both short lab names and classic Horizon transaction field names.
+ */
+export function mapPendingTransaction(record) {
+  const status = String(
+    record.status ?? record.tx_status ?? "pending"
+  ).toLowerCase();
 
   return {
-    records: payments.records
-      .filter((p) => p.type === "payment")
-      .map((p) => ({
-        id: p.id,
-        from: p.from,
-        to: p.to,
-        amount: p.amount,
-        asset_type: p.asset_type,
-        asset_code: p.asset_code || "XLM",
-        transaction_hash: p.transaction_hash,
-        created_at: p.created_at,
-      })),
-    // Paging straight off Horizon is out of scope, so this path is the last page.
-    nextCursor: null,
+    hash: record.hash,
+    fee: String(record.fee ?? record.fee_charged ?? record.max_fee ?? ""),
+    sequence: String(
+      record.sequence ?? record.source_account_sequence ?? ""
+    ),
+    status,
   };
+}
+
+/**
+ * Keep only transactions Horizon has not applied yet.
+ * Applied rows from the pending endpoint are ignored.
+ */
+export function selectPendingTransactions(records) {
+  return (records || [])
+    .map(mapPendingTransaction)
+    .filter((tx) => tx.hash && tx.status !== "applied");
+}
+
+/**
+ * List transactions for an account that are still pending on Horizon.
+ *
+ * Hits `GET {horizon}/accounts/{id}/pending_transactions`. A 404 means an
+ * empty queue (not an error). Applied records in the payload are dropped.
+ *
+ * @param {string} publicKey Connected account.
+ * @returns {Promise<object[]>} Pending rows with hash, fee, and sequence.
+ */
+export async function getPendingTransactions(publicKey, options = {}) {
+  return withHorizon429Backoff(async () => {
+    const url = `${getActiveNetwork().horizonUrl}/accounts/${encodeURIComponent(
+      publicKey
+    )}/pending_transactions`;
+
+    const response = options.signal
+      ? await fetch(url, { signal: options.signal })
+      : await fetch(url);
+    if (response.status === 404) {
+      return [];
+    }
+    if (!response.ok) {
+      const error = new Error(
+        `Could not load pending transactions (HTTP ${response.status}).`
+      );
+      error.status = response.status;
+      throw error;
+    }
+
+    const body = await response.json();
+    const records = Array.isArray(body)
+      ? body
+      : body?._embedded?.records || body?.records || [];
+
+    return selectPendingTransactions(records);
+  }, options);
 }

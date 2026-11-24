@@ -18,6 +18,7 @@ import {
   readKitewellEvents,
   submitFailureResult,
   signChallengeWithFreighter,
+  simulateRegisterBuilder,
 } from "./freighter";
 import {
   createFailedSubmitLog,
@@ -28,10 +29,14 @@ import {
   fundWithFriendbot,
   getAccountBalances,
   getAccountDetails,
+  getPendingTransactions,
   getLiquidityPool,
   getTransactions,
   explorerAccountUrl,
   explorerTxUrl,
+  isHorizonSlowdownError,
+  HORIZON_SLOWDOWN_MESSAGE,
+  statusWatchHref,
   getAccountAuthConfig,
   getIssuedAssetTrustlines,
   IMMUTABLE_CONFIRMATION,
@@ -40,6 +45,7 @@ import { poolShareRows } from "./poolShare";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
+import { formatSimulationFee } from "./simulationFees";
 import {
   NETWORKS,
   getActiveNetworkId,
@@ -67,11 +73,14 @@ const TABS = [
   "Send",
   "Path",
   "History",
+  "Pending",
   "Inspect",
+  "Decode",
   "Issuer",
   "Web auth",
   "Lab",
 ];
+const PENDING_REFRESH_MS = 8000;
 const EVENT_POLL_MS = 6000;
 const PATH_MODE_FIELDS = {
   strictSend: {
@@ -111,6 +120,8 @@ export default function App() {
   const [balances, setBalances] = useState([]);
   const [liquidityPools, setLiquidityPools] = useState({});
   const [transactions, setTransactions] = useState([]);
+  const [pendingTransactions, setPendingTransactions] = useState([]);
+  const [pendingError, setPendingError] = useState(null);
   const [nextCursor, setNextCursor] = useState(null);
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
@@ -148,8 +159,13 @@ export default function App() {
   const [inspectForm, setInspectForm] = useState({ xdr: "" });
   const [inspectResult, setInspectResult] = useState(null);
   const [inspectError, setInspectError] = useState(null);
+  const [envelopeXdr, setEnvelopeXdr] = useState("");
+  const [decodeError, setDecodeError] = useState(null);
+  const [decodedEnvelope, setDecodedEnvelope] = useState(null);
   const tabRefs = useRef([]);
+  const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
+  const [horizonNotice, setHorizonNotice] = useState(null);
   const [failedSubmits, setFailedSubmits] = useState([]);
   const failedSubmitLogRef = useRef(createFailedSubmitLog());
   const [webAuthForm, setWebAuthForm] = useState({ endpoint: "", serverAccount: "" });
@@ -211,6 +227,18 @@ export default function App() {
     setTimeout(() => setToast(null), 4200);
   };
 
+  const beginHorizonRead = () => {
+    horizonAbortRef.current?.abort();
+    const controller = new AbortController();
+    horizonAbortRef.current = controller;
+    return controller.signal;
+  };
+
+  const cancelHorizonReads = () => {
+    horizonAbortRef.current?.abort();
+    horizonAbortRef.current = null;
+  };
+
   /** Append a failed submit to the in-memory session list (not localStorage). */
   const trackFailedSubmit = (operationType, error) => {
     failedSubmitLogRef.current.record({
@@ -246,6 +274,8 @@ export default function App() {
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
   }, []);
+
+  useEffect(() => () => cancelHorizonReads(), []);
 
   // A pool-share balance only says how many shares the account holds. Load
   // each pool so the panel can also show both reserves and the total shares.
@@ -359,18 +389,32 @@ export default function App() {
   const refreshBalances = useCallback(async () => {
     if (!publicKey) return;
     setLoading("balance");
+    const signal = beginHorizonRead();
     try {
-      const next = await getAccountBalances(publicKey);
+      const next = await getAccountBalances(publicKey, { signal });
       setBalances(next);
+      setHorizonNotice(null);
       try {
-        const details = await getAccountDetails(publicKey);
+        const details = await getAccountDetails(publicKey, { signal });
         setAccountDetails(details);
-      } catch {
+      } catch (detailsError) {
+        if (detailsError?.name === "AbortError") return;
+        if (isHorizonSlowdownError(detailsError)) {
+          setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
+          showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+        }
         setAccountDetails(null);
       }
-    } catch {
+    } catch (error) {
+      if (error?.name === "AbortError") return;
       setBalances([]);
-      showToast("Account not found on Testnet yet. Fund it with Friendbot.", "error");
+      if (isHorizonSlowdownError(error)) {
+        setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
+        showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+      } else {
+        setHorizonNotice(null);
+        showToast("Account not found on Testnet yet. Fund it with Friendbot.", "error");
+      }
     } finally {
       setLoading("");
     }
@@ -383,6 +427,8 @@ export default function App() {
       setPublicKey(address);
       setBalances([]);
       setTransactions([]);
+      setPendingTransactions([]);
+      setPendingError(null);
       showToast("Freighter connected.");
       try {
         const next = await getAccountBalances(address);
@@ -403,6 +449,8 @@ export default function App() {
     setPublicKey(null);
     setBalances([]);
     setTransactions([]);
+    setPendingTransactions([]);
+    setPendingError(null);
     setAccountDetails(null);
     setIssuerConfig(null);
     setIssuedTrustlines([]);
@@ -411,10 +459,14 @@ export default function App() {
 
   const handleNetworkChange = (id) => {
     try {
+      cancelHorizonReads();
+      setHorizonNotice(null);
       const next = setActiveNetwork(id);
       setNetworkId(id);
       setBalances([]);
       setTransactions([]);
+      setPendingTransactions([]);
+      setPendingError(null);
       setAccountDetails(null);
       setInspectResult(null);
       setInspectError(null);
@@ -424,6 +476,46 @@ export default function App() {
       showToast(e.message || "Could not switch network.", "error");
     }
   };
+
+  const refreshPending = useCallback(async () => {
+    if (!publicKey) {
+      setPendingTransactions([]);
+      setPendingError(null);
+      return;
+    }
+    try {
+      const rows = await getPendingTransactions(publicKey);
+      setPendingTransactions(rows);
+      setPendingError(null);
+      setHorizonNotice(null);
+    } catch (e) {
+      if (isHorizonSlowdownError(e)) {
+        setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
+        setPendingError(null);
+        return;
+      }
+      setPendingError(e.message || "Could not load pending transactions.");
+    }
+  }, [publicKey]);
+
+  useEffect(() => {
+    if (activeTab !== "Pending" || !publicKey) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled) return;
+      await refreshPending();
+    };
+
+    tick();
+    const timer = setInterval(tick, PENDING_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeTab, publicKey, networkId, refreshPending]);
 
   const handleFund = async () => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -752,13 +844,21 @@ export default function App() {
   const handleHistory = async () => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     setLoading("history");
+    const signal = beginHorizonRead();
     try {
-      const page = await getTransactions(publicKey);
+      const page = await getTransactions(publicKey, 15, undefined, { signal });
       setTransactions(page.records);
       setNextCursor(page.nextCursor);
+      setHorizonNotice(null);
       if (page.records.length === 0) showToast("No payments yet.", "info");
-    } catch {
-      showToast("Could not load payment history.", "error");
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      if (isHorizonSlowdownError(error)) {
+        setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
+        showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+      } else {
+        showToast("Could not load payment history.", "error");
+      }
     } finally {
       setLoading("");
     }
@@ -767,13 +867,23 @@ export default function App() {
   const handleLoadMore = async () => {
     if (!publicKey || !nextCursor) return;
     setLoading("history-more");
+    const signal = beginHorizonRead();
     try {
       // Same page size as the first page; `undefined` keeps the default limit.
-      const page = await getTransactions(publicKey, undefined, nextCursor);
+      const page = await getTransactions(publicKey, undefined, nextCursor, {
+        signal,
+      });
       setTransactions((previous) => [...previous, ...page.records]);
       setNextCursor(page.nextCursor);
-    } catch {
-      showToast("Could not load older payments.", "error");
+      setHorizonNotice(null);
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      if (isHorizonSlowdownError(error)) {
+        setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
+        showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+      } else {
+        showToast("Could not load older payments.", "error");
+      }
     } finally {
       setLoading("");
     }
@@ -1151,6 +1261,17 @@ export default function App() {
     }
   };
 
+  const handleDecodeEnvelope = (event) => {
+    event.preventDefault();
+    try {
+      setDecodedEnvelope(decodeEnvelope(envelopeXdr));
+      setDecodeError(null);
+    } catch (error) {
+      setDecodedEnvelope(null);
+      setDecodeError(error.message || "Could not decode this envelope.");
+    }
+  };
+
   const activateTab = (tab) => {
     setActiveTab(tab);
     if (tab === "History") handleHistory();
@@ -1339,6 +1460,11 @@ export default function App() {
                 <span className="status-dot" />
                 Connected via Freighter
               </div>
+              {horizonNotice && (
+                <p className="muted" role="status">
+                  {horizonNotice}
+                </p>
+              )}
               <div className="hero-card__balance">
                 <span className="eyebrow">XLM balance</span>
                 <span className="hero-card__amount">
@@ -3307,6 +3433,56 @@ export default function App() {
                     </div>
                   ))}
                 </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === "Pending" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Pending transactions</h2>
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={refreshPending}
+                  disabled={requireWallet}
+                >
+                  Refresh
+                </button>
+              </div>
+              <p className="muted">
+                Transactions Horizon has accepted but not applied yet for this
+                account. The list refreshes while this panel is open.
+              </p>
+              {requireWallet ? (
+                <p className="muted">Connect a wallet to load the pending queue.</p>
+              ) : pendingError ? (
+                <div className="info-box info-box--warning">
+                  <span className="eyebrow">Pending queue</span>
+                  <p className="muted">{pendingError}</p>
+                </div>
+              ) : pendingTransactions.length > 0 ? (
+                <div className="tx-list">
+                  {pendingTransactions.map((tx) => (
+                    <div key={tx.hash} className="tx-item tx-item--out">
+                      <div className="tx-item__direction">Pending</div>
+                      <div className="tx-item__amount">
+                        <code>{tx.hash}</code>
+                      </div>
+                      <div className="tx-item__addr muted">
+                        Fee {tx.fee || "—"} · Seq {tx.sequence || "—"}
+                      </div>
+                      <a
+                        href={statusWatchHref(tx.hash)}
+                        className="tx-item__link"
+                      >
+                        Watch status ↗
+                      </a>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No pending transactions.</p>
               )}
             </div>
           )}

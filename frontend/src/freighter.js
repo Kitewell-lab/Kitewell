@@ -15,6 +15,7 @@ import {
   MAX_ASSET_CODE_LENGTH,
 } from "./stellar";
 import { parseHorizonError } from "./horizonErrorParse";
+import { parseSimulationFees } from "./simulationFees";
 import {
   HORIZON_FAILURE_CODE,
   freighterCancelledError,
