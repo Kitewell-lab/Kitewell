@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * - The real SDK is used for tx building, XDR round-trips, and scVal decoding.
  */
 
-const { sorobanServerMock, signTransactionMock } = vi.hoisted(() => ({
+const { sorobanServerMock, signTransactionMock, horizonServerMock } = vi.hoisted(() => ({
   sorobanServerMock: {
     simulateTransaction: vi.fn(),
     prepareTransaction: vi.fn(),
@@ -18,6 +18,10 @@ const { sorobanServerMock, signTransactionMock } = vi.hoisted(() => ({
     getAccount: vi.fn(),
   },
   signTransactionMock: vi.fn(),
+  horizonServerMock: {
+    loadAccount: vi.fn(),
+    submitTransaction: vi.fn(),
+  },
 }));
 
 vi.mock("@stellar/freighter-api", () => ({
@@ -42,6 +46,12 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
         return sorobanServerMock;
       }),
     },
+    Horizon: {
+      ...actual.Horizon,
+      Server: vi.fn(function () {
+        return horizonServerMock;
+      }),
+    },
   };
 });
 
@@ -50,6 +60,7 @@ const {
   SOROBAN_RPC_URL,
   readKitewellState,
   registerBuilderWithFreighter,
+  clawbackClaimableBalanceWithFreighter,
 } = await import("./freighter");
 
 const CONTRACT_ID =
@@ -89,6 +100,8 @@ function simOk(retval) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  horizonServerMock.loadAccount.mockReset();
+  horizonServerMock.submitTransaction.mockReset();
 });
 
 afterEach(() => {
@@ -403,5 +416,40 @@ describe("registerBuilderWithFreighter", () => {
     await expect(
       registerBuilderWithFreighter(USER, "GAAAAWTF", "alice")
     ).rejects.toThrow("valid Soroban contract");
+  });
+});
+
+describe("clawbackClaimableBalanceWithFreighter", () => {
+  it("builds and submits a clawbackClaimableBalance operation", async () => {
+    horizonServerMock.loadAccount.mockResolvedValue(new StellarSdk.Account(USER, "7"));
+    horizonServerMock.submitTransaction.mockResolvedValue({ hash: "clawback-hash" });
+    signTransactionMock.mockImplementation(async (xdr) => ({
+      error: null,
+      signedTxXdr: xdr,
+    }));
+
+    const result = await clawbackClaimableBalanceWithFreighter(USER, "a".repeat(64));
+
+    expect(result).toEqual({ hash: "clawback-hash" });
+    const [xdr] = signTransactionMock.mock.calls.at(-1);
+    const signed = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
+    expect(signed.operations[0].type).toBe("clawbackClaimableBalance");
+    expect(signed.operations[0].balanceId).toBe(`00000000${"a".repeat(64)}`);
+  });
+
+  it("accepts a Horizon id that already includes the type prefix", async () => {
+    horizonServerMock.loadAccount.mockResolvedValue(new StellarSdk.Account(USER, "7"));
+    horizonServerMock.submitTransaction.mockResolvedValue({ hash: "clawback-hash" });
+    signTransactionMock.mockImplementation(async (xdr) => ({
+      error: null,
+      signedTxXdr: xdr,
+    }));
+
+    const horizonId = `00000000${"bb".repeat(32)}`;
+    await clawbackClaimableBalanceWithFreighter(USER, horizonId);
+
+    const [xdr] = signTransactionMock.mock.calls.at(-1);
+    const signed = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
+    expect(signed.operations[0].balanceId).toBe(horizonId);
   });
 });

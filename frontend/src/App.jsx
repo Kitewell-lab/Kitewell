@@ -8,6 +8,7 @@ import {
   changeOfferPriceWithFreighter,
   changeTrustWithFreighter,
   revokeTrustlineSponsorshipWithFreighter,
+  clawbackClaimableBalanceWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
   simulateRegisterBuilder,
@@ -36,6 +37,7 @@ import {
   getAccountDetails,
   getOpenOffers,
   getPendingTransactions,
+  getClaimableBalances,
   getLiquidityPool,
   getTransactions,
   explorerAccountUrl,
@@ -135,6 +137,7 @@ export default function App() {
   const [networkId, setNetworkId] = useState(getActiveNetworkId());
   const [freighterInstalled, setFreighterInstalled] = useState(null);
   const [balances, setBalances] = useState([]);
+  const [claimableBalances, setClaimableBalances] = useState([]);
   const [liquidityPools, setLiquidityPools] = useState({});
   const [transactions, setTransactions] = useState([]);
   const [pendingTransactions, setPendingTransactions] = useState([]);
@@ -482,6 +485,8 @@ export default function App() {
       const next = await getAccountBalances(publicKey, { signal });
       setBalances(next);
       setHorizonNotice(null);
+      const claimables = await getClaimableBalances(publicKey).catch(() => []);
+      setClaimableBalances(claimables);
       try {
         const details = await getAccountDetails(publicKey, { signal });
         setAccountDetails(details);
@@ -496,6 +501,7 @@ export default function App() {
     } catch (error) {
       if (error?.name === "AbortError") return;
       setBalances([]);
+      setClaimableBalances([]);
       if (isHorizonSlowdownError(error)) {
         setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
         showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
@@ -508,6 +514,22 @@ export default function App() {
     }
   }, [publicKey]);
 
+  const handleClawback = async (balance) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`clawback-${balance.id}`);
+    try {
+      await clawbackClaimableBalanceWithFreighter(publicKey, balance.id);
+      const next = await getClaimableBalances(publicKey).catch(() => []);
+      setClaimableBalances(next);
+      showToast(`${balance.code} claimable balance clawed back.`);
+    } catch (err) {
+      trackFailedSubmit("clawbackClaimableBalance", err);
+      showToast(err.message || "Clawback failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const handleConnect = async () => {
     setLoading("connect");
     try {
@@ -517,6 +539,7 @@ export default function App() {
       setOpenOffers([]);
       setOfferPrices({});
       setOfferResult(null);
+      setClaimableBalances([]);
       setTransactions([]);
       setPendingTransactions([]);
       setPendingError(null);
@@ -2088,6 +2111,36 @@ export default function App() {
                   ))}
                 </div>
               )}
+
+              <div className="section">
+                <h3 className="subhead">Claimable balances you created</h3>
+                {claimableBalances.length > 0 ? (
+                  <ul className="balance-list">
+                    {claimableBalances.map((balance) => (
+                      <li key={balance.id} className="balance-row">
+                        <div>
+                          <strong>{balance.amount} {balance.code}</strong>
+                          <span className="muted balance-row__issuer">
+                            {balance.issuer ? shortenAddress(balance.issuer) : "Native asset"}
+                          </span>
+                        </div>
+                        {balance.clawbackEnabled && balance.issuer === publicKey && (
+                          <button
+                            className="btn btn--secondary btn--sm"
+                            type="button"
+                            onClick={() => handleClawback(balance)}
+                            disabled={loading === `clawback-${balance.id}`}
+                          >
+                            {loading === `clawback-${balance.id}` ? "Clawing back…" : "Claw back"}
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No claimable balances created by this account.</p>
+                )}
+              </div>
 
               <form onSubmit={handleTrust} className="form">
                 <h3 className="subhead">Add trustline</h3>
