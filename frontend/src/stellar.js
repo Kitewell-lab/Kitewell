@@ -1,7 +1,9 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { Buffer } from "buffer";
 import { fetchAccountViaApi, fetchPaymentsViaApi } from "./api";
 import { normaliseTxHash } from "./txStatusWatch";
 import { rowsToCsv } from "./csvExport";
+import { mapTransactionFee } from "./historyFee";
 import {
   getActiveNetwork,
   getActiveNetworkId,
@@ -95,7 +97,6 @@ function defaultSleep(ms, signal) {
     );
   });
 }
-
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
 }
@@ -582,6 +583,14 @@ export function buildAsset({ isNative, code, issuer } = {}) {
   return new StellarSdk.Asset(normalizedCode.toUpperCase(), issuer);
 }
 
+function mapOrderBookRows(rows = []) {
+  return (rows || []).slice(0, 10).map((row) => ({
+    amount: row.amount,
+    price: row.price,
+    priceR: row.price_r,
+  }));
+}
+
 /** Read the public Horizon order book for a validated pair of SDK assets. */
 export async function getOrderBook(selling, buying) {
   if (!selling || !buying) {
@@ -668,7 +677,7 @@ export function calculateAvailableBalance(
   return Math.max(0, total - sellingLiabilities).toFixed(7);
 }
 
-function liabilityFields(balance, isNative, subentryCount, baseReserve) {
+export function liabilityFields(balance, isNative, subentryCount, baseReserve) {
   const sellingLiabilities = parseFloat(balance.selling_liabilities || "0");
   const buyingLiabilities = parseFloat(balance.buying_liabilities || "0");
   return {
@@ -711,8 +720,7 @@ async function readBaseReserve() {
   return baseReserve;
 }
 
-function mapHorizonBalances(account, baseReserve = 0.5) {
-  const subentryCount = account.subentry_count || 0;
+function mapHorizonBalances(account) {
   return account.balances.map((b) => {
     const sellingLiabilities = b.selling_liabilities ?? "0";
     const buyingLiabilities = b.buying_liabilities ?? "0";
@@ -724,6 +732,20 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
         balance: b.balance,
         limit: null,
         isNative: true,
+        sellingLiabilities,
+        buyingLiabilities,
+      };
+    }
+    if (b.asset_type === "liquidity_pool_shares") {
+      return {
+        key: `pool:${b.liquidity_pool_id}`,
+        code: "POOL",
+        issuer: null,
+        balance: b.balance,
+        limit: b.limit,
+        isNative: false,
+        isPoolShare: true,
+        poolId: b.liquidity_pool_id,
         sellingLiabilities,
         buyingLiabilities,
       };
@@ -767,40 +789,53 @@ export async function getSponsoredClaimableBalances(publicKey) {
     .forSponsor(publicKey)
     .limit(200)
     .call();
-
-  const balances = await Promise.all(
-    (records.records || []).map(async (record) => {
-      const mapped = mapClaimableBalance(record, publicKey);
-      if (!mapped.issuer) return mapped;
-
-      try {
-        const assets = await getServer()
-          .assets()
-          .forCode(mapped.code)
-          .forIssuer(mapped.issuer)
-          .call();
-        return {
-          ...mapped,
-          clawbackEnabled: Boolean(assets.records?.[0]?.flags?.auth_clawback_enabled),
-        };
-      } catch {
-        return { ...mapped, clawbackEnabled: false };
-      }
-    })
-  );
-
-  return balances.filter((balance) => balance.createdByAccount);
+  return (records.records || []).map((balance) => ({
+    id: balance.id,
+    asset:
+      balance.asset === "native"
+        ? "XLM"
+        : `${balance.asset_code || balance.asset}`,
+    assetCode: balance.asset_code,
+    assetIssuer: balance.asset_issuer,
+    amount: balance.amount,
+    claimants: balance.claimants || [],
+    sponsor: balance.sponsor || null,
+  }));
 }
+
+export async function getClaimableBalances(publicKey) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  const page = await getServer()
+    .claimableBalances()
+    .forClaimant(publicKey)
+    .limit(200)
+    .call();
+
+  return (page.records || []).map((balance) => ({
+    id: balance.id,
+    asset:
+      balance.asset === "native"
+        ? "XLM"
+        : `${balance.asset_code || balance.asset}`,
+    assetCode: balance.asset_code,
+    assetIssuer: balance.asset_issuer,
+    amount: balance.amount,
+    claimants: balance.claimants || [],
+    sponsor: balance.sponsor || null,
+  }));
+}
+
 
 /** Prefer the Kitewell backend on Testnet; otherwise read Horizon directly. */
 export async function getAccountBalances(publicKey, options = {}) {
-  if (backendIsUsable()) {
-    try {
-      const data = await fetchAccountViaApi(publicKey);
-      return data.balances;
-    } catch {
-      /* fall back to direct Horizon */
-    }
+  try {
+    const data = await fetchAccountViaApi(publicKey, getActiveNetworkId());
+    return data.balances;
+  } catch {
+    /* fall back to direct Horizon */
   }
 
   return withHorizon429Backoff(async () => {
@@ -810,12 +845,10 @@ export async function getAccountBalances(publicKey, options = {}) {
 }
 
 export async function getAccountDetails(publicKey) {
-  if (backendIsUsable()) {
-    try {
-      return await fetchAccountViaApi(publicKey);
-    } catch {
-      /* fall back to direct Horizon */
-    }
+  try {
+    return await fetchAccountViaApi(publicKey, getActiveNetworkId());
+  } catch {
+    /* fall back to direct Horizon */
   }
 
   const account = await getServer().loadAccount(publicKey);
@@ -828,7 +861,6 @@ export async function getAccountDetails(publicKey) {
     signers: account.signers,
     balances: mapHorizonBalances(account),
     dataEntries: mapAccountDataEntries(account),
-    signers: account.signers || [],
     explorerUrl: explorerAccountUrl(publicKey),
   };
 }
@@ -943,33 +975,109 @@ export async function getBalance(publicKey, options = {}) {
   return xlm ? xlm.balance : "0";
 }
 
-export async function getClaimableBalances(publicKey) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
-  }
 
-  const page = await getServer()
-    .claimableBalances()
-    .claimant(publicKey)
-    .limit(200)
-    .order("desc")
-    .call();
-
-  return (page.records || []).map((balance) => ({
-    id: balance.id,
-    asset:
-      balance.asset === "native"
-        ? "XLM"
-        : `${balance.asset_code || balance.asset}`,
-    assetCode: balance.asset_code,
-    assetIssuer: balance.asset_issuer,
-    amount: balance.amount,
-    claimants: balance.claimants || [],
-    sponsor: balance.sponsor || null,
-  }));
-}
 
 export const listClaimableBalances = getClaimableBalances;
+
+/** Load all open offers owned by the connected account from Horizon. */
+export async function getOpenOffers(publicKey, options = {}) {
+  return withHorizon429Backoff(async () => {
+    let page = await getServer().offers().forAccount(publicKey).limit(200).call();
+    const offers = [];
+    while (page.records.length > 0) {
+      offers.push(...page.records);
+      if (page.records.length < 200) break;
+      page = await page.next();
+    }
+    return offers;
+  }, options);
+}
+
+/**
+ * Fetch and parse stellar.toml for a domain or issuer account.
+ *
+ * @param {string} domainOrIssuer Either a domain (e.g., "example.com") or a
+ *   Stellar public key (G...). When an issuer is provided, the SDK resolves
+ *   the home_domain from the account's on-chain data.
+ * @returns {Promise<object>} Parsed stellar.toml with keys like
+ *   TRANSFER_SERVER, WEB_AUTH_ENDPOINT, KYC_SERVER, CURRENCIES, etc.
+ */
+export async function fetchStellarToml(domainOrIssuer) {
+  if (!domainOrIssuer || typeof domainOrIssuer !== "string") {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  const trimmed = domainOrIssuer.trim();
+  if (!trimmed) {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  return StellarSdk.StellarTomlResolver.resolve(trimmed, {
+    allowHttp: false,
+  });
+}
+
+/**
+ * Fetch the SEP-24 info endpoint from a transfer server URL.
+ *
+ * @param {string} transferServerUrl The TRANSFER_SERVER URL from stellar.toml.
+ * @returns {Promise<object>} The parsed JSON response from the /info endpoint,
+ *   including deposit and withdraw asset details.
+ */
+export async function fetchTransferServerInfo(transferServerUrl) {
+  if (!transferServerUrl || typeof transferServerUrl !== "string") {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  const trimmed = transferServerUrl.trim();
+  if (!trimmed) {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  if (!trimmed.startsWith("https://")) {
+    throw new Error("Transfer server URL must use HTTPS.");
+  }
+
+  const baseUrl = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  const infoUrl = `${baseUrl}/info`;
+
+  const response = await fetch(infoUrl);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch transfer server info: ${response.status} ${response.statusText}`
+    );
+  }
+
+  return response.json();
+}
+
+/**
+ * Fetch stellar.toml and optionally the transfer server info for a domain or issuer.
+ *
+ * @param {string} domainOrIssuer Either a domain (e.g., "example.com") or a
+ *   Stellar public key (G...).
+ * @returns {Promise<object>} An object with:
+ *   - toml: The parsed stellar.toml
+ *   - transferServerInfo: The parsed /info response (null if TRANSFER_SERVER
+ *     is absent or the fetch fails)
+ */
+export async function fetchAnchorInfo(domainOrIssuer) {
+  const toml = await fetchStellarToml(domainOrIssuer);
+
+  let transferServerInfo = null;
+  if (toml.TRANSFER_SERVER) {
+    try {
+      transferServerInfo = await fetchTransferServerInfo(toml.TRANSFER_SERVER);
+    } catch {
+      transferServerInfo = null;
+    }
+  }
+
+  return {
+    toml,
+    transferServerInfo,
+  };
+}
 
 /**
  * Load one liquidity pool (both reserves and total shares) from Horizon.
@@ -1047,24 +1155,22 @@ export function liquidityPoolWithdraw(poolId, amount, minAmountA, minAmountB) {
  *   mapped records plus the cursor for the next page (null on the last page).
  */
 export async function getTransactions(publicKey, limit = 15, cursor, options = {}) {
-  if (backendIsUsable()) {
-    try {
-      return options.signal
-        ? await fetchPaymentsViaApi(publicKey, limit, cursor, options)
-        : await fetchPaymentsViaApi(publicKey, limit, cursor);
-    } catch {
-      /* fall back to direct Horizon */
-    }
+  try {
+    return options.signal
+      ? await fetchPaymentsViaApi(publicKey, limit, cursor, getActiveNetworkId(), options)
+      : await fetchPaymentsViaApi(publicKey, limit, cursor, getActiveNetworkId());
+  } catch {
+    /* fall back to direct Horizon */
   }
 
   return withHorizon429Backoff(async () => {
-    let request = getServer()
+    let builder = getServer()
       .payments()
       .forAccount(publicKey)
       .limit(limit)
-      .order("desc")
-      .join("transactions");
-    if (cursor) request = request.cursor(cursor);
+      .order("desc");
+    if (cursor) builder = builder.cursor(cursor);
+    const request = typeof builder.join === "function" ? builder.join("transactions") : builder;
     const payments = await request.call();
     const lastRaw = payments.records[payments.records.length - 1];
 
@@ -1141,6 +1247,54 @@ export async function getTransactionByHash(input, options = {}) {
 }
 
 const MEMO_LOOKUP_CONCURRENCY = 5;
+
+const transactionDetailRequests = new Map();
+
+/**
+ * Read one transaction with its operations and effects from the active Horizon.
+ * Read-only. Failed transactions are included (`include_failed`). Concurrent
+ * calls for the same network and hash share one in-flight request.
+ *
+ * @param {string} input Transaction hash.
+ * @returns {Promise<{ transaction: object, operations: object[], effects: object[] }>}
+ */
+export function getTransactionDetails(input, options = {}) {
+  const hash = normaliseTxHash(input);
+  const base = getActiveNetwork().horizonUrl;
+  const key = `${base}|${hash}`;
+
+  const pending = transactionDetailRequests.get(key);
+  if (pending) return pending;
+
+  const read = async (path) => {
+    const response = await fetch(`${base}/transactions/${hash}${path}`);
+    if (response.status === 404) {
+      throw new Error("Transaction not found on this network.");
+    }
+    if (!response.ok) {
+      const error = new Error(`Could not load transaction (HTTP ${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    return response.json();
+  };
+
+  const request = withHorizon429Backoff(async () => {
+    const [transaction, operationPage, effectPage] = await Promise.all([
+      read(""),
+      read("/operations?limit=200&include_failed=true"),
+      read("/effects?limit=200"),
+    ]);
+    return {
+      transaction,
+      operations: operationPage?._embedded?.records || [],
+      effects: effectPage?._embedded?.records || [],
+    };
+  }, options).finally(() => transactionDetailRequests.delete(key));
+
+  transactionDetailRequests.set(key, request);
+  return request;
+}
 
 /**
  * Read the memo of each distinct transaction hash straight from Horizon.
@@ -1377,6 +1531,47 @@ export async function getPendingTransactions(publicKey) {
   });
 }
 
+export async function getTrades(publicKey, limit = 15, cursor) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
+
+  let builder = getServer()
+    .trades()
+    .forAccount(publicKey)
+    .limit(limit)
+    .order("desc");
+
+  if (cursor) {
+    builder = builder.cursor(cursor);
+  }
+
+  const response = await builder.call();
+  return {
+    records: (response.records || []).map((trade) => ({
+      id: trade.id,
+      ledger_close_time: trade.ledger_close_time,
+      offer_id: trade.offer_id,
+      base_is_seller: trade.base_is_seller,
+      base_account: trade.base_account,
+      base_amount: trade.base_amount,
+      base_asset_type: trade.base_asset_type,
+      base_asset_code: trade.base_asset_code,
+      base_asset_issuer: trade.base_asset_issuer,
+      counter_account: trade.counter_account,
+      counter_amount: trade.counter_amount,
+      counter_asset_type: trade.counter_asset_type,
+      counter_asset_code: trade.counter_asset_code,
+      counter_asset_issuer: trade.counter_asset_issuer,
+      price: trade.price,
+    })),
+    nextCursor:
+      response.records?.length > 0
+        ? response.records[response.records.length - 1].paging_token
+        : null,
+  };
+}
+
 export async function getAccountTrades(publicKey, { limit = 10, cursor } = {}) {
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
     throw new Error("Connect a valid Freighter address first.");
@@ -1409,6 +1604,230 @@ export async function getAccountTrades(publicKey, { limit = 10, cursor } = {}) {
       ? records[records.length - 1].paging_token
       : null,
   };
+}
+
+export async function getLatestBaseReserve() {
+  const server = getServer();
+  if (typeof server?.ledgers !== "function") {
+    return "5000000";
+  }
+  const response = await server
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const baseReserve = response.records?.[0]?.base_reserve_in_stroops;
+  if (!/^\d+$/.test(String(baseReserve ?? "")) || Number(baseReserve) <= 0) {
+    throw new Error("Latest ledger did not include a valid base reserve.");
+  }
+  return String(baseReserve);
+}
+
+export function isFederationAddress(destination) {
+  return typeof destination === "string" && destination.includes("*");
+}
+
+export async function resolveFederationAddress(destination) {
+  const value = typeof destination === "string" ? destination.trim() : "";
+  if (!value) return value;
+  if (!isFederationAddress(value)) return value;
+
+  const separator = value.indexOf("*");
+  const name = value.slice(0, separator).trim();
+  const domain = value.slice(separator + 1).trim();
+  if (!name || !domain) {
+    throw new Error("Federation address must look like name*domain.");
+  }
+
+  let tomlResponse;
+  try {
+    tomlResponse = await fetch(`https://${domain}/.well-known/stellar.toml`);
+  } catch {
+    throw new Error(`Could not load stellar.toml for ${domain}.`);
+  }
+  if (!tomlResponse.ok) {
+    throw new Error(`Could not load stellar.toml for ${domain}.`);
+  }
+
+  const toml = await tomlResponse.text();
+  const federationMatch = toml.match(
+    /^\s*FEDERATION_SERVER\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s#]+))\s*(?:#.*)?$/im
+  );
+  const federationServer = (
+    federationMatch?.[1] ||
+    federationMatch?.[2] ||
+    federationMatch?.[3] ||
+    ""
+  ).trim();
+  if (!federationServer) {
+    throw new Error(`${domain} has no FEDERATION_SERVER in its stellar.toml.`);
+  }
+
+  let federationUrl;
+  try {
+    federationUrl = new URL(federationServer);
+  } catch {
+    throw new Error(`${domain} has an invalid FEDERATION_SERVER URL.`);
+  }
+  federationUrl.searchParams.set("type", "name");
+  federationUrl.searchParams.set("q", value);
+
+  let federationResponse;
+  try {
+    federationResponse = await fetch(federationUrl.toString());
+  } catch {
+    throw new Error("Federation lookup failed. Try again in a moment.");
+  }
+  if (!federationResponse.ok) {
+    throw new Error("Federation lookup failed. Check the federation address.");
+  }
+
+  let federation;
+  try {
+    federation = await federationResponse.json();
+  } catch {
+    throw new Error("Federation server returned an invalid response.");
+  }
+
+  const account = typeof federation.account === "string" ? federation.account.trim() : "";
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(account)) {
+    throw new Error("Federation lookup did not return a valid Stellar account.");
+  }
+  return account;
+}
+
+export const resolvePaymentDestination = resolveFederationAddress;
+
+export async function getAccountSnapshot(publicKey) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
+
+  const account = await getServer().loadAccount(publicKey);
+
+  let offers;
+  try {
+    const offersResponse = await getServer()
+      .offers()
+      .forAccount(publicKey)
+      .limit(200)
+      .call();
+    offers = offersResponse.records.map((offer) => ({
+      id: offer.id,
+      selling: offer.selling,
+      buying: offer.buying,
+      amount: offer.amount,
+      price: offer.price,
+      price_r: offer.price_r,
+    }));
+  } catch {
+    offers = [];
+  }
+
+  const dataEntries = {};
+  if (account.data_attr) {
+    Object.entries(account.data_attr).forEach(([key, value]) => {
+      try {
+        const decoded = Buffer.from(value, "base64").toString("utf8");
+        if (Buffer.from(decoded, "utf8").toString("base64") === value) {
+          dataEntries[key] = decoded;
+        } else {
+          dataEntries[key] = Buffer.from(value, "base64").toString("hex");
+        }
+      } catch {
+        dataEntries[key] = Buffer.from(value, "base64").toString("hex");
+      }
+    });
+  }
+
+  return {
+    id: account.id,
+    sequence: account.sequenceNumber(),
+    subentryCount: account.subentry_count,
+    thresholds: {
+      low: account.thresholds.low_threshold,
+      medium: account.thresholds.med_threshold,
+      high: account.thresholds.high_threshold,
+    },
+    signers: account.signers.map((signer) => ({
+      key: signer.key,
+      weight: signer.weight,
+      type: signer.type,
+    })),
+    balances: mapHorizonBalances(account),
+    data: dataEntries,
+    offers,
+    network: getActiveNetworkId(),
+    exportedAt: new Date().toISOString(),
+  };
+}
+
+export async function downloadAccountSnapshot(publicKey) {
+  const snapshot = await getAccountSnapshot(publicKey);
+
+  const filename = `kitewell-account-${snapshot.id.slice(0, 8)}-${Date.now()}.json`;
+  const json = JSON.stringify(snapshot, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * List the assets issued by `publicKey` that have clawback enabled.
+ * Horizon's accounts endpoint lists what an account holds, not what it
+ * issues, so this reads the issued-asset index directly.
+ */
+export async function getIssuedClawbackAssets(publicKey) {
+  const params = new URLSearchParams({
+    asset_issuer: publicKey,
+    limit: "200",
+  });
+  const response = await fetch(
+    `${getActiveNetwork().horizonUrl}/assets?${params.toString()}`
+  );
+  if (!response.ok) {
+    throw new Error("Could not load the assets issued by this account.");
+  }
+
+  const data = await response.json();
+  return (data._embedded?.records || [])
+    .filter((asset) => asset.flags?.clawback_enabled)
+    .map((asset) => ({
+      key: `${asset.asset_code}:${asset.asset_issuer}`,
+      code: asset.asset_code,
+      issuer: asset.asset_issuer,
+      isNative: false,
+    }));
+}
+
+/**
+ * Read a holder's balance of one credit asset straight from Horizon.
+ * Throws when the holder has no trustline for that asset.
+ */
+export async function getAccountAssetBalance(
+  publicKey,
+  assetCode,
+  assetIssuer
+) {
+  const account = await getServer().loadAccount(publicKey);
+  const code = (assetCode || "").trim().toUpperCase();
+  const match = mapHorizonBalances(account).find(
+    (balance) =>
+      !balance.isNative &&
+      balance.code === code &&
+      balance.issuer === assetIssuer
+  );
+
+  if (!match) {
+    throw new Error(`Holder has no trustline for ${code || "that asset"}.`);
+  }
+  return match.balance;
 }
 
 export { summarizeEnvelopeSignatures } from "./multisigEnvelope";

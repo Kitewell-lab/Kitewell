@@ -32,6 +32,12 @@ import {
   readKitewellBuilder,
   createSponsoredAccountDraft,
   sponsorAccountCreationWithFreighter,
+  computeWasmHash,
+  compareWasmHashes,
+  readPausedState,
+  filterEventsByBuilder,
+  confirmPaymentWithFreighter,
+  preparePaymentWithFreighter,
 } from "./freighter";
 import {
   appendBuilderPage,
@@ -257,16 +263,7 @@ export default function App() {
   });
   const [sendPrepared, setSendPrepared] = useState(null);
 
-  const updateSendForm = (changes) => {
-    setSendForm((previous) => ({
-      ...previous,
-      ...changes,
-    }));
-    setSendPrepared(null);
-    // Any edit changes the operation list, so the previewed envelope is stale.
-    setUnsignedEnvelope(null);
-    setSigningConfirmationOpen(false);
-  };
+
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
   const [createAccountForm, setCreateAccountForm] = useState({
     destination: "",
@@ -321,6 +318,16 @@ export default function App() {
   const [sessionContractId, setSessionContractId] = useState(null);
   const [deployedContracts, setDeployedContracts] = useState([]);
   const [wasmFile, setWasmFile] = useState(null);
+  const [localWasmHash, setLocalWasmHash] = useState(null);
+  const [onChainWasmHash, setOnChainWasmHash] = useState(null);
+  const [wasmCompareResult, setWasmCompareResult] = useState(null);
+  const [registrationPaused, setRegistrationPaused] = useState(null);
+  const [pausedReadError, setPausedReadError] = useState(null);
+  const [builderFilterInput, setBuilderFilterInput] = useState("");
+  const [activeBuilderFilter, setActiveBuilderFilter] = useState("");
+  const [builderFilterError, setBuilderFilterError] = useState(null);
+  const [accountFiguresTimestamp, setAccountFiguresTimestamp] = useState(null);
+  const [accountFiguresStale, setAccountFiguresStale] = useState(false);
   const [confirmRedeploy, setConfirmRedeploy] = useState(false);
   const [deployError, setDeployError] = useState(null);
   const tabRefs = useRef([]);
@@ -499,6 +506,12 @@ export default function App() {
     setPathQuote(null);
   };
   const updateOfferForm = (changes) => setOfferForm((prev) => ({ ...prev, ...changes }));
+  const updateSendForm = (changes) => {
+    setSendForm((prev) => ({ ...prev, ...changes }));
+    setSendPrepared(null);
+    setUnsignedEnvelope(null);
+    setSigningConfirmationOpen(false);
+  };
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
   const selectedComposeAsset = balances.find((b) => b.key === composeForm.assetKey);
   const configuredContractId = labInfo?.network?.contract?.kitewell;
@@ -624,6 +637,8 @@ export default function App() {
       setHorizonNotice(null);
       const claimables = await getSponsoredClaimableBalances(publicKey).catch(() => []);
       setClaimableBalances(claimables);
+      setAccountFiguresTimestamp(Date.now());
+      setAccountFiguresStale(false);
       try {
         const details = await getAccountDetails(publicKey, { signal });
         const latestLedger = await fetchLatestHorizonLedger(
@@ -644,10 +659,18 @@ export default function App() {
         } else {
           setAccountDetails(null);
         }
+        setAccountDetails(null);
       }
       await refreshReserve();
     } catch (error) {
-      setBalances([]);
+      setAccountFiguresStale(true);
+      setBalances((prev) => {
+        if (!prev || prev.length === 0) {
+          setAccountFiguresTimestamp(null);
+          return [];
+        }
+        return prev;
+      });
       setClaimableBalances([]);
       if (isHorizonSlowdownError(error)) {
         setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
@@ -2099,6 +2122,14 @@ export default function App() {
       // Always read builder state
       const state = await readKitewellState(contractId, publicKey);
       setLabState(state);
+      try {
+        const isPaused = await readPausedState(contractId);
+        setRegistrationPaused(isPaused);
+        setPausedReadError(null);
+      } catch {
+        setRegistrationPaused(null);
+        setPausedReadError("The paused flag could not be read.");
+      }
       
       // Try to read admin state, but don't fail if the contract doesn't have
       // get_pending_admin yet (it's new in this PR and may not be deployed)
@@ -2162,6 +2193,19 @@ export default function App() {
     if (!registerForm.name.trim()) {
       return showToast("Enter a builder name to register.", "error");
     }
+    // Issue #648: Check paused flag first before opening Freighter
+    try {
+      const isPaused = await readPausedState(contractId);
+      setRegistrationPaused(isPaused);
+      setPausedReadError(null);
+      if (isPaused) {
+        return showToast("Registration is paused by the lab admin.", "error");
+      }
+    } catch {
+      setRegistrationPaused(null);
+      setPausedReadError("The paused flag could not be read.");
+      return showToast("The paused flag could not be read.", "error");
+    }
     const expectedSimulationKey = JSON.stringify([
       publicKey,
       networkId,
@@ -2197,6 +2241,14 @@ export default function App() {
       startTxWatch(result.hash);
       const state = await readKitewellState(contractId, publicKey);
       setLabState(state);
+      try {
+        const isPaused = await readPausedState(contractId);
+        setRegistrationPaused(isPaused);
+        setPausedReadError(null);
+      } catch {
+        setRegistrationPaused(null);
+        setPausedReadError("The paused flag could not be read.");
+      }
     } catch (err) {
       trackFailedSubmit("register", err);
       showToast(err.message || "Contract invoke failed.", "error");
@@ -3141,6 +3193,16 @@ export default function App() {
                     {loading === "balance" ? <Spinner size={14} /> : "↻"}
                   </button>
                 </span>
+                {accountFiguresTimestamp && (
+                  <p className="muted" style={{ fontSize: "0.8rem", marginTop: 4 }}>
+                    {accountFiguresStale ? (
+                      <span className="badge badge--warning" style={{ marginRight: 6 }}>
+                        Figures not updated
+                      </span>
+                    ) : null}
+                    Loaded at {new Date(accountFiguresTimestamp).toLocaleTimeString()} (machine clock)
+                  </p>
+                )}
               </div>
               <div className="hero-card__key">
                 <span className="eyebrow">Public key</span>
@@ -3467,6 +3529,16 @@ export default function App() {
                 View holdings, open a trustline, or remove an empty one with Freighter{" "}
                 <code>signTransaction</code>. Removing sets the limit to 0.
               </p>
+              {accountFiguresTimestamp && (
+                <p className="muted" style={{ fontSize: "0.85rem", marginTop: 4 }}>
+                  {accountFiguresStale ? (
+                    <strong style={{ color: "var(--warning, #d97706)" }}>
+                      Figures not updated ·{" "}
+                    </strong>
+                  ) : null}
+                  Loaded at {new Date(accountFiguresTimestamp).toLocaleTimeString()} (machine clock)
+                </p>
+              )}
               <div className="info-box">
                 <span className="eyebrow">Minimum XLM calculator</span>
                 <label className="label" htmlFor="reserve-subentries">
@@ -5153,12 +5225,62 @@ export default function App() {
                         className="input"
                         type="file"
                         accept=".wasm,application/wasm"
-                        onChange={(e) => {
-                          setWasmFile(e.target.files?.[0] ?? null);
+                        onChange={async (e) => {
+                          const file = e.target.files?.[0] ?? null;
+                          setWasmFile(file);
                           setConfirmRedeploy(false);
                           setDeployError(null);
+                          if (!file) {
+                            setLocalWasmHash(null);
+                            setOnChainWasmHash(null);
+                            setWasmCompareResult(null);
+                            return;
+                          }
+                          try {
+                            const bytes = await file.arrayBuffer();
+                            const hash = computeWasmHash(bytes);
+                            setLocalWasmHash(hash);
+                            const targetContractId = sessionContractId || configuredContractId;
+                            if (targetContractId) {
+                              const ttl = await readContractTTL(targetContractId).catch(() => null);
+                              const onChain = ttl?.wasmHash ?? null;
+                              setOnChainWasmHash(onChain);
+                              setWasmCompareResult(compareWasmHashes(hash, onChain));
+                            } else {
+                              setOnChainWasmHash(null);
+                              setWasmCompareResult(compareWasmHashes(hash, null));
+                            }
+                          } catch (err) {
+                            setDeployError({ message: err.message });
+                          }
                         }}
                       />
+                      {wasmFile && (
+                        <div className="info-box" style={{ marginTop: 8 }}>
+                          <span className="eyebrow">Wasm verification</span>
+                          <div className="metadata-grid">
+                            <div>
+                              <span className="metadata-label">Local wasm hash</span>
+                              <span className="metadata-value">
+                                <code>{localWasmHash || "Calculating…"}</code>
+                              </span>
+                            </div>
+                            <div>
+                              <span className="metadata-label">On-chain wasm hash</span>
+                              <span className="metadata-value">
+                                <code>
+                                  {onChainWasmHash || "No on-chain hash (contract is not deployed)."}
+                                </code>
+                              </span>
+                            </div>
+                          </div>
+                          {wasmCompareResult?.message && (
+                            <p className="muted" style={{ marginTop: 6 }}>
+                              {wasmCompareResult.message}
+                            </p>
+                          )}
+                        </div>
+                      )}
                       <p className="muted">
                         Build with <code>npm run build:contracts</code> (output:{" "}
                         <code>contracts/target/wasm32v1-none/release/kitewell.wasm</code>).
@@ -5461,6 +5583,17 @@ export default function App() {
                     </>
                   )}
 
+                  {registrationPaused && (
+                    <div className="info-box info-box--warning" style={{ marginBottom: 12 }}>
+                      <p className="muted">Registration is paused by the lab admin.</p>
+                    </div>
+                  )}
+                  {pausedReadError && (
+                    <div className="info-box info-box--warning" style={{ marginBottom: 12 }}>
+                      <p className="muted">{pausedReadError}</p>
+                    </div>
+                  )}
+
                   <form className="form" onSubmit={handleBuilderLookup}>
                     <div className="subhead">Builder lookup</div>
                     <label className="label" htmlFor="builder-lookup-address">
@@ -5504,6 +5637,8 @@ export default function App() {
                       )}
                     </div>
                   )}
+                    </div>
+                  )}
 
                   <form className="form" onSubmit={handleRegister}>
                     <label className="label" htmlFor="builder-name">
@@ -5529,7 +5664,9 @@ export default function App() {
                         loading === "simulate" ||
                         requireWallet ||
                         !registerSimulationReady ||
-                        !canCallContract(contractStatus)
+                        !canCallContract(contractStatus) ||
+                        registrationPaused === true ||
+                        Boolean(pausedReadError)
                       }
                     >
                       {loading === "register" ? (
@@ -6047,6 +6184,61 @@ export default function App() {
                       Refresh
                     </button>
                   </div>
+                  <div className="section__row" style={{ marginTop: 8, marginBottom: 8, gap: 8 }}>
+                    <input
+                      className="input"
+                      style={{ maxWidth: 380 }}
+                      placeholder="Filter by builder address (G…)"
+                      value={builderFilterInput}
+                      onChange={(e) => {
+                        setBuilderFilterInput(e.target.value);
+                        setBuilderFilterError(null);
+                      }}
+                    />
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={() => {
+                        const trimmed = builderFilterInput.trim();
+                        if (!trimmed) {
+                          setActiveBuilderFilter("");
+                          setBuilderFilterError(null);
+                          return;
+                        }
+                        if (!StellarSdk.StrKey.isValidEd25519PublicKey(trimmed)) {
+                          setBuilderFilterError("Invalid builder address.");
+                          return;
+                        }
+                        setActiveBuilderFilter(trimmed);
+                        setBuilderFilterError(null);
+                      }}
+                    >
+                      Filter builder
+                    </button>
+                    {activeBuilderFilter && (
+                      <button
+                        className="btn btn--secondary"
+                        type="button"
+                        onClick={() => {
+                          setBuilderFilterInput("");
+                          setActiveBuilderFilter("");
+                          setBuilderFilterError(null);
+                        }}
+                      >
+                        Clear filter
+                      </button>
+                    )}
+                  </div>
+                  {builderFilterError && (
+                    <div className="info-box info-box--warning" style={{ marginBottom: 8 }}>
+                      <p className="muted">{builderFilterError}</p>
+                    </div>
+                  )}
+                  {activeBuilderFilter && (
+                    <p className="muted" style={{ marginBottom: 8 }}>
+                      Events not about this builder are hidden while the filter is on.
+                    </p>
+                  )}
                   {!configuredContractId && (
                     <p className="muted">
                       No contract id configured — no events to show.
@@ -6057,9 +6249,15 @@ export default function App() {
                       <p className="muted">{labEventsError}</p>
                     </div>
                   )}
-                  {labEvents.length > 0 ? (
+                  {(activeBuilderFilter
+                    ? filterEventsByBuilder(labEvents, activeBuilderFilter).events
+                    : labEvents
+                  ).length > 0 ? (
                     <ul className="balance-list">
-                      {labEvents.map((event) => (
+                      {(activeBuilderFilter
+                        ? filterEventsByBuilder(labEvents, activeBuilderFilter).events
+                        : labEvents
+                      ).map((event) => (
                         <li key={event.id} className="balance-row">
                           <div>
                             <strong>{event.functionName ?? "unknown"}</strong>
@@ -6334,7 +6532,6 @@ export default function App() {
               {txWatchPanel}
             </div>
           )}
-
           {activeTab === "Liquidity" && (
             <div className="section">
               <div className="section__row">

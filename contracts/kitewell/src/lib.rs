@@ -165,6 +165,11 @@ impl Kitewell {
         Ok(())
     }
 
+    /// Whether registration is currently paused.
+    pub fn paused(env: Env) -> bool {
+        env.storage().instance().get(&PAUSED).unwrap_or(false)
+    }
+
     /// Returns the lab name. Useful as a smoke-test invoke.
     pub fn lab_name(env: Env) -> String {
         String::from_str(&env, "Kitewell")

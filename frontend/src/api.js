@@ -22,20 +22,31 @@ export async function fetchLatestHorizonLedger(horizonUrl) {
   return sequence == null ? null : Number(sequence);
 }
 
-export async function fetchAccountViaApi(publicKey) {
-  const res = await fetch(`${API_BASE}/api/account/${publicKey}`);
+export async function fetchAccountViaApi(publicKey, network) {
+  const query = network ? `?network=${encodeURIComponent(network)}` : "";
+  const res = await fetch(`${API_BASE}/api/account/${publicKey}${query}`);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Account fetch failed");
+  if (data && typeof data === "object") {
+    data.arrivedAt = Date.now();
+  }
   return data;
 }
 
-export async function fetchPaymentsViaApi(publicKey, limit = 15, cursor, options = {}) {
+export async function fetchPaymentsViaApi(publicKey, limit = 15, cursor, network, options = {}) {
+  let opt = options;
+  let net = network;
+  if (typeof network === "object" && network !== null) {
+    opt = network;
+    net = undefined;
+  }
   const params = new URLSearchParams({ limit: String(limit) });
   if (cursor) params.set("cursor", cursor);
+  if (net) params.set("network", net);
 
   const url = `${API_BASE}/api/payments/${publicKey}?${params.toString()}`;
-  const res = options.signal
-    ? await fetch(url, { signal: options.signal })
+  const res = opt.signal
+    ? await fetch(url, { signal: opt.signal })
     : await fetch(url);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Payments fetch failed");

@@ -14,10 +14,22 @@ vi.mock("./api", () => ({
   fetchPaymentsViaApi: vi.fn(),
 }));
 
-const { loadAccountMock, paymentsCallMock, offersCallMock } = vi.hoisted(() => ({
+const {
+  loadAccountMock,
+  paymentsCallMock,
+  offersCallMock,
+  orderBookCallMock,
+  claimableCallMock,
+  assetCallMock,
+  ledgerCallMock,
+} = vi.hoisted(() => ({
   loadAccountMock: vi.fn(),
   paymentsCallMock: vi.fn(),
   offersCallMock: vi.fn(),
+  orderBookCallMock: vi.fn(),
+  claimableCallMock: vi.fn(),
+  assetCallMock: vi.fn(),
+  ledgerCallMock: vi.fn(),
 }));
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
@@ -52,6 +64,13 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
           assets: () => ({
             forCode: () => ({ forIssuer: () => ({ call: assetCallMock }) }),
           }),
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({
+                call: ledgerCallMock,
+              }),
+            }),
+          }),
         };
       }),
     },
@@ -80,6 +99,7 @@ const {
   validateDataValue,
   validateAccountMerge,
   mergeBlockersFromAccount,
+  resetHorizon429BackoffForTests,
 } = await import("./stellar");
 
 /** Minimal Horizon account payload: 3.5 XLM + an issued asset. */
@@ -113,6 +133,10 @@ beforeEach(() => {
   loadAccountMock.mockReset();
   paymentsCallMock.mockReset();
   offersCallMock.mockReset();
+  ledgerCallMock.mockReset();
+  ledgerCallMock.mockResolvedValue({
+    records: [{ base_reserve_in_stroops: "5000000" }],
+  });
   resetHorizon429BackoffForTests();
 });
 
