@@ -3,7 +3,7 @@ import cors from "cors";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { mapBalances } from "./mapBalances.js";
 import { createRateLimiter } from "./rateLimit.js";
-import { resolveNetwork } from "./networkConfig.js";
+import { resolveNetwork, resolveRequestNetwork } from "./networkConfig.js";
 import { mapTransactionFee } from "./transactionFee.js";
 
 /**
@@ -165,7 +165,7 @@ export function createApp({ horizon, env = process.env } = {}) {
         dataEntries: Object.entries(account.data_attr || {})
           .sort(([left], [right]) => left.localeCompare(right))
           .map(([name, value]) => ({ name, value })),
-        explorerUrl: `${EXPLORER_BASE}/account/${address}`,
+        explorerUrl: `${network.explorerBase}/account/${address}`,
       });
     } catch (err) {
       const status = err?.response?.status || 404;
@@ -196,9 +196,12 @@ export function createApp({ horizon, env = process.env } = {}) {
         .payments()
         .forAccount(address)
         .limit(limit)
-        .order("desc")
-        // Embeds each payment's transaction record, the source of fee and operation count.
-        .join("transactions");
+        .order("desc");
+
+      // Embeds each payment's transaction record when supported
+      if (typeof request.join === "function") {
+        request = request.join("transactions");
+      }
 
       // Paging backwards from the caller's cursor; omit it for the first page.
       if (cursor) request = request.cursor(cursor);
@@ -217,7 +220,7 @@ export function createApp({ horizon, env = process.env } = {}) {
           transaction_hash: p.transaction_hash,
           created_at: p.created_at,
           ...mapTransactionFee(p.transaction),
-          explorerUrl: `${EXPLORER_BASE}/tx/${p.transaction_hash}`,
+          explorerUrl: `${network.explorerBase}/tx/${p.transaction_hash}`,
         }));
 
       // A full page of raw records means there may be older ones; the cursor

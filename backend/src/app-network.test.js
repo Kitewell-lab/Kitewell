@@ -57,6 +57,9 @@ function stubHorizon({ id = "GTEST", fail } = {}) {
           order() {
             return builder;
           },
+          join() {
+            return builder;
+          },
           cursor() {
             return builder;
           },

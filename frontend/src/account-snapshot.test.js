@@ -371,7 +371,7 @@ describe("downloadAccountSnapshot", () => {
   beforeEach(() => {
     // Mock DOM APIs for download tests
     globalThis.document = {
-      createElement: vi.fn((tag) => ({
+      createElement: vi.fn(() => ({
         href: "",
         download: "",
         click: vi.fn(),
