@@ -7,6 +7,10 @@ import {
   changeTrustWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
+  sendSacTransferWithFreighter,
+  inspectInnerEnvelope,
+  feeBumpInnerEnvelopeWithFreighter,
+  isTxBadSeqFailure,
 } from "./freighter";
 import {
   fundWithFriendbot,
@@ -50,8 +54,7 @@ const MEMO_FIELDS = {
     inputMode: "numeric",
   },
   hash: {
-    maxLength: 64,
-    pattern: "[0-9a-fA-F]{64}",
+    maxLength: 128,
     placeholder: "64 hexadecimal characters",
   },
 };
@@ -93,6 +96,10 @@ export default function App() {
   const [labStateError, setLabStateError] = useState(null);
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
+  const [sacForm, setSacForm] = useState({ assetKey: "", destination: "", amount: "" });
+  const [feeBumpForm, setFeeBumpForm] = useState({ innerXdr: "", feePerOperation: "" });
+  const [innerEnvelopeInfo, setInnerEnvelopeInfo] = useState(null);
+  const [feeBumpResult, setFeeBumpResult] = useState(null);
   const tabRefs = useRef([]);
   const [accountDetails, setAccountDetails] = useState(null);
 
@@ -132,6 +139,20 @@ export default function App() {
       setLoading("");
     }
   }, [publicKey]);
+
+  const handleSubmitFailure = async (error, existingMessage) => {
+    if (!isTxBadSeqFailure(error)) {
+      showToast(existingMessage || error.message || "Transaction failed.", "error");
+      return;
+    }
+    try {
+      const details = await getAccountDetails(publicKey);
+      setAccountDetails(details);
+      showToast(`Sequence was stale. Reloaded; next try will use sequence ${details.sequence}.`, "info");
+    } catch {
+      showToast("Sequence was stale, but the new sequence could not be read.", "error");
+    }
+  };
 
   const handleConnect = async () => {
     setLoading("connect");
@@ -211,7 +232,7 @@ export default function App() {
       setTrustForm({ code: "", issuer: "", limit: "1000000" });
       showToast(`Trustline for ${code} submitted.`);
     } catch (err) {
-      showToast(err.message || "Change trust failed.", "error");
+      await handleSubmitFailure(err, err.message || "Change trust failed.");
     } finally {
       setLoading("");
     }
@@ -233,7 +254,7 @@ export default function App() {
       setBalances(next);
       showToast(`${asset.code} trustline removed.`);
     } catch (err) {
-      showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
+      await handleSubmitFailure(err, err.message || `Could not remove the ${asset.code} trustline.`);
     } finally {
       setLoading("");
     }
@@ -250,6 +271,15 @@ export default function App() {
       new TextEncoder().encode(sendForm.memo).length > 28
     ) {
       return showToast("Text memos must be 28 UTF-8 bytes or fewer.", "error");
+    }
+    if (sendForm.memoType === "hash") {
+      const normalizedHash = sendForm.memo.replace(/\s/g, "");
+      if (!normalizedHash) {
+        return showToast("Hash memo is required.", "error");
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(normalizedHash)) {
+        return showToast("Hash memos must be exactly 64 hexadecimal characters.", "error");
+      }
     }
 
     const selected = balances.find((b) => b.key === sendForm.assetKey);
@@ -292,7 +322,7 @@ export default function App() {
         explorerTxUrl(result.hash)
       );
     } catch (err) {
-      showToast(err.message || "Payment failed.", "error");
+      await handleSubmitFailure(err, err.message || "Payment failed.");
     } finally {
       setLoading("");
     }
@@ -346,7 +376,7 @@ export default function App() {
       }
       showToast(`Path payment submitted · ${result.hash.slice(0, 12)}…`);
     } catch (err) {
-      showToast(err.message || "Path payment failed.", "error");
+      await handleSubmitFailure(err, err.message || "Path payment failed.");
     } finally {
       setLoading("");
     }
@@ -407,6 +437,63 @@ export default function App() {
     }
   }, [labInfo, publicKey]);
 
+  const handleSacTransfer = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const asset = balances.find((b) => b.key === sacForm.assetKey && !b.isNative);
+    if (!asset) return showToast("Choose a credit asset you hold.", "error");
+    if (!sacForm.destination || !sacForm.amount) {
+      return showToast("Destination and amount are required.", "error");
+    }
+    setLoading("sac");
+    try {
+      const result = await sendSacTransferWithFreighter({
+        publicKey,
+        destination: sacForm.destination,
+        amount: sacForm.amount,
+        asset: { isNative: false, code: asset.code, issuer: asset.issuer },
+        availableBalance: asset.balance,
+      });
+      showToast(`SAC transfer submitted · ${result.hash.slice(0, 12)}…`, "success", explorerTxUrl(result.hash));
+      setSacForm({ assetKey: "", destination: "", amount: "" });
+      refreshBalances();
+    } catch (err) {
+      await handleSubmitFailure(err, err.message || "SAC transfer failed.");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleInspectInnerEnvelope = () => {
+    try {
+      const info = inspectInnerEnvelope(feeBumpForm.innerXdr);
+      setInnerEnvelopeInfo(info);
+      setFeeBumpResult(null);
+    } catch (err) {
+      setInnerEnvelopeInfo(null);
+      showToast(err.message || "Invalid inner envelope.", "error");
+    }
+  };
+
+  const handleFeeBump = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("fee-bump");
+    try {
+      const result = await feeBumpInnerEnvelopeWithFreighter(
+        publicKey,
+        feeBumpForm.innerXdr,
+        feeBumpForm.feePerOperation
+      );
+      setFeeBumpResult(result);
+      showToast(`Fee-bump submitted · ${result.hash.slice(0, 12)}…`, "success", explorerTxUrl(result.hash));
+    } catch (err) {
+      await handleSubmitFailure(err, err.message || "Fee-bump failed.");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const handleRegister = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -438,7 +525,7 @@ export default function App() {
       const state = await readKitewellState(contractId, publicKey);
       setLabState(state);
     } catch (err) {
-      showToast(err.message || "Contract invoke failed.", "error");
+      await handleSubmitFailure(err, err.message || "Contract invoke failed.");
     } finally {
       setLoading("");
     }
@@ -1278,6 +1365,48 @@ export default function App() {
                     </button>
                     {!publicKey && <p className="muted">Connect Freighter to sign.</p>}
                   </form>
+                  <div className="subhead">Send SAC asset balance</div>
+                  <form className="form" onSubmit={handleSacTransfer}>
+                    <label className="label" htmlFor="sac-asset">Credit asset</label>
+                    <select id="sac-asset" className="input" value={sacForm.assetKey} onChange={(e) => setSacForm({ ...sacForm, assetKey: e.target.value })}>
+                      <option value="">Choose held credit asset</option>
+                      {balances.filter((b) => !b.isNative).map((b) => (
+                        <option key={b.key} value={b.key}>{b.code} · {b.balance}</option>
+                      ))}
+                    </select>
+                    <label className="label" htmlFor="sac-destination">Destination</label>
+                    <input id="sac-destination" className="input" placeholder="G…" value={sacForm.destination} onChange={(e) => setSacForm({ ...sacForm, destination: e.target.value })} required />
+                    <label className="label" htmlFor="sac-amount">Amount</label>
+                    <input id="sac-amount" className="input" type="number" step="0.0000001" min="0.0000001" value={sacForm.amount} onChange={(e) => setSacForm({ ...sacForm, amount: e.target.value })} required />
+                    <button className="btn btn--primary" type="submit" disabled={loading === "sac" || requireWallet}>
+                      {loading === "sac" ? <><Spinner /> Signing in Freighter…</> : "Send SAC transfer"}
+                    </button>
+                  </form>
+
+                  <div className="subhead">Fee-bump a pasted envelope</div>
+                  <form className="form" onSubmit={handleFeeBump}>
+                    <label className="label" htmlFor="inner-xdr">Inner envelope XDR</label>
+                    <textarea id="inner-xdr" className="input" rows="5" value={feeBumpForm.innerXdr} onChange={(e) => { setFeeBumpForm({ ...feeBumpForm, innerXdr: e.target.value }); setInnerEnvelopeInfo(null); }} placeholder="Paste inner transaction envelope" />
+                    <button className="btn btn--secondary" type="button" onClick={handleInspectInnerEnvelope} disabled={!feeBumpForm.innerXdr.trim()}>Inspect envelope</button>
+                    {innerEnvelopeInfo && (
+                      <div className="info-box">
+                        <span className="eyebrow">Inner transaction</span>
+                        <code>Source: {innerEnvelopeInfo.source}</code>
+                        <code>Inner fee: {innerEnvelopeInfo.fee}</code>
+                        <code>Operations: {innerEnvelopeInfo.operationCount}</code>
+                      </div>
+                    )}
+                    <label className="label" htmlFor="fee-per-operation">Fee per operation (stroops)</label>
+                    <input id="fee-per-operation" className="input" type="number" min="1" step="1" value={feeBumpForm.feePerOperation} onChange={(e) => setFeeBumpForm({ ...feeBumpForm, feePerOperation: e.target.value })} required />
+                    <button className="btn btn--primary" type="submit" disabled={loading === "fee-bump" || requireWallet}>Build & submit fee-bump</button>
+                  </form>
+                  {feeBumpResult && (
+                    <div className="info-box">
+                      <span className="eyebrow">Fee-bump submitted</span>
+                      <code>{feeBumpResult.hash}</code>
+                    </div>
+                  )}
+
                   {lastRegisterTx && (
                     <div className="info-box">
                       <span className="eyebrow">Register tx</span>

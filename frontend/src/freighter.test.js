@@ -45,6 +45,10 @@ const {
   SOROBAN_RPC_URL,
   readKitewellState,
   registerBuilderWithFreighter,
+  normalizeHashMemo,
+  isTxBadSeqFailure,
+  buildSacTransferTransaction,
+  inspectInnerEnvelope,
 } = await import("./freighter");
 
 const CONTRACT_ID =
@@ -175,6 +179,89 @@ describe("readKitewellState", () => {
       "valid Soroban contract"
     );
     expect(sorobanServerMock.simulateTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("hash memo helpers", () => {
+  it("accepts a 32-byte hex fixture and strips spaces", () => {
+    const hex = "ab".repeat(32);
+    expect(normalizeHashMemo(`${hex.slice(0, 20)} ${hex.slice(20)}`)).toBe(hex);
+  });
+
+  it("rejects 31-byte, 33-byte, empty, and non-hex values", () => {
+    expect(() => normalizeHashMemo("ab".repeat(31))).toThrow(/64 hexadecimal/);
+    expect(() => normalizeHashMemo("ab".repeat(33))).toThrow(/64 hexadecimal/);
+    expect(() => normalizeHashMemo(" ")).toThrow(/required/);
+    expect(() => normalizeHashMemo("z".repeat(64))).toThrow(/64 hexadecimal/);
+  });
+});
+
+describe("stale sequence errors", () => {
+  it("offers reload only for tx_bad_seq failures", () => {
+    expect(isTxBadSeqFailure({ response: { data: { extras: { result_codes: { transaction: "tx_bad_seq" } } } } })).toBe(true);
+    expect(isTxBadSeqFailure({ response: { data: { extras: { result_codes: { transaction: "tx_failed" } } } } })).toBe(false);
+  });
+});
+
+describe("SAC asset transfers", () => {
+  it("builds invokeHostFunction instead of a payment operation", () => {
+    const issuer = StellarSdk.Keypair.random().publicKey();
+    const source = StellarSdk.Keypair.random().publicKey();
+    const destination = StellarSdk.Keypair.random().publicKey();
+    const tx = buildSacTransferTransaction(source, destination, "1.25", {
+      isNative: false,
+      code: "FOO",
+      issuer,
+    }, "7");
+
+    expect(tx.operations).toHaveLength(1);
+    expect(tx.operations[0].type).toBe("invokeHostFunction");
+  });
+
+  it("rejects the source as destination", () => {
+    const source = StellarSdk.Keypair.random().publicKey();
+    expect(() => buildSacTransferTransaction(source, source, "1", {
+      isNative: false,
+      code: "FOO",
+      issuer: StellarSdk.Keypair.random().publicKey(),
+    }, "7")).toThrow(/different/);
+  });
+});
+
+describe("fee-bump envelopes", () => {
+  it("inspects inner transaction metadata and preserves inner XDR for wrapping", () => {
+    const source = StellarSdk.Keypair.random().publicKey();
+    const inner = new StellarSdk.TransactionBuilder(new StellarSdk.Account(source, "7"), {
+      fee: "200",
+      networkPassphrase: StellarSdk.Networks.TESTNET,
+    })
+      .addOperation(StellarSdk.Operation.bumpSequence({ bumpTo: "8" }))
+      .addOperation(StellarSdk.Operation.bumpSequence({ bumpTo: "9" }))
+      .setTimeout(30)
+      .build();
+
+    const inspected = inspectInnerEnvelope(inner.toXDR());
+    expect(inspected.operationCount).toBe(2);
+    expect(inspected.source).toBe(source);
+    expect(inspected.fee).toBe("400");
+
+    const feeBump = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
+      source,
+      "200",
+      inspected.transaction,
+      StellarSdk.Networks.TESTNET
+    );
+    expect(feeBump.innerTransaction.toXDR()).toBe(inner.toXDR());
+  });
+
+  it("refuses already fee-bumped envelopes", () => {
+    const source = StellarSdk.Keypair.random().publicKey();
+    const inner = new StellarSdk.TransactionBuilder(new StellarSdk.Account(source, "7"), {
+      fee: "200",
+      networkPassphrase: StellarSdk.Networks.TESTNET,
+    }).addOperation(StellarSdk.Operation.bumpSequence({ bumpTo: "8" })).setTimeout(30).build();
+    const feeBump = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(source, "200", inner, StellarSdk.Networks.TESTNET);
+    expect(() => inspectInnerEnvelope(feeBump.toXDR())).toThrow(/already a fee-bump/i);
   });
 });
 

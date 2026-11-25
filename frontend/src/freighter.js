@@ -166,6 +166,9 @@ export async function registerBuilderWithFreighter(
 }
 
 function createMemo(memoType, value) {
+  if (memoType === "hash" && !String(value ?? "").replace(/\s/g, "")) {
+    throw new Error("Hash memo is required.");
+  }
   if (!value) return null;
 
   if (memoType === "text") {
@@ -183,13 +186,34 @@ function createMemo(memoType, value) {
   }
 
   if (memoType === "hash") {
-    if (!/^[0-9a-fA-F]{64}$/.test(value)) {
-      throw new Error("Hash memos must be exactly 64 hexadecimal characters.");
-    }
-    return StellarSdk.Memo.hash(value);
+    return StellarSdk.Memo.hash(normalizeHashMemo(value));
   }
 
   throw new Error(`Unsupported memo type: ${memoType}`);
+}
+
+export function normalizeHashMemo(value) {
+  const normalized = String(value ?? "").replace(/\s/g, "");
+  if (!normalized) throw new Error("Hash memo is required.");
+  if (!/^[0-9a-fA-F]{64}$/.test(normalized)) {
+    throw new Error("Hash memos must be exactly 64 hexadecimal characters.");
+  }
+  return normalized;
+}
+
+export function isTxBadSeqFailure(error) {
+  if (!error) return false;
+  const resultCodes =
+    error.result?.result_codes ||
+    error.response?.data?.extras?.result_codes ||
+    error.response?.data?.result_codes ||
+    {};
+  return (
+    resultCodes.transaction === "tx_bad_seq" ||
+    error.result?.tx_bad_seq === true ||
+    error.tx_bad_seq === true ||
+    String(error.message || error).toLowerCase().includes("tx_bad_seq")
+  );
 }
 
 export async function checkFreighterInstalled() {
@@ -392,6 +416,111 @@ export async function pathPaymentWithFreighter({
     .build();
 
   return signAndSubmit(transaction, publicKey);
+}
+
+export function buildSacTransferTransaction(publicKey, destination, amount, asset, sequence = "0") {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
+    throw new Error("Destination must be a valid Stellar public key (G…).");
+  }
+  if (destination === publicKey) {
+    throw new Error("Destination must be different from the source account.");
+  }
+  const amountValue = normalizeAmount(amount, "Amount");
+  if (!asset || asset.isNative) {
+    throw new Error("Choose a credit asset for a SAC transfer.");
+  }
+
+  const stellarAsset = resolvePaymentAsset(asset);
+  const contractId = stellarAsset.contractId(currentPassphrase());
+  const contract = new StellarSdk.Contract(contractId);
+  const amountMinor = BigInt(amountValue.split(".")[0] || "0") * 10000000n;
+  const fraction = (amountValue.split(".")[1] || "").padEnd(7, "0");
+  const amountInt = amountMinor + (fraction ? BigInt(fraction) : 0n);
+  const source = new StellarSdk.Account(publicKey, sequence);
+  return new StellarSdk.TransactionBuilder(source, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(contract.call(
+      "transfer",
+      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
+      StellarSdk.nativeToScVal(destination, { type: "address" }),
+      StellarSdk.nativeToScVal(amountInt, { type: "i128" })
+    ))
+    .setTimeout(180)
+    .build();
+}
+
+export async function sendSacTransferWithFreighter({
+  publicKey,
+  destination,
+  amount,
+  asset,
+  availableBalance,
+} = {}) {
+  if (availableBalance !== undefined && availableBalance !== null) {
+    const normalized = normalizeAmount(amount, "Amount");
+    if (Number(normalized) > Number(availableBalance)) {
+      throw new Error(`Insufficient SAC balance. Available: ${availableBalance}.`);
+    }
+  }
+  const account = await sorobanRpc.getAccount(publicKey);
+  const transaction = buildSacTransferTransaction(
+    publicKey,
+    destination,
+    amount,
+    asset,
+    account.sequence
+  );
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const result = await sorobanRpc.sendTransaction(signedTx);
+  if (result.status === "ERROR") {
+    throw new Error(`SAC transfer rejected by the network. Tx hash: ${result.hash}`);
+  }
+  return { hash: result.hash, confirmed: false };
+}
+
+export const sendSacAssetTransferWithFreighter = sendSacTransferWithFreighter;
+
+export function inspectInnerEnvelope(innerXdr) {
+  if (!innerXdr || !String(innerXdr).trim()) {
+    throw new Error("Paste an inner transaction envelope.");
+  }
+  const transaction = StellarSdk.TransactionBuilder.fromXDR(
+    String(innerXdr).trim(),
+    currentPassphrase()
+  );
+  if (transaction instanceof StellarSdk.FeeBumpTransaction) {
+    throw new Error("The pasted envelope is already a fee-bump transaction.");
+  }
+  return {
+    transaction,
+    source: transaction.source,
+    fee: transaction.fee,
+    operationCount: transaction.operations.length,
+  };
+}
+
+export async function feeBumpInnerEnvelopeWithFreighter(publicKey, innerXdr, feePerOperation) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!/^\d+$/.test(String(feePerOperation ?? "").trim()) || BigInt(feePerOperation) <= 0n) {
+    throw new Error("Fee per operation must be greater than zero.");
+  }
+  const { transaction: inner } = inspectInnerEnvelope(innerXdr);
+  const feeBump = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
+    publicKey,
+    String(feePerOperation).trim(),
+    inner,
+    currentPassphrase()
+  );
+  const signed = await signWithFreighter(feeBump.toXDR(), publicKey);
+  return getServer().submitTransaction(signed);
 }
 
 /**
