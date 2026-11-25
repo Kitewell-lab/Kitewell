@@ -1,4 +1,5 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { Buffer } from "buffer";
 import { fetchAccountViaApi, fetchPaymentsViaApi } from "./api";
 import { normaliseTxHash } from "./txStatusWatch";
 import { rowsToCsv } from "./csvExport";
@@ -1020,6 +1021,106 @@ export async function getBalance(publicKey, options = {}) {
 
 export const listClaimableBalances = getClaimableBalances;
 
+/** Load all open offers owned by the connected account from Horizon. */
+export async function getOpenOffers(publicKey, options = {}) {
+  return withHorizon429Backoff(async () => {
+    let page = await getServer().offers().forAccount(publicKey).limit(200).call();
+    const offers = [];
+    while (page.records.length > 0) {
+      offers.push(...page.records);
+      if (page.records.length < 200) break;
+      page = await page.next();
+    }
+    return offers;
+  }, options);
+}
+
+/**
+ * Fetch and parse stellar.toml for a domain or issuer account.
+ *
+ * @param {string} domainOrIssuer Either a domain (e.g., "example.com") or a
+ *   Stellar public key (G...). When an issuer is provided, the SDK resolves
+ *   the home_domain from the account's on-chain data.
+ * @returns {Promise<object>} Parsed stellar.toml with keys like
+ *   TRANSFER_SERVER, WEB_AUTH_ENDPOINT, KYC_SERVER, CURRENCIES, etc.
+ */
+export async function fetchStellarToml(domainOrIssuer) {
+  if (!domainOrIssuer || typeof domainOrIssuer !== "string") {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  const trimmed = domainOrIssuer.trim();
+  if (!trimmed) {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  return StellarSdk.StellarTomlResolver.resolve(trimmed, {
+    allowHttp: false,
+  });
+}
+
+/**
+ * Fetch the SEP-24 info endpoint from a transfer server URL.
+ *
+ * @param {string} transferServerUrl The TRANSFER_SERVER URL from stellar.toml.
+ * @returns {Promise<object>} The parsed JSON response from the /info endpoint,
+ *   including deposit and withdraw asset details.
+ */
+export async function fetchTransferServerInfo(transferServerUrl) {
+  if (!transferServerUrl || typeof transferServerUrl !== "string") {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  const trimmed = transferServerUrl.trim();
+  if (!trimmed) {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  if (!trimmed.startsWith("https://")) {
+    throw new Error("Transfer server URL must use HTTPS.");
+  }
+
+  const baseUrl = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  const infoUrl = `${baseUrl}/info`;
+
+  const response = await fetch(infoUrl);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch transfer server info: ${response.status} ${response.statusText}`
+    );
+  }
+
+  return response.json();
+}
+
+/**
+ * Fetch stellar.toml and optionally the transfer server info for a domain or issuer.
+ *
+ * @param {string} domainOrIssuer Either a domain (e.g., "example.com") or a
+ *   Stellar public key (G...).
+ * @returns {Promise<object>} An object with:
+ *   - toml: The parsed stellar.toml
+ *   - transferServerInfo: The parsed /info response (null if TRANSFER_SERVER
+ *     is absent or the fetch fails)
+ */
+export async function fetchAnchorInfo(domainOrIssuer) {
+  const toml = await fetchStellarToml(domainOrIssuer);
+
+  let transferServerInfo = null;
+  if (toml.TRANSFER_SERVER) {
+    try {
+      transferServerInfo = await fetchTransferServerInfo(toml.TRANSFER_SERVER);
+    } catch {
+      transferServerInfo = null;
+    }
+  }
+
+  return {
+    toml,
+    transferServerInfo,
+  };
+}
+
 /**
  * Load one liquidity pool (both reserves and total shares) from Horizon.
  *
@@ -1629,7 +1730,7 @@ export async function getAccountSnapshot(publicKey) {
 
   const account = await getServer().loadAccount(publicKey);
 
-  let offers = [];
+  let offers;
   try {
     const offersResponse = await getServer()
       .offers()
@@ -1700,6 +1801,58 @@ export async function downloadAccountSnapshot(publicKey) {
   link.click();
 
   URL.revokeObjectURL(url);
+}
+
+/**
+ * List the assets issued by `publicKey` that have clawback enabled.
+ * Horizon's accounts endpoint lists what an account holds, not what it
+ * issues, so this reads the issued-asset index directly.
+ */
+export async function getIssuedClawbackAssets(publicKey) {
+  const params = new URLSearchParams({
+    asset_issuer: publicKey,
+    limit: "200",
+  });
+  const response = await fetch(
+    `${getActiveNetwork().horizonUrl}/assets?${params.toString()}`
+  );
+  if (!response.ok) {
+    throw new Error("Could not load the assets issued by this account.");
+  }
+
+  const data = await response.json();
+  return (data._embedded?.records || [])
+    .filter((asset) => asset.flags?.clawback_enabled)
+    .map((asset) => ({
+      key: `${asset.asset_code}:${asset.asset_issuer}`,
+      code: asset.asset_code,
+      issuer: asset.asset_issuer,
+      isNative: false,
+    }));
+}
+
+/**
+ * Read a holder's balance of one credit asset straight from Horizon.
+ * Throws when the holder has no trustline for that asset.
+ */
+export async function getAccountAssetBalance(
+  publicKey,
+  assetCode,
+  assetIssuer
+) {
+  const account = await getServer().loadAccount(publicKey);
+  const code = (assetCode || "").trim().toUpperCase();
+  const match = mapHorizonBalances(account).find(
+    (balance) =>
+      !balance.isNative &&
+      balance.code === code &&
+      balance.issuer === assetIssuer
+  );
+
+  if (!match) {
+    throw new Error(`Holder has no trustline for ${code || "that asset"}.`);
+  }
+  return match.balance;
 }
 
 export { summarizeEnvelopeSignatures } from "./multisigEnvelope";

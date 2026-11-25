@@ -27,7 +27,10 @@ export async function fetchAccountViaApi(publicKey, network) {
   const res = await fetch(`${API_BASE}/api/account/${publicKey}${query}`);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Account fetch failed");
-  return { ...data, arrivedAt: Date.now() };
+  if (data && typeof data === "object") {
+    data.arrivedAt = Date.now();
+  }
+  return data;
 }
 
 export async function fetchPaymentsViaApi(publicKey, limit = 15, cursor, network, options = {}) {

@@ -15,7 +15,6 @@ const {
   horizonLoadAccountMock,
   horizonSubmitMock,
   getNetworkDetailsMock,
-  horizonServerMock,
 } = vi.hoisted(() => ({
   sorobanServerMock: {
     simulateTransaction: vi.fn(),
