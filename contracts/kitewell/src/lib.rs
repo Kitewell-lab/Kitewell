@@ -165,6 +165,14 @@ impl Kitewell {
         Ok(())
     }
 
+    /// Whether registration is paused.
+    ///
+    /// Read-only, so the Lab tab can disable the check-in action and show the
+    /// paused state without guessing at a transaction error.
+    pub fn paused(env: Env) -> bool {
+        env.storage().instance().get(&PAUSED).unwrap_or(false)
+    }
+
     /// Returns the lab name. Useful as a smoke-test invoke.
     pub fn lab_name(env: Env) -> String {
         String::from_str(&env, "Kitewell")

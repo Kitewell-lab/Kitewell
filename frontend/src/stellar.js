@@ -9,6 +9,8 @@ import {
   NETWORKS,
 } from "./network";
 import { calculateMinimumBalance } from "./accountReserve";
+import { mapTransactionFee } from "./historyFee";
+import { Buffer } from "buffer";
 
 /** Shown in the lab panel when Horizon asks the client to slow down. */
 export const HORIZON_SLOWDOWN_MESSAGE =
@@ -23,6 +25,138 @@ const HORIZON_429_MAX_WAIT_SEC = 30;
  * @type {Map<string, { streak: number }>}
  */
 const horizon429BackoffByNetwork = new Map();
+
+
+/** @param {unknown} error */
+export function isHorizon429(error) {
+  const status = error?.response?.status ?? error?.status;
+  if (status === 429) return true;
+  const message = String(error?.message ?? "");
+  return /too many requests/i.test(message);
+}
+
+/** @param {unknown} error */
+export function isHorizonSlowdownError(error) {
+  return error instanceof Error && error.message === HORIZON_SLOWDOWN_MESSAGE;
+}
+
+/** @param {unknown} error */
+function readRetryAfterSeconds(error) {
+  const headers = error?.response?.headers;
+  if (!headers) return null;
+
+  const raw =
+    typeof headers.get === "function"
+      ? headers.get("retry-after") ?? headers.get("Retry-After")
+      : headers["retry-after"] ?? headers["Retry-After"];
+
+  if (raw == null || raw === "") return null;
+
+  const asNumber = Number(raw);
+  if (Number.isFinite(asNumber) && asNumber >= 0) return asNumber;
+
+  const asDate = Date.parse(String(raw));
+  if (!Number.isNaN(asDate)) {
+    return Math.max(0, (asDate - Date.now()) / 1000);
+  }
+
+  return null;
+}
+
+/** @param {number} streak 1-based count of consecutive 429s on this network */
+export function computeHorizon429WaitSeconds(streak) {
+  const safeStreak = Math.max(1, streak);
+  return Math.min(
+    HORIZON_429_BASE_WAIT_SEC * 2 ** (safeStreak - 1),
+    HORIZON_429_MAX_WAIT_SEC
+  );
+}
+
+function resetHorizon429Backoff(networkId = getActiveNetworkId()) {
+  horizon429BackoffByNetwork.delete(networkId);
+}
+
+/**
+ * Record a 429 for the active network and return how long to wait (seconds).
+ * Prefers Horizon's Retry-After when present; otherwise 2 → 4 → 8 … capped at 30.
+ * @param {unknown} error
+ * @returns {number}
+ */
+export function recordHorizon429(error) {
+  const networkId = getActiveNetworkId();
+  const prior = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
+  const streak = prior.streak + 1;
+  horizon429BackoffByNetwork.set(networkId, { streak });
+
+  const retryAfter = readRetryAfterSeconds(error);
+  if (retryAfter != null) return retryAfter;
+  return computeHorizon429WaitSeconds(streak);
+}
+
+/** Test helper: clear the shared backoff clocks. */
+export function resetHorizon429BackoffForTests() {
+  horizon429BackoffByNetwork.clear();
+}
+
+function abortError() {
+  const error = new Error("Aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function defaultSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    function onAbort() {
+      clearTimeout(timer);
+      reject(abortError());
+    }
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Run a Horizon lab read with shared per-network 429 backoff.
+ *
+ * On 429: waits Retry-After (or 2/4/8…≤30s), then rejects with
+ * {@link HORIZON_SLOWDOWN_MESSAGE}. A later success resets the clock.
+ * A 500 (or any non-429) is rethrown unchanged. The wait is cancelled when
+ * `signal` aborts (unmount / network change).
+ *
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @param {object} [options]
+ * @param {AbortSignal} [options.signal]
+ * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [options.sleep]
+ * @returns {Promise<T>}
+ */
+export async function withHorizon429Backoff(fn, options = {}) {
+  const { signal, sleep = defaultSleep } = options;
+
+  if (signal?.aborted) throw abortError();
+
+  try {
+    const result = await fn();
+    resetHorizon429Backoff();
+    return result;
+  } catch (error) {
+    if (!isHorizon429(error)) throw error;
+
+    const waitSeconds = recordHorizon429(error);
+    await sleep(waitSeconds * 1000, signal);
+    throw new Error(HORIZON_SLOWDOWN_MESSAGE);
+  }
+}
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -81,8 +215,11 @@ export function explorerAccountUrl(publicKey) {
     : `${network.horizonUrl}/accounts/${publicKey}`;
 }
 
-export function explorerTxUrl(hash) {
-  const network = getActiveNetwork();
+/**
+ * Explorer link for a transaction hash. Defaults to the active network; pass a
+ * network to build the link for a specific one.
+ */
+export function explorerTxUrl(hash, network = getActiveNetwork()) {
   return network.explorerBase
     ? `${network.explorerBase}/tx/${hash}`
     : `${network.horizonUrl}/transactions/${hash}`;
@@ -510,6 +647,14 @@ export function buildAsset({ isNative, code, issuer } = {}) {
   return new StellarSdk.Asset(normalizedCode.toUpperCase(), issuer);
 }
 
+function mapOrderBookRows(rows = []) {
+  return rows.slice(0, 10).map((row) => ({
+    amount: row.amount,
+    price: row.price,
+    priceR: row.price_r,
+  }));
+}
+
 /** Read the public Horizon order book for a validated pair of SDK assets. */
 export async function getOrderBook(selling, buying) {
   if (!selling || !buying) {
@@ -689,7 +834,7 @@ function mapClaimableBalance(record, publicKey) {
  * the filter server-side so another account's balance is never offered for
  * clawback.
  */
-export async function getClaimableBalances(publicKey) {
+export async function getSponsoredClaimableBalances(publicKey) {
   const records = await getServer()
     .claimableBalances()
     .forSponsor(publicKey)
@@ -753,7 +898,6 @@ export async function getAccountDetails(publicKey) {
     subentryCount: account.subentry_count,
     lastModifiedLedger: account.last_modified_ledger ?? null,
     thresholds: account.thresholds,
-    signers: account.signers,
     balances: mapHorizonBalances(account),
     dataEntries: mapAccountDataEntries(account),
     signers: account.signers || [],
@@ -802,7 +946,6 @@ export async function getAccountOffers(publicKey, options = {}) {
       const price = offer.price_r ?? offer.price;
       if (
         offerId === undefined ||
-        offer.amount === undefined ||
         !price ||
         price.n === undefined ||
         price.d === undefined
@@ -814,7 +957,12 @@ export async function getAccountOffers(publicKey, options = {}) {
         offerId: String(offerId),
         selling: offerAssetDescriptor(offer.selling),
         buying: offerAssetDescriptor(offer.buying),
-        amount: String(offer.amount),
+        // A missing amount stays null: the row shows it as unknown and
+        // cannot cancel it, instead of the whole list failing to load.
+        amount:
+          offer.amount === undefined || offer.amount === null
+            ? null
+            : String(offer.amount),
         priceNumerator: String(price.n),
         priceDenominator: String(price.d),
       };
@@ -1161,17 +1309,6 @@ export function mapPendingTransaction(record) {
   };
 }
 
-/**
- * Load one page of trades for an account.
- *
- * @param {string} publicKey Account to page through.
- * @param {number} [limit] Page size; Horizon caps it at 200 server-side.
- * @param {string} [cursor] Paging cursor from the previous page; omit for the
- *   first page.
- * @returns {Promise<{ records: object[], nextCursor: string|null }>} The
- *   mapped trade records plus the cursor for the next page (null on the last
- *   page).
- */
 /** How often an offer watch re-reads the order book by default. */
 export const OFFER_POLL_INTERVAL_MS = 5000;
 
@@ -1281,6 +1418,43 @@ export async function getPendingTransactions(publicKey, options = {}) {
       publicKey
     )}/pending_transactions`;
 
+    const response = options.signal
+      ? await fetch(url, { signal: options.signal })
+      : await fetch(url);
+    if (response.status === 404) {
+      return [];
+    }
+    if (!response.ok) {
+      throw new Error(
+        `Could not load pending transactions (HTTP ${response.status}).`
+      );
+    }
+
+    const body = await response.json();
+    const records = Array.isArray(body)
+      ? body
+      : body?._embedded?.records || body?.records || [];
+
+    return selectPendingTransactions(records);
+  }, options);
+}
+
+/**
+ * Load one page of trades for an account.
+ *
+ * @param {string} publicKey Account to page through.
+ * @param {number} [limit] Page size; Horizon caps it at 200 server-side.
+ * @param {string} [cursor] Paging cursor from the previous page; omit for the
+ *   first page.
+ * @returns {Promise<{ records: object[], nextCursor: string|null }>} The
+ *   mapped trade records plus the cursor for the next page (null on the last
+ *   page).
+ */
+export async function getTrades(publicKey, limit = 15, cursor, options = {}) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
+
   let builder = getServer()
     .trades()
     .forAccount(publicKey)
@@ -1292,10 +1466,13 @@ export async function getPendingTransactions(publicKey, options = {}) {
   }
 
   const response = await builder.call();
+  const hashes = await lookupTradeTransactionHashes(response.records, options);
 
   return {
-    records: response.records.map((trade) => ({
+    records: response.records.map((trade, index) => ({
       id: trade.id,
+      ledger: tradeLedger(trade),
+      transaction_hash: hashes[index],
       ledger_close_time: trade.ledger_close_time,
       offer_id: trade.offer_id,
       base_account: trade.base_account,
@@ -1314,6 +1491,504 @@ export async function getPendingTransactions(publicKey, options = {}) {
     nextCursor: response.records.length > 0 
       ? response.records[response.records.length - 1].paging_token 
       : null,
+  };
+}
+
+
+/**
+ * The operation that produced a trade. Horizon trade ids are
+ * `<operation id>-<index>`, where the operation id is a TOID.
+ */
+export function tradeOperationId(trade) {
+  const raw = String(trade?.id ?? trade?.paging_token ?? "");
+  const operationId = raw.split("-")[0];
+  return /^\d+$/.test(operationId) && operationId !== "0" ? operationId : null;
+}
+
+/**
+ * The ledger a trade closed in, read from the trade's own id: a TOID keeps the
+ * ledger sequence in its upper 32 bits. Null when the id is not a TOID.
+ */
+export function tradeLedger(trade) {
+  const operationId = tradeOperationId(trade);
+  if (!operationId) return null;
+  const ledger = Number(BigInt(operationId) >> 32n);
+  return ledger > 0 ? ledger : null;
+}
+
+function isTransactionHash(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
+}
+
+/**
+ * Explorer link for the transaction that settled a trade, on the given network
+ * (the active network by default). Null when the trade has no known hash.
+ * The link only opens the explorer; it never submits anything.
+ */
+export function tradeExplorerLink(trade, network = getActiveNetwork()) {
+  const hash = trade?.transaction_hash;
+  if (!isTransactionHash(hash) || !network) return null;
+  return explorerTxUrl(hash.toLowerCase(), network);
+}
+
+const TRADE_HASH_LOOKUP_CONCURRENCY = 5;
+
+/**
+ * Horizon trade records do not carry the transaction hash, so read it from
+ * each trade's operation. A lookup that fails leaves that trade's hash null
+ * ("unknown") instead of failing the whole page.
+ */
+async function lookupTradeTransactionHashes(trades, options = {}) {
+  const {
+    fetchOperation = (id) => getServer().operations().operation(id).call(),
+  } = options;
+  const hashes = new Array(trades.length).fill(null);
+  const byOperation = new Map();
+  trades.forEach((trade, index) => {
+    const operationId = tradeOperationId(trade);
+    if (!operationId) return;
+    if (!byOperation.has(operationId)) byOperation.set(operationId, []);
+    byOperation.get(operationId).push(index);
+  });
+
+  const queue = [...byOperation.keys()];
+  const worker = async () => {
+    while (queue.length) {
+      const operationId = queue.shift();
+      let hash;
+      try {
+        const operation = await fetchOperation(operationId);
+        hash = isTransactionHash(operation?.transaction_hash)
+          ? operation.transaction_hash
+          : null;
+      } catch {
+        hash = null;
+      }
+      for (const index of byOperation.get(operationId)) hashes[index] = hash;
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(TRADE_HASH_LOOKUP_CONCURRENCY, queue.length) }, worker)
+  );
+  return hashes;
+}
+
+const STROOPS_PER_UNIT = 10_000_000n;
+
+/** Parse a Horizon amount ("12.3400000") into stroops; null when invalid. */
+function amountToStroops(value) {
+  const text = String(value ?? "").trim();
+  const match = text.match(/^(\d+)(?:\.(\d{1,7}))?$/);
+  if (!match) return null;
+  return BigInt(match[1]) * STROOPS_PER_UNIT + BigInt((match[2] || "").padEnd(7, "0"));
+}
+
+function stroopsToAmount(stroops) {
+  const whole = stroops / STROOPS_PER_UNIT;
+  const fraction = String(stroops % STROOPS_PER_UNIT).padStart(7, "0");
+  return `${whole}.${fraction}`;
+}
+
+function sameOfferAsset(descriptor, type, code, issuer) {
+  if (!descriptor) return false;
+  if (descriptor.isNative) return type === "native";
+  return type !== "native" && code === descriptor.code && issuer === descriptor.issuer;
+}
+
+/**
+ * How much of its selling asset an offer gave up in one of its own trades.
+ * Null when the trade's assets do not include the offer's selling asset.
+ */
+function offerSoldInTrade(offer, trade) {
+  if (
+    sameOfferAsset(
+      offer.selling,
+      trade.base_asset_type,
+      trade.base_asset_code,
+      trade.base_asset_issuer
+    )
+  ) {
+    return amountToStroops(trade.base_amount);
+  }
+  if (
+    sameOfferAsset(
+      offer.selling,
+      trade.counter_asset_type,
+      trade.counter_asset_code,
+      trade.counter_asset_issuer
+    )
+  ) {
+    return amountToStroops(trade.counter_amount);
+  }
+  return null;
+}
+
+const OFFER_TRADES_PAGE_LIMIT = 200;
+const OFFER_TRADES_MAX_PAGES = 10;
+
+/**
+ * Read the original amount of one of the account's offers from the offer
+ * itself: what is still open plus everything its own trades have filled
+ * (`/offers/{id}/trades`). Nothing is estimated from the order book.
+ * Returns null when the amount or any trade cannot be read.
+ */
+export async function getOfferOriginalAmount(offer, options = {}) {
+  const remaining = amountToStroops(offer?.amount);
+  if (remaining === null || !offer?.offerId) return null;
+
+  const {
+    fetchOfferTrades = (offerId, cursor) => {
+      let builder = getServer()
+        .trades()
+        .forOffer(offerId)
+        .limit(OFFER_TRADES_PAGE_LIMIT)
+        .order("asc");
+      if (cursor) builder = builder.cursor(cursor);
+      return builder.call();
+    },
+  } = options;
+
+  let filled = 0n;
+  let cursor;
+  for (let page = 0; page < OFFER_TRADES_MAX_PAGES; page += 1) {
+    const response = await fetchOfferTrades(offer.offerId, cursor);
+    const records = response?.records || [];
+    for (const trade of records) {
+      const sold = offerSoldInTrade(offer, trade);
+      if (sold === null) return null;
+      filled += sold;
+    }
+    if (records.length < OFFER_TRADES_PAGE_LIMIT) {
+      return stroopsToAmount(remaining + filled);
+    }
+    cursor = records[records.length - 1].paging_token;
+  }
+  // Too many fills to read in one go; do not guess.
+  return null;
+}
+
+/**
+ * Attach `originalAmount` to each of the account's offers. An offer whose
+ * history cannot be read keeps `originalAmount: null`.
+ */
+export async function withOfferOriginalAmounts(offers, options = {}) {
+  return Promise.all(
+    (offers || []).map(async (offer) => {
+      let originalAmount;
+      try {
+        originalAmount = await getOfferOriginalAmount(offer, options);
+      } catch {
+        originalAmount = null;
+      }
+      return { ...offer, originalAmount };
+    })
+  );
+}
+
+/**
+ * Describe how much of an open offer is still open, from the offer's own
+ * figures. `cancellable` is false when the open amount is unknown.
+ *
+ * @returns {{ state: "unknown"|"open"|"partial"|"original-unknown",
+ *   remaining: string|null, original: string|null, filled: string|null,
+ *   cancellable: boolean }}
+ */
+export function describeOfferFill(offer) {
+  const remaining = amountToStroops(offer?.amount);
+  if (remaining === null) {
+    return { state: "unknown", remaining: null, original: null, filled: null, cancellable: false };
+  }
+  const original = amountToStroops(offer?.originalAmount);
+  if (original === null || original < remaining) {
+    return {
+      state: "original-unknown",
+      remaining: stroopsToAmount(remaining),
+      original: null,
+      filled: null,
+      cancellable: true,
+    };
+  }
+  return {
+    state: original === remaining ? "open" : "partial",
+    remaining: stroopsToAmount(remaining),
+    original: stroopsToAmount(original),
+    filled: stroopsToAmount(original - remaining),
+    cancellable: true,
+  };
+}
+
+// Restored: these exports were dropped while merging earlier pull requests.
+
+export async function getOpenOffers(publicKey, options = {}) {
+  return withHorizon429Backoff(async () => {
+    let page = await getServer().offers().forAccount(publicKey).limit(200).call();
+    const offers = [];
+    while (page.records.length > 0) {
+      offers.push(...page.records);
+      if (page.records.length < 200) break;
+      page = await page.next();
+    }
+    return offers;
+  }, options);
+}
+
+export async function getLatestBaseReserve() {
+  const response = await getServer()
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const baseReserve = response.records?.[0]?.base_reserve_in_stroops;
+  if (!/^\d+$/.test(String(baseReserve ?? "")) || Number(baseReserve) <= 0) {
+    throw new Error("Latest ledger did not include a valid base reserve.");
+  }
+  return String(baseReserve);
+}
+
+/**
+ * Keep only transactions Horizon has not applied yet.
+ * Applied rows from the pending endpoint are ignored.
+ */
+export function selectPendingTransactions(records) {
+  return (records || [])
+    .map(mapPendingTransaction)
+    .filter((tx) => tx.hash && tx.status !== "applied");
+}
+
+/**
+ * Fetch a complete account snapshot from Horizon.
+ *
+ * @param {string} publicKey The account to snapshot.
+ * @returns {Promise<object>} A comprehensive account snapshot including id,
+ *   sequence, balances, signers, thresholds, data entries, offers, and
+ *   subentry count. Secrets and signed XDR are never included.
+ */
+export async function getAccountSnapshot(publicKey) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
+
+  const account = await getServer().loadAccount(publicKey);
+
+  // Fetch offers for this account
+  let offers = [];
+  try {
+    const offersResponse = await getServer()
+      .offers()
+      .forAccount(publicKey)
+      .limit(200)
+      .call();
+    offers = offersResponse.records.map((offer) => ({
+      id: offer.id,
+      selling: offer.selling,
+      buying: offer.buying,
+      amount: offer.amount,
+      price: offer.price,
+      price_r: offer.price_r,
+    }));
+  } catch {
+    // Offers are optional; if fetch fails, continue with empty array
+    offers = [];
+  }
+
+  // Process data entries, converting non-UTF-8 values to hex
+  const dataEntries = {};
+  if (account.data_attr) {
+    Object.entries(account.data_attr).forEach(([key, value]) => {
+      try {
+        // Try to decode as UTF-8
+        const decoded = Buffer.from(value, "base64").toString("utf8");
+        // Check if it round-trips correctly (is valid UTF-8)
+        if (Buffer.from(decoded, "utf8").toString("base64") === value) {
+          dataEntries[key] = decoded;
+        } else {
+          // Not valid UTF-8, store as hex
+          dataEntries[key] = Buffer.from(value, "base64").toString("hex");
+        }
+      } catch {
+        // If decoding fails, store as hex
+        dataEntries[key] = Buffer.from(value, "base64").toString("hex");
+      }
+    });
+  }
+
+  return {
+    id: account.id,
+    sequence: account.sequenceNumber(),
+    subentryCount: account.subentry_count,
+    thresholds: {
+      low: account.thresholds.low_threshold,
+      medium: account.thresholds.med_threshold,
+      high: account.thresholds.high_threshold,
+    },
+    signers: account.signers.map((signer) => ({
+      key: signer.key,
+      weight: signer.weight,
+      type: signer.type,
+    })),
+    balances: mapHorizonBalances(account),
+    data: dataEntries,
+    offers,
+    network: getActiveNetworkId(),
+    exportedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Download an account snapshot as a JSON file.
+ *
+ * @param {string} publicKey The account to snapshot.
+ */
+export async function downloadAccountSnapshot(publicKey) {
+  const snapshot = await getAccountSnapshot(publicKey);
+
+  const filename = `kitewell-account-${snapshot.id.slice(0, 8)}-${Date.now()}.json`;
+  const json = JSON.stringify(snapshot, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
+const transactionDetailRequests = new Map();
+
+/**
+ * Read one transaction with its operations and effects from the active Horizon.
+ * Read-only. Failed transactions are included (`include_failed`). Concurrent
+ * calls for the same network and hash share one in-flight request.
+ *
+ * @param {string} input Transaction hash.
+ * @returns {Promise<{ transaction: object, operations: object[], effects: object[] }>}
+ */
+export function getTransactionDetails(input, options = {}) {
+  const hash = normaliseTxHash(input);
+  const base = getActiveNetwork().horizonUrl;
+  const key = `${base}|${hash}`;
+
+  const pending = transactionDetailRequests.get(key);
+  if (pending) return pending;
+
+  const read = async (path) => {
+    const response = await fetch(`${base}/transactions/${hash}${path}`);
+    if (response.status === 404) {
+      throw new Error("Transaction not found on this network.");
+    }
+    if (!response.ok) {
+      const error = new Error(`Could not load transaction (HTTP ${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    return response.json();
+  };
+
+  const request = withHorizon429Backoff(async () => {
+    const [transaction, operationPage, effectPage] = await Promise.all([
+      read(""),
+      read("/operations?limit=200&include_failed=true"),
+      read("/effects?limit=200"),
+    ]);
+    return {
+      transaction,
+      operations: operationPage?._embedded?.records || [],
+      effects: effectPage?._embedded?.records || [],
+    };
+  }, options).finally(() => transactionDetailRequests.delete(key));
+
+  transactionDetailRequests.set(key, request);
+  return request;
+}
+
+/**
+ * Fetch and parse stellar.toml for a domain or issuer account.
+ *
+ * @param {string} domainOrIssuer Either a domain (e.g., "example.com") or a
+ *   Stellar public key (G...). When an issuer is provided, the SDK resolves
+ *   the home_domain from the account's on-chain data.
+ * @returns {Promise<object>} Parsed stellar.toml with keys like
+ *   TRANSFER_SERVER, WEB_AUTH_ENDPOINT, KYC_SERVER, CURRENCIES, etc.
+ */
+export async function fetchStellarToml(domainOrIssuer) {
+  if (!domainOrIssuer || typeof domainOrIssuer !== "string") {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  const trimmed = domainOrIssuer.trim();
+  if (!trimmed) {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  return StellarSdk.StellarTomlResolver.resolve(trimmed, {
+    allowHttp: false,
+  });
+}
+
+/**
+ * Fetch the SEP-24 info endpoint from a transfer server URL.
+ *
+ * @param {string} transferServerUrl The TRANSFER_SERVER URL from stellar.toml.
+ * @returns {Promise<object>} The parsed JSON response from the /info endpoint,
+ *   including deposit and withdraw asset details.
+ */
+export async function fetchTransferServerInfo(transferServerUrl) {
+  if (!transferServerUrl || typeof transferServerUrl !== "string") {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  const trimmed = transferServerUrl.trim();
+  if (!trimmed) {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  // Only allow HTTPS URLs for security
+  if (!trimmed.startsWith("https://")) {
+    throw new Error("Transfer server URL must use HTTPS.");
+  }
+
+  // Build info endpoint URL, ensuring no double slashes
+  const baseUrl = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  const infoUrl = `${baseUrl}/info`;
+
+  const response = await fetch(infoUrl);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch transfer server info: ${response.status} ${response.statusText}`
+    );
+  }
+
+  return response.json();
+}
+
+/**
+ * Fetch stellar.toml and optionally the transfer server info for a domain or issuer.
+ *
+ * @param {string} domainOrIssuer Either a domain (e.g., "example.com") or a
+ *   Stellar public key (G...).
+ * @returns {Promise<object>} An object with:
+ *   - toml: The parsed stellar.toml
+ *   - transferServerInfo: The parsed /info response (null if TRANSFER_SERVER
+ *     is absent or the fetch fails)
+ */
+export async function fetchAnchorInfo(domainOrIssuer) {
+  const toml = await fetchStellarToml(domainOrIssuer);
+
+  let transferServerInfo = null;
+  if (toml.TRANSFER_SERVER) {
+    try {
+      transferServerInfo = await fetchTransferServerInfo(toml.TRANSFER_SERVER);
+    } catch {
+      // If the info endpoint fails, we still return the toml data
+      transferServerInfo = null;
+    }
+  }
+
+  return {
+    toml,
+    transferServerInfo,
   };
 }
 
