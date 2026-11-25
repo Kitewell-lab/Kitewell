@@ -5,6 +5,7 @@ import {
   getActiveNetworkId,
   isFriendbotAvailable,
 } from "./network";
+import { ORDER_BOOK_LEVELS, orderBookView } from "./orderBook";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -73,6 +74,40 @@ export function parsePathAssets(input) {
       }
       return buildAsset({ isNative: false, code, issuer });
     });
+}
+
+/**
+ * Load the order book for a selling/buying pair without placing an offer.
+ * Returns the best `ORDER_BOOK_LEVELS` bids and asks; an empty book is an
+ * empty state, and a failed read rejects so the caller can keep the form.
+ *
+ * @param {{ isNative: boolean, code?: string, issuer?: string }} selling
+ * @param {{ isNative: boolean, code?: string, issuer?: string }} buying
+ * @returns {Promise<{ bids: object[], asks: object[], isEmpty: boolean }>}
+ */
+export async function getOrderBook(selling, buying) {
+  const book = await getServer()
+    .orderbook(buildAsset(selling), buildAsset(buying))
+    .limit(ORDER_BOOK_LEVELS)
+    .call();
+
+  return orderBookView(book);
+}
+
+/**
+ * Whether an issuer has clawback enabled, read from its account flags. The
+ * claimable balance clawback action is hidden unless this is true.
+ *
+ * @param {string} issuer the asset issuer's public key
+ * @returns {Promise<boolean>}
+ */
+export async function getIssuerClawbackEnabled(issuer) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(issuer)) {
+    throw new Error("Asset issuer must be a valid Stellar public key (G…).");
+  }
+
+  const account = await getServer().loadAccount(issuer);
+  return Boolean(account.flags?.auth_clawback_enabled);
 }
 
 export async function fundWithFriendbot(publicKey) {

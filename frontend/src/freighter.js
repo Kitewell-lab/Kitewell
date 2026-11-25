@@ -7,6 +7,7 @@ import {
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetwork } from "./network";
 import { buildAsset, parsePathAssets } from "./stellar";
+import { clawbackClaimableBalanceOperation } from "./clawbackClaimableBalance";
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -382,6 +383,29 @@ export async function pathPaymentWithFreighter({
         path: intermediatePath,
       });
 
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(operation)
+    .setTimeout(180)
+    .build();
+
+  return signAndSubmit(transaction, publicKey);
+}
+
+/**
+ * Claw back a claimable balance the connected account created as the asset
+ * issuer. The transaction is one `clawbackClaimableBalance` operation for the
+ * given balance id, signed in Freighter and submitted to Horizon.
+ */
+export async function clawbackClaimableBalanceWithFreighter(publicKey, balanceId) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Account must be a valid Stellar public key (G…).");
+  }
+
+  const operation = clawbackClaimableBalanceOperation(balanceId);
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
