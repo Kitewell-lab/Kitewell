@@ -12,6 +12,19 @@
 export function mapBalance(balance) {
   if (!balance || typeof balance !== "object") return null;
 
+  if (balance.asset_type === "liquidity_pool_shares") {
+    return {
+      key: `pool:${balance.liquidity_pool_id}`,
+      code: "POOL",
+      issuer: null,
+      balance: balance.balance,
+      limit: null,
+      isNative: false,
+      isPoolShare: true,
+      poolId: balance.liquidity_pool_id,
+    };
+  }
+
   if (balance.asset_type === "native") {
     return {
       key: "native",
@@ -30,6 +43,14 @@ export function mapBalance(balance) {
     balance: balance.balance,
     limit: balance.limit ?? null,
     isNative: false,
+    isAuthorized:
+      typeof balance.is_authorized === "boolean" ? balance.is_authorized : null,
+    isAuthorizedToMaintainLiabilities:
+      typeof balance.is_authorized_to_maintain_liabilities === "boolean"
+        ? balance.is_authorized_to_maintain_liabilities
+        : null,
+    clawbackEnabled:
+      typeof balance.clawback_enabled === "boolean" ? balance.clawback_enabled : null,
   };
 }
 

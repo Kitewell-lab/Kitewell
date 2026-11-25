@@ -22,7 +22,7 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
           payments: () => ({
             forAccount: () => ({
               limit: () => ({
-                order: () => ({ call: paymentsCallMock }),
+                order: () => ({ join: () => ({ call: paymentsCallMock }) }),
               }),
             }),
           }),
@@ -47,6 +47,11 @@ describe("getTransactions API limit", () => {
     fetchPaymentsViaApi.mockResolvedValue(page);
 
     await expect(getTransactions("GTEST", 7)).resolves.toBe(page);
-    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 7, undefined);
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith(
+      "GTEST",
+      7,
+      undefined,
+      "TESTNET"
+    );
   });
 });

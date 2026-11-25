@@ -59,6 +59,40 @@ function override(envValue, fallback) {
  *   so a misconfigured server fails fast at startup instead of silently
  *   serving Testnet URLs.
  */
+/**
+ * Resolve the network a single request asked for.
+ *
+ * Account and payment reads accept a caller-selected network so the frontend
+ * can follow the header's Testnet / Futurenet switch. The default is Testnet
+ * when the caller sends nothing, independent of the server's own `NETWORK`.
+ *
+ * @param {string|null|undefined} id Network id (`TESTNET` or `FUTURENET`,
+ *   case-insensitive, trimmed). Blank, `null` and `undefined` mean Testnet.
+ * @returns {{ network: string, label: string, passphrase: string,
+ *   horizonUrl: string, friendbotUrl: string|null, explorerBase: string,
+ *   sorobanRpcUrl: string }}
+ * @throws {Error} When `id` names a network the backend does not support.
+ */
+export function resolveRequestNetwork(id) {
+  if (id !== undefined && id !== null && typeof id !== "string") {
+    throw new Error(
+      `Unsupported network "${String(id)}". Supported networks: ${SUPPORTED_NETWORKS.join(", ")}.`,
+    );
+  }
+
+  const requested = typeof id === "string" ? id.trim() : undefined;
+  const network = (requested || DEFAULT_NETWORK).toUpperCase();
+  const preset = NETWORK_PRESETS[network];
+
+  if (!preset) {
+    throw new Error(
+      `Unsupported network "${requested}". Supported networks: ${SUPPORTED_NETWORKS.join(", ")}.`,
+    );
+  }
+
+  return { network, ...preset };
+}
+
 export function resolveNetwork(env = process.env) {
   const requested =
     typeof env?.NETWORK === "string" ? env.NETWORK.trim() : undefined;

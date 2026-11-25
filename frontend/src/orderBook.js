@@ -117,6 +117,33 @@ export function offerPriceFromRow(row) {
 }
 
 /**
+ * The price numerator and denominator a chosen row puts in the offer form.
+ * Horizon's `price_r` is already the exact fraction, so the offer keeps the
+ * book's price instead of a rounded decimal.
+ *
+ * @param {{ priceR?: { n: number, d: number } }} row
+ * @returns {{ numerator: string, denominator: string }}
+ */
+export function offerPriceFractionFromRow(row) {
+  if (!row || typeof row !== "object") {
+    throw new TypeError("row must be an object");
+  }
+
+  const numerator = Number(row.priceR?.n);
+  const denominator = Number(row.priceR?.d);
+  if (
+    !Number.isInteger(numerator) ||
+    !Number.isInteger(denominator) ||
+    numerator <= 0 ||
+    denominator <= 0
+  ) {
+    throw new Error("That order book row has no usable price fraction.");
+  }
+
+  return { numerator: String(numerator), denominator: String(denominator) };
+}
+
+/**
  * Keep the offer form on a failed book load and explain what happened.
  *
  * @param {unknown} error the rejected load

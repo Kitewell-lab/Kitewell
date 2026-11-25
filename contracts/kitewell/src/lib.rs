@@ -1,11 +1,33 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, symbol_short, Address, Env, String,
-    Symbol,
+    Symbol, Vec,
 };
 
 const LAB: Symbol = symbol_short!("KITEWELL");
 const COUNT: Symbol = symbol_short!("COUNT");
+const INDEX: Symbol = symbol_short!("INDEX");
+
+/// Hard cap on one `list_builders` page, so a single read stays small.
+const BUILDER_PAGE_MAX: u32 = 50;
+
+fn read_index(env: &Env) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&INDEX)
+        .unwrap_or(Vec::new(env))
+}
+
+fn index_position(index: &Vec<Address>, address: &Address) -> Option<u32> {
+    let mut cursor = 0;
+    while cursor < index.len() {
+        if index.get(cursor).as_ref() == Some(address) {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+    None
+}
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const PENDING_ADMIN: Symbol = symbol_short!("PENDING");
 const PAUSED: Symbol = symbol_short!("PAUSED");
@@ -114,6 +136,11 @@ impl Kitewell {
         env.storage().instance().get(&ADMIN)
     }
 
+    /// Read the pending admin, if one has been proposed.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&PENDING_ADMIN)
+    }
+
     /// Admin-only pause / unpause toggle.
     ///
     /// On success it publishes the `paused` event: topic `("paused",)`, data
@@ -148,6 +175,33 @@ impl Kitewell {
         env.storage().instance().get(&COUNT).unwrap_or(0)
     }
 
+    /// Page through the addresses in the registry index.
+    ///
+    /// The index holds one row per registered builder, in check-in order, so
+    /// the length always matches `builder_count`. `start` past the end returns
+    /// an empty page rather than an error. Pages are capped at
+    /// `BUILDER_PAGE_MAX` entries so a single read cannot grow unbounded.
+    pub fn list_builders(env: Env, start: u32, limit: u32) -> Vec<Address> {
+        let index = read_index(&env);
+        let len = index.len();
+        let mut page = Vec::new(&env);
+
+        if limit == 0 || start >= len {
+            return page;
+        }
+
+        let end = start.saturating_add(limit.min(BUILDER_PAGE_MAX)).min(len);
+        let mut cursor = start;
+        while cursor < end {
+            if let Some(address) = index.get(cursor) {
+                page.push_back(address);
+            }
+            cursor += 1;
+        }
+
+        page
+    }
+
     /// Check in a builder nickname for `caller`. Overwrites previous name.
     ///
     /// Rejects an empty nickname, so a stored builder always has a name.
@@ -177,6 +231,14 @@ impl Kitewell {
             let count: u32 = env.storage().instance().get(&COUNT).unwrap_or(0);
             env.storage().instance().set(&COUNT, &(count + 1));
             env.storage().instance().extend_ttl(1000, 5000);
+
+            // The index carries one row per registered builder. It is only
+            // appended for a first check-in, so a second register for the same
+            // address cannot add a duplicate row.
+            let mut index = read_index(&env);
+            index.push_back(caller.clone());
+            env.storage().persistent().set(&INDEX, &index);
+            env.storage().persistent().extend_ttl(&INDEX, 1000, 5000);
         }
 
         env.storage().persistent().extend_ttl(&key, 1000, 5000);
@@ -189,6 +251,37 @@ impl Kitewell {
             is_new,
         }
         .publish(&env);
+
+        Ok(())
+    }
+
+    /// Rename a builder's existing nickname. Count unchanged.
+    ///
+    /// Auth-gated to `caller`. Requires the caller to already be registered,
+    /// and rejects an empty new name just like `register`. Blocked while
+    /// paused. On success the stored name updates and `COUNT` stays stable,
+    /// so a builder who mistyped can edit in place without inflating the
+    /// count.
+    pub fn rename(env: Env, caller: Address, new_name: String) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Empty-name guard: payload validation.
+        if new_name.is_empty() {
+            return Err(Error::EmptyName);
+        }
+
+        let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+        if paused {
+            return Err(Error::Paused);
+        }
+
+        let key = (LAB, caller.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotRegistered);
+        }
+
+        env.storage().persistent().set(&key, &new_name);
+        env.storage().persistent().extend_ttl(&key, 1000, 5000);
 
         Ok(())
     }
@@ -213,6 +306,16 @@ impl Kitewell {
             return Err(Error::NotRegistered);
         }
         env.storage().persistent().remove(&key);
+
+        // Drop the caller's row from the index so its length keeps matching
+        // `COUNT`. The entry is known to exist, so a stored index built by
+        // `register` must contain it.
+        let mut index = read_index(&env);
+        if let Some(position) = index_position(&index, &caller) {
+            index.remove(position);
+            env.storage().persistent().set(&INDEX, &index);
+            env.storage().persistent().extend_ttl(&INDEX, 1000, 5000);
+        }
 
         // `COUNT` is only bumped together with a stored entry, so it is at
         // least 1 here; saturating_sub keeps the never-below-zero invariant.
@@ -337,6 +440,8 @@ mod test {
         let admin = Address::generate(&env);
 
         assert!(client.try_init(&admin).is_ok());
+        // The connected account that signs the Lab deploy becomes the admin.
+        assert_eq!(client.get_admin(), Some(admin));
     }
 
     #[test]
@@ -429,6 +534,25 @@ mod test {
     }
 
     #[test]
+    fn paused_defaults_false_and_follows_set_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+
+        // A contract that was never paused reports false, not a missing value.
+        assert!(!client.paused());
+
+        client.init(&admin);
+        client.set_paused(&admin, &true);
+        assert!(client.paused());
+
+        client.set_paused(&admin, &false);
+        assert!(!client.paused());
+    }
+
+    #[test]
     fn get_builder_unregistered_address_is_none() {
         let env = Env::default();
         env.mock_all_auths();
@@ -447,5 +571,112 @@ mod test {
         // A never-registered address has no entry even alongside real ones.
         assert_eq!(client.get_builder(&stranger), None);
         assert_eq!(client.builder_count(), 1);
+    }
+
+    #[test]
+    fn rename_changes_name_without_changing_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let a = Address::generate(&env);
+
+        // Register first
+        client.register(&a, &String::from_str(&env, "typo"));
+        assert_eq!(client.builder_count(), 1);
+        assert_eq!(
+            client.get_builder(&a),
+            Some(String::from_str(&env, "typo"))
+        );
+
+        // Rename keeps the count stable
+        client.rename(&a, &String::from_str(&env, "fixed"));
+        assert_eq!(client.builder_count(), 1);
+        assert_eq!(
+            client.get_builder(&a),
+            Some(String::from_str(&env, "fixed"))
+        );
+    }
+
+    #[test]
+    fn rename_twice_keeps_count_stable() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let a = Address::generate(&env);
+
+        client.register(&a, &String::from_str(&env, "first"));
+        assert_eq!(client.builder_count(), 1);
+
+        client.rename(&a, &String::from_str(&env, "second"));
+        assert_eq!(client.builder_count(), 1);
+
+        client.rename(&a, &String::from_str(&env, "third"));
+        assert_eq!(client.builder_count(), 1);
+        assert_eq!(
+            client.get_builder(&a),
+            Some(String::from_str(&env, "third"))
+        );
+    }
+
+    #[test]
+    fn rename_rejects_unregistered_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let a = Address::generate(&env);
+
+        assert_eq!(
+            client.try_rename(&a, &String::from_str(&env, "nope")),
+            Err(Ok(Error::NotRegistered))
+        );
+        assert_eq!(client.get_builder(&a), None);
+        assert_eq!(client.builder_count(), 0);
+    }
+
+    #[test]
+    fn rename_rejects_empty_name() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let a = Address::generate(&env);
+
+        client.register(&a, &String::from_str(&env, "valid"));
+        assert_eq!(
+            client.try_rename(&a, &String::from_str(&env, "")),
+            Err(Ok(Error::EmptyName))
+        );
+        // Name unchanged
+        assert_eq!(
+            client.get_builder(&a),
+            Some(String::from_str(&env, "valid"))
+        );
+    }
+
+    #[test]
+    fn rename_rejects_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Kitewell, ());
+        let client = KitewellClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let a = Address::generate(&env);
+
+        client.init(&admin);
+        client.register(&a, &String::from_str(&env, "before"));
+        client.set_paused(&admin, &true);
+
+        assert_eq!(
+            client.try_rename(&a, &String::from_str(&env, "blocked")),
+            Err(Ok(Error::Paused))
+        );
+        // Name unchanged
+        assert_eq!(
+            client.get_builder(&a),
+            Some(String::from_str(&env, "before"))
+        );
     }
 }

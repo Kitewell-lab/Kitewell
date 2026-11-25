@@ -26,6 +26,9 @@ test("mapBalance maps a credit_alphanum4 asset balance", () => {
     asset_issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
     balance: "123.4567890",
     limit: "1000000.0000000",
+    is_authorized: true,
+    is_authorized_to_maintain_liabilities: false,
+    clawback_enabled: true,
   });
 
   assert.deepEqual(result, {
@@ -35,6 +38,9 @@ test("mapBalance maps a credit_alphanum4 asset balance", () => {
     balance: "123.4567890",
     limit: "1000000.0000000",
     isNative: false,
+    isAuthorized: true,
+    isAuthorizedToMaintainLiabilities: false,
+    clawbackEnabled: true,
   });
 });
 
@@ -90,4 +96,17 @@ test("mapBalance stores a missing credit limit as null", () => {
 
   assert.equal(result.limit, null);
   assert.equal(result.code, "USDC");
+});
+
+test("mapBalance marks missing trustline flags as unknown", () => {
+  const result = mapBalance({
+    asset_type: "credit_alphanum4",
+    asset_code: "USDC",
+    asset_issuer: "GISSUER",
+    balance: "1.0000000",
+  });
+
+  assert.equal(result.isAuthorized, null);
+  assert.equal(result.isAuthorizedToMaintainLiabilities, null);
+  assert.equal(result.clawbackEnabled, null);
 });

@@ -17,6 +17,11 @@ vi.mock("@stellar/freighter-api", () => ({
   isConnected: vi.fn(),
   setAllowed: vi.fn(),
   getAddress: vi.fn(),
+  getNetwork: vi.fn(async () => {
+    const { getActiveNetwork } = await import("./network");
+    const active = getActiveNetwork();
+    return { network: active.id, networkPassphrase: active.passphrase };
+  }),
   signTransaction: signTransactionMock,
 }));
 
@@ -65,6 +70,39 @@ describe("payment submit options", () => {
     await expect(
       sendPaymentWithFreighter(SOURCE, DESTINATION, "10")
     ).rejects.toBe(submitError);
+  });
+
+  it("adds safe operation details to a Horizon transaction failure", async () => {
+    const submitError = new Error("raw Horizon response");
+    submitError.response = {
+      data: {
+        type: "https://stellar.org/horizon-errors/transaction_failed",
+        extras: {
+          result_codes: {
+            transaction: "tx_failed",
+            operations: ["op_underfunded"],
+          },
+          envelope_xdr: "signed secret xdr",
+        },
+      },
+    };
+    submitTransactionMock.mockRejectedValue(submitError);
+
+    await expect(
+      sendPaymentWithFreighter(SOURCE, DESTINATION, "10")
+    ).rejects.toMatchObject({
+      message: "Transaction failed on the network.",
+      transactionFailure: {
+        operations: [
+          {
+            index: 0,
+            code: "op_underfunded",
+            explanation: "Sending account does not have enough balance.",
+          },
+        ],
+        transactionCode: "tx_failed",
+      },
+    });
   });
 
   it("signs on Testnet with the TESTNET passphrase and source address", async () => {

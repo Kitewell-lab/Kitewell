@@ -132,6 +132,35 @@ Set the contract id on the backend:
 export KITEWELL_CONTRACT_ID=C...
 ```
 
+### Deploy from the Lab tab (no backend id)
+
+When `KITEWELL_CONTRACT_ID` is unset, the frontend Lab tab can deploy this same
+contract without leaving the browser:
+
+1. Build the Wasm locally: `npm run build:contracts` (or `stellar contract build
+   --manifest-path contracts/kitewell/Cargo.toml`). The file is
+   `contracts/target/wasm32v1-none/release/kitewell.wasm`.
+2. Start the backend, connect Freighter on Testnet, and open the **Lab** tab.
+3. Choose the Wasm file under **Deploy from Wasm** and click **Install & init**.
+   Three Freighter signatures are requested in order: upload Wasm, create
+   contract, then `init(admin)` with the connected account as admin. `init` is
+   called once; the contract itself rejects a second call.
+4. The new contract id is shown, copied to the clipboard when available, and
+   used for Lab reads and `register` for the rest of the session. Deploying
+   again in the same session asks for confirmation and keeps every earlier id
+   visible.
+
+The panel never writes backend environment variables. To make the id survive a
+reload, set it yourself:
+
+```bash
+export KITEWELL_CONTRACT_ID=C...   # the id shown in the Lab tab
+```
+
+A failed install shows no contract id. If install succeeds but `init` fails,
+the panel reports the installed id with the failure so it can be inspected;
+it is not activated for Lab reads.
+
 ## Register from the Lab tab
 
 After deploy, the frontend Lab tab reads `lab_name()`, `builder_count()`, and

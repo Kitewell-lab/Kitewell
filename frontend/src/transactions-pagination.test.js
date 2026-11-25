@@ -5,8 +5,9 @@ vi.mock("./api", () => ({
   fetchPaymentsViaApi: vi.fn(),
 }));
 
-const { paymentsCallMock } = vi.hoisted(() => ({
+const { paymentsCallMock, cursorMock } = vi.hoisted(() => ({
   paymentsCallMock: vi.fn(),
+  cursorMock: vi.fn(() => ({ call: paymentsCallMock })),
 }));
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
@@ -20,7 +21,10 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
           payments: () => ({
             forAccount: () => ({
               limit: () => ({
-                order: () => ({ call: paymentsCallMock }),
+                order: () => ({
+                  call: paymentsCallMock,
+                  cursor: cursorMock,
+                }),
               }),
             }),
           }),
@@ -64,6 +68,36 @@ describe("getTransactions pagination", () => {
     expect(fetchPaymentsViaApi.mock.calls[0][2]).toBe("token-1");
   });
 
+  it("pages a fixture forward and back without repeating rows", async () => {
+    const firstPage = {
+      records: [{ id: "p3" }, { id: "p2" }],
+      nextCursor: "cursor-p2",
+    };
+    const secondPage = {
+      records: [{ id: "p1" }, { id: "p0" }],
+      nextCursor: null,
+    };
+    fetchPaymentsViaApi
+      .mockResolvedValueOnce(firstPage)
+      .mockResolvedValueOnce(secondPage)
+      .mockResolvedValueOnce(firstPage);
+
+    const first = await getTransactions("GTEST");
+    const next = await getTransactions("GTEST", undefined, first.nextCursor);
+    const previous = await getTransactions("GTEST");
+
+    expect(next.records.map(({ id }) => id)).toEqual(["p1", "p0"]);
+    expect(previous.records).toEqual(first.records);
+    expect(
+      new Set([...first.records, ...next.records].map(({ id }) => id)).size
+    ).toBe(first.records.length + next.records.length);
+    expect(fetchPaymentsViaApi.mock.calls.map((call) => call[2])).toEqual([
+      undefined,
+      "cursor-p2",
+      undefined,
+    ]);
+  });
+
   it("ends paging when the last page reports no cursor", async () => {
     fetchPaymentsViaApi.mockResolvedValue({ records: [{ id: "p0" }], nextCursor: null });
 
@@ -82,7 +116,7 @@ describe("getTransactions pagination", () => {
     });
   });
 
-  it("treats the direct-Horizon fallback as a single page", async () => {
+  it("supports cursors when falling back directly to Horizon", async () => {
     fetchPaymentsViaApi.mockRejectedValue(new Error("backend down"));
     paymentsCallMock.mockResolvedValue({
       records: [
@@ -93,16 +127,18 @@ describe("getTransactions pagination", () => {
           to: "GTEST",
           amount: "1.0000000",
           asset_type: "native",
+          paging_token: "next-token",
           transaction_hash: "h1",
           created_at: "2026-01-01T00:00:00Z",
         },
       ],
     });
 
-    const page = await getTransactions("GTEST");
+    const page = await getTransactions("GTEST", 1, "previous-token");
 
     expect(page.records).toHaveLength(1);
     expect(page.records[0].id).toBe("p1");
-    expect(page.nextCursor).toBeNull();
+    expect(page.nextCursor).toBe("next-token");
+    expect(cursorMock).toHaveBeenCalledWith("previous-token");
   });
 });
