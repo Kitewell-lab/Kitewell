@@ -17,7 +17,7 @@ Kitewell adheres to a non-custodial, client-side cryptographic architecture desi
 ## 2. Network & Environment Isolation
 
 - **Testnet-Only by Default:** The default configuration for all contracts, indexers, and frontend applications is strictly locked to **Stellar Testnet** (`Test SDF Network ; September 2015`).
-- **Mainnet Protection:** Any accidental submission to or signing against Mainnet is blocked by client-side network passphrase validation. Do not deploy or run production funds against un-audited experimental smart contract endpoints.
+- **Mainnet Protection:** The network selector offers Testnet and Futurenet only. Testnet is the default. Transactions are signed with the selected network's passphrase. The selector rejects any other network id, including public mainnet. Do not deploy or run production funds against un-audited experimental smart contract endpoints.
 
 ---
 
