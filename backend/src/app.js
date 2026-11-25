@@ -220,7 +220,14 @@ export function createApp({ horizon, env = process.env } = {}) {
           transaction_hash: p.transaction_hash,
           created_at: p.created_at,
           ...mapTransactionFee(p.transaction),
-          explorerUrl: `${network.explorerBase}/tx/${p.transaction_hash}`,
+          ...(typeof p.transaction?.memo_type === "string"
+            ? {
+                memo_type: p.transaction.memo_type,
+                memo: p.transaction.memo ?? null,
+                memo_bytes: p.transaction.memo_bytes ?? null,
+              }
+            : {}),
+          explorerUrl: `${network.explorerBase || EXPLORER_BASE}/tx/${p.transaction_hash}`,
         }));
 
       // A full page of raw records means there may be older ones; the cursor

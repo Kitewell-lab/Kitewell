@@ -9,6 +9,11 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 import { Buffer } from "buffer";
 import { findNetworkByPassphrase, getActiveNetwork } from "./network";
 import {
+  decodeBuilderName,
+  describeBuilderLookup,
+  normalizeBuilderAddress,
+} from "./builderLookup";
+import {
   buildAsset,
   parsePathAssets,
   buildSetOptionsBody,
@@ -24,6 +29,7 @@ import {
 import { getTransactionFailure, parseHorizonError } from "./horizonErrorParse";
 import { formatTrustlineLimit } from "./trustlineLimitFormat";
 import { parseSimulationFees } from "./simulationFees";
+import { pageBuilderAddresses } from "./builderDirectory";
 import { getFeePerOperation } from "./feeSetting";
 import {
   freighterCancelledError,
@@ -357,8 +363,7 @@ export const BUILDER_PAGE_SIZE = 10;
  * each address's nickname.
  *
  * The list function is a read-only simulation, so nothing is signed or
- * submitted. A start past the end comes back as an empty page with
- * `nextStart: null` instead of an error.
+ * submitted. One extra address detects the final page without an empty request.
  *
  * @param {string} contractId Kitewell contract (C…)
  * @param {{ start?: number, limit?: number }} [options]
@@ -379,8 +384,8 @@ export async function listKitewellBuilders(
   if (!Number.isSafeInteger(pageStart) || pageStart < 0) {
     throw new Error("Builder page start must be zero or a positive index.");
   }
-  if (!Number.isSafeInteger(pageLimit) || pageLimit <= 0) {
-    throw new Error("Builder page size must be a positive number.");
+  if (!Number.isSafeInteger(pageLimit) || pageLimit <= 0 || pageLimit >= 50) {
+    throw new Error("Builder page size must be between 1 and 49.");
   }
 
   const contract = new StellarSdk.Contract(contractId);
@@ -398,14 +403,15 @@ export async function listKitewellBuilders(
   const retval = await simulate(
     "list_builders",
     StellarSdk.nativeToScVal(pageStart, { type: "u32" }),
-    StellarSdk.nativeToScVal(pageLimit, { type: "u32" })
+    StellarSdk.nativeToScVal(pageLimit + 1, { type: "u32" })
   );
   const addresses = retval ? StellarSdk.scValToNative(retval) : [];
+  const page = pageBuilderAddresses(addresses || [], pageStart, pageLimit);
 
   // The index only stores addresses; the nickname still comes from
   // get_builder so the list and the single-builder lookup never disagree.
   const rows = await Promise.all(
-    (addresses || []).map(async (address) => {
+    page.rows.map(async (address) => {
       const name = await simulate(
         "get_builder",
         StellarSdk.nativeToScVal(address, { type: "address" })
@@ -418,8 +424,46 @@ export async function listKitewellBuilders(
     start: pageStart,
     limit: pageLimit,
     rows,
-    nextStart: rows.length === pageLimit ? pageStart + pageLimit : null,
+    nextStart: page.nextStart,
   };
+}
+
+/**
+ * Look up one registered builder by address via Soroban RPC.
+ *
+ * The lookup is a read-only simulation, so the connected wallet does not have
+ * to be the builder: any valid G… address can be queried.
+ *
+ * @param {string} contractId Kitewell contract (C…)
+ * @param {string} address Stellar account address (G…)
+ * @returns {Promise<{ address: string, name: string|null, registered: boolean, label: string }>}
+ */
+export async function readKitewellBuilder(contractId, address) {
+  const normalized = normalizeBuilderAddress(address);
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const source = new StellarSdk.Account(ZERO_ADDRESS, "0");
+  const transaction = buildContractTx(
+    contract,
+    "get_builder",
+    [StellarSdk.nativeToScVal(normalized, { type: "address" })],
+    source,
+    30
+  );
+  const simulation = await sorobanRpc.simulateTransaction(transaction);
+  if (simulation.error) {
+    throw new Error(`get_builder() simulation failed: ${simulation.error}`);
+  }
+
+  return describeBuilderLookup(
+    normalized,
+    decodeBuilderName(simulation.result?.retval ?? null)
+  );
 }
 
 /**
@@ -471,7 +515,6 @@ export async function proposeAdminWithFreighter(
     );
   }
 
-  // Poll for confirmation
   for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
     const status = await sorobanRpc.getTransaction(sendResult.hash);
     if (status.status === "SUCCESS") {
@@ -480,61 +523,6 @@ export async function proposeAdminWithFreighter(
     if (status.status === "FAILED") {
       throw new Error(
         `Propose admin failed on-chain. Tx hash: ${sendResult.hash}`
-      );
-    }
-    await sleep(POLL_INTERVAL_MS);
-  }
-
-  return { hash: sendResult.hash, confirmed: false };
-}
-
-/**
- * Accept a pending admin transfer for the Kitewell contract.
- * Only the pending admin can call this. On success, the caller becomes the
- * live admin and the pending slot clears.
- *
- * @param {string} publicKey - Pending admin's public key (must match pending)
- * @param {string} contractId - The contract's C… address
- * @returns {Promise<{ hash: string, confirmed: boolean }>}
- */
-export async function acceptAdminWithFreighter(publicKey, contractId) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Pending admin address is invalid.");
-  }
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error(
-      "Contract ID must be a valid Soroban contract strkey (C…)."
-    );
-  }
-
-  const contract = new StellarSdk.Contract(contractId);
-  const sourceAccount = await sorobanRpc.getAccount(publicKey);
-  const transaction = buildContractTx(
-    contract,
-    "accept_admin",
-    [StellarSdk.nativeToScVal(publicKey, { type: "address" })],
-    sourceAccount
-  );
-
-  const prepared = await sorobanRpc.prepareTransaction(transaction);
-  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
-  const sendResult = await sorobanRpc.sendTransaction(signedTx);
-
-  if (sendResult.status === "ERROR") {
-    throw new Error(
-      `Accept admin rejected by the network. Tx hash: ${sendResult.hash}`
-    );
-  }
-
-  // Poll for confirmation
-  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
-    const status = await sorobanRpc.getTransaction(sendResult.hash);
-    if (status.status === "SUCCESS") {
-      return { hash: sendResult.hash, confirmed: true };
-    }
-    if (status.status === "FAILED") {
-      throw new Error(
-        `Accept admin failed on-chain. Tx hash: ${sendResult.hash}`
       );
     }
     await sleep(POLL_INTERVAL_MS);
@@ -596,6 +584,61 @@ export async function simulateRegisterBuilder(publicKey, contractId, name) {
         ? null
         : StellarSdk.scValToNative(simulation.result.retval),
   };
+}
+
+/**
+ * Accept a pending admin transfer for the Kitewell contract.
+ * Only the pending admin can call this. On success, the caller becomes the
+ * live admin and the pending slot clears.
+ *
+ * @param {string} publicKey - Pending admin's public key (must match pending)
+ * @param {string} contractId - The contract's C… address
+ * @returns {Promise<{ hash: string, confirmed: boolean }>}
+ */
+export async function acceptAdminWithFreighter(publicKey, contractId) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Pending admin address is invalid.");
+  }
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = buildContractTx(
+    contract,
+    "accept_admin",
+    [StellarSdk.nativeToScVal(publicKey, { type: "address" })],
+    sourceAccount
+  );
+
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `Accept admin rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  // Poll for confirmation
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return { hash: sendResult.hash, confirmed: true };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(
+        `Accept admin failed on-chain. Tx hash: ${sendResult.hash}`
+      );
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  return { hash: sendResult.hash, confirmed: false };
 }
 
 /**
@@ -936,6 +979,37 @@ export async function claimClaimableBalanceWithFreighter(publicKey, balanceId) {
 
 export const createClaimableBalance = createClaimableBalanceWithFreighter;
 export const claimClaimableBalance = claimClaimableBalanceWithFreighter;
+
+function normalizeClaimableBalanceId(balanceId) {
+  if (!/^([0-9a-fA-F]{72}|B[1-9A-HJ-NP-Za-km-z]{55})$/.test(balanceId || "")) {
+    throw new Error("A valid claimable balance ID is required.");
+  }
+  return typeof balanceId === "string" && balanceId.startsWith("B")
+    ? StellarSdk.StrKey.decodeClaimableBalance(balanceId).toString("hex")
+    : balanceId;
+}
+
+/** Claw back a claimable balance this account created. The issuer signs. */
+export async function clawbackClaimableBalanceWithFreighter(publicKey, balanceId) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  const normalizedId = normalizeClaimableBalanceId(balanceId);
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.clawbackClaimableBalance({
+        balanceId: normalizedId,
+      })
+    )
+    .setTimeout(180)
+    .build();
+  return signAndSubmit(transaction, publicKey);
+}
+
 
 /**
  * Validate a Stellar amount string (positive, max 7 decimal places) without
