@@ -1,5 +1,6 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { getActiveNetworkId, getNetworkById } from "./network";
+import { mapTransactionFee } from "./historyFee";
 
 /**
  * Stream payments for the connected account while the history tab is open.
