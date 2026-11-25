@@ -10,6 +10,7 @@ import {
   NETWORKS,
 } from "./network";
 import { calculateMinimumBalance } from "./accountReserve";
+import { paymentMemoFields } from "./paymentMemo";
 
 /** Shown in the lab panel when Horizon asks the client to slow down. */
 export const HORIZON_SLOWDOWN_MESSAGE =
@@ -24,6 +25,77 @@ const HORIZON_429_MAX_WAIT_SEC = 30;
  * @type {Map<string, { streak: number }>}
  */
 const horizon429BackoffByNetwork = new Map();
+
+function horizonStatus(error) {
+  return error?.response?.status ?? error?.status ?? null;
+}
+
+export function isHorizonSlowdownError(error) {
+  return horizonStatus(error) === 429;
+}
+
+function horizonRetryAfterSeconds(error, streak) {
+  const headers = error?.response?.headers;
+  const header = typeof headers?.get === "function"
+    ? headers.get("retry-after")
+    : headers?.["retry-after"];
+  const parsed = Number(header);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.min(parsed, HORIZON_429_MAX_WAIT_SEC);
+  }
+  return Math.min(
+    HORIZON_429_BASE_WAIT_SEC * 2 ** Math.max(streak, 0),
+    HORIZON_429_MAX_WAIT_SEC
+  );
+}
+
+async function withHorizon429Backoff(task) {
+  const networkId = getActiveNetworkId();
+  const state = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
+  let attempt = 0;
+  for (;;) {
+    try {
+      const result = await task();
+      horizon429BackoffByNetwork.set(networkId, { streak: 0 });
+      return result;
+    } catch (error) {
+      if (!isHorizonSlowdownError(error) || attempt >= 2) throw error;
+      const wait = horizonRetryAfterSeconds(error, state.streak);
+      state.streak += 1;
+      horizon429BackoffByNetwork.set(networkId, state);
+      await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+      attempt += 1;
+    }
+  }
+}
+
+export function resetHorizon429BackoffForTests() {
+  horizon429BackoffByNetwork.clear();
+}
+
+function abortError() {
+  const error = new Error("The request was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+function defaultSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(abortError());
+      },
+      { once: true }
+    );
+  });
+}
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -929,7 +1001,7 @@ function mapClaimableBalance(record, publicKey) {
  * the filter server-side so another account's balance is never offered for
  * clawback.
  */
-export async function getClaimableBalances(publicKey) {
+export async function getSponsoredClaimableBalances(publicKey) {
   const records = await getServer()
     .claimableBalances()
     .forSponsor(publicKey)
@@ -1492,6 +1564,7 @@ export async function getTransactions(publicKey, limit = 15, cursor, options = {
           transaction_hash: p.transaction_hash,
           created_at: p.created_at,
           ...mapTransactionFee(p.transaction),
+          ...paymentMemoFields(p.transaction),
         })),
       nextCursor:
         payments.records.length < limit ? null : (lastRaw?.paging_token ?? null),
@@ -1769,33 +1842,66 @@ export async function watchOfferUntilGone(offerId, options = {}) {
   return { status: "still-open", stillListed: null };
 }
 
-export async function getPendingTransactions(publicKey, options = {}) {
+export function selectPendingTransactions(records = []) {
+  return records
+    .filter((row) => String(row.status || row.tx_status || "").toLowerCase() === "pending")
+    .map((row) => ({
+      hash: row.hash,
+      fee: row.fee ?? row.max_fee ?? null,
+      sequence: row.sequence ?? null,
+      status: "pending",
+    }));
+}
+
+export async function getPendingTransactions(publicKey) {
   return withHorizon429Backoff(async () => {
     const url = `${getActiveNetwork().horizonUrl}/accounts/${encodeURIComponent(
       publicKey
     )}/pending_transactions`;
-
-    const response = options.signal
-      ? await fetch(url, { signal: options.signal })
-      : await fetch(url);
-    if (response.status === 404) {
-      return [];
-    }
+    const response = await fetch(url);
+    if (response.status === 404) return [];
     if (!response.ok) {
-      const error = new Error(
-        `Could not load pending transactions (HTTP ${response.status}).`
-      );
+      const error = new Error("Could not load pending transactions.");
       error.status = response.status;
       throw error;
     }
-
     const body = await response.json();
-    const records = Array.isArray(body)
-      ? body
-      : body?._embedded?.records || body?.records || [];
+    return selectPendingTransactions(body?._embedded?.records || []);
+  });
+}
 
-    return selectPendingTransactions(records);
-  }, options);
+export async function getAccountTrades(publicKey, { limit = 10, cursor } = {}) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  let builder = getServer().trades().forAccount(publicKey).limit(limit).order("desc");
+  if (cursor) builder = builder.cursor(cursor);
+  const response = await builder.call();
+  const records = response.records || [];
+
+  return {
+    records: records.map((trade) => ({
+      id: trade.id,
+      ledger_close_time: trade.ledger_close_time,
+      offer_id: trade.offer_id,
+      base_account: trade.base_account,
+      base_amount: trade.base_amount,
+      base_asset_type: trade.base_asset_type,
+      base_asset_code: trade.base_asset_code,
+      base_asset_issuer: trade.base_asset_issuer,
+      counter_account: trade.counter_account,
+      counter_amount: trade.counter_amount,
+      counter_asset_type: trade.counter_asset_type,
+      counter_asset_code: trade.counter_asset_code,
+      counter_asset_issuer: trade.counter_asset_issuer,
+      price: trade.price,
+      base_is_seller: trade.base_is_seller,
+    })),
+    nextCursor: records.length > 0
+      ? records[records.length - 1].paging_token
+      : null,
+  };
 }
 
 export { summarizeEnvelopeSignatures } from "./multisigEnvelope";
