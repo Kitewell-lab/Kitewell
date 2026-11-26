@@ -11,6 +11,11 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 import { Buffer } from "buffer";
 import { findNetworkByPassphrase, getActiveNetwork } from "./network";
 import {
+  decodeBuilderName,
+  describeBuilderLookup,
+  normalizeBuilderAddress,
+} from "./builderLookup";
+import {
   buildAsset,
   parsePathAssets,
   buildSetOptionsBody,
@@ -275,8 +280,7 @@ export const BUILDER_PAGE_SIZE = 10;
  * each address's nickname.
  *
  * The list function is a read-only simulation, so nothing is signed or
- * submitted. A start past the end comes back as an empty page with
- * `nextStart: null` instead of an error.
+ * submitted. One extra address detects the final page without an empty request.
  *
  * @param {string} contractId Kitewell contract (C…)
  * @param {{ start?: number, limit?: number }} [options]
@@ -297,8 +301,8 @@ export async function listKitewellBuilders(
   if (!Number.isSafeInteger(pageStart) || pageStart < 0) {
     throw new Error("Builder page start must be zero or a positive index.");
   }
-  if (!Number.isSafeInteger(pageLimit) || pageLimit <= 0) {
-    throw new Error("Builder page size must be a positive number.");
+  if (!Number.isSafeInteger(pageLimit) || pageLimit <= 0 || pageLimit >= 50) {
+    throw new Error("Builder page size must be between 1 and 49.");
   }
 
   const contract = new StellarSdk.Contract(contractId);
@@ -316,14 +320,15 @@ export async function listKitewellBuilders(
   const retval = await simulate(
     "list_builders",
     StellarSdk.nativeToScVal(pageStart, { type: "u32" }),
-    StellarSdk.nativeToScVal(pageLimit, { type: "u32" })
+    StellarSdk.nativeToScVal(pageLimit + 1, { type: "u32" })
   );
   const addresses = retval ? StellarSdk.scValToNative(retval) : [];
+  const page = pageBuilderAddresses(addresses || [], pageStart, pageLimit);
 
   // The index only stores addresses; the nickname still comes from
   // get_builder so the list and the single-builder lookup never disagree.
   const rows = await Promise.all(
-    (addresses || []).map(async (address) => {
+    page.rows.map(async (address) => {
       const name = await simulate(
         "get_builder",
         StellarSdk.nativeToScVal(address, { type: "address" })
@@ -336,8 +341,46 @@ export async function listKitewellBuilders(
     start: pageStart,
     limit: pageLimit,
     rows,
-    nextStart: rows.length === pageLimit ? pageStart + pageLimit : null,
+    nextStart: page.nextStart,
   };
+}
+
+/**
+ * Look up one registered builder by address via Soroban RPC.
+ *
+ * The lookup is a read-only simulation, so the connected wallet does not have
+ * to be the builder: any valid G… address can be queried.
+ *
+ * @param {string} contractId Kitewell contract (C…)
+ * @param {string} address Stellar account address (G…)
+ * @returns {Promise<{ address: string, name: string|null, registered: boolean, label: string }>}
+ */
+export async function readKitewellBuilder(contractId, address) {
+  const normalized = normalizeBuilderAddress(address);
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const source = new StellarSdk.Account(ZERO_ADDRESS, "0");
+  const transaction = buildContractTx(
+    contract,
+    "get_builder",
+    [StellarSdk.nativeToScVal(normalized, { type: "address" })],
+    source,
+    30
+  );
+  const simulation = await sorobanRpc.simulateTransaction(transaction);
+  if (simulation.error) {
+    throw new Error(`get_builder() simulation failed: ${simulation.error}`);
+  }
+
+  return describeBuilderLookup(
+    normalized,
+    decodeBuilderName(simulation.result?.retval ?? null)
+  );
 }
 
 /**
@@ -465,13 +508,21 @@ export async function simulateRegisterBuilder(publicKey, contractId, name) {
  * Only the pending admin can call this. On success, the caller becomes the
  * live admin and the pending slot clears.
  *
- * @param {string} publicKey - Pending admin's public key (must match pending)
- * @param {string} contractId - The contract's C… address
- * @returns {Promise<{ hash: string, confirmed: boolean }>}
+ * @returns {Promise<{
+ *   error: string|null,
+ *   inclusionFee: string|null,
+ *   resourceFee: string|null,
+ *   totalFee: string|null,
+ *   returnValue: unknown,
+ * }>} Fees in stroops.
  */
-export async function acceptAdminWithFreighter(publicKey, contractId) {
+export async function simulateRegisterBuilder(publicKey, contractId, name) {
+  const trimmed = (name || "").trim();
+  if ([...trimmed].length > 64) {
+    throw new Error("Builder name must be 64 characters or fewer.");
+  }
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Pending admin address is invalid.");
+    throw new Error("Connect a valid Freighter address first.");
   }
   if (!StellarSdk.StrKey.isValidContract(contractId)) {
     throw new Error(
@@ -483,8 +534,11 @@ export async function acceptAdminWithFreighter(publicKey, contractId) {
   const sourceAccount = await sorobanRpc.getAccount(publicKey);
   const transaction = buildContractTx(
     contract,
-    "accept_admin",
-    [StellarSdk.nativeToScVal(publicKey, { type: "address" })],
+    "register",
+    [
+      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
+      StellarSdk.nativeToScVal(trimmed, { type: "string" }),
+    ],
     sourceAccount
   );
 
@@ -516,11 +570,13 @@ export async function acceptAdminWithFreighter(publicKey, contractId) {
 }
 
 /**
- * Check in a builder: builds + simulates a Soroban `register(caller, name)`
- * invoke, lets Freighter sign it, then submits via Soroban RPC and waits for
- * on-chain confirmation.
+ * Accept a pending admin transfer for the Kitewell contract.
+ * Only the pending admin can call this. On success, the caller becomes the
+ * live admin and the pending slot clears.
  *
- * @returns {{ hash: string, returnValue: unknown, confirmed: boolean }}
+ * @param {string} publicKey - Pending admin's public key (must match pending)
+ * @param {string} contractId - The contract's C… address
+ * @returns {Promise<{ hash: string, confirmed: boolean }>}
  */
 export async function registerBuilderWithFreighter(
   publicKey,
@@ -536,7 +592,7 @@ export async function registerBuilderWithFreighter(
     throw new Error("Builder name must be 64 characters or fewer.");
   }
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
+    throw new Error("Pending admin address is invalid.");
   }
   if (!StellarSdk.StrKey.isValidContract(contractId)) {
     throw new Error(
@@ -553,11 +609,8 @@ export async function registerBuilderWithFreighter(
   const sourceAccount = await sorobanRpc.getAccount(publicKey);
   const transaction = buildContractTx(
     contract,
-    "register",
-    [
-      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
-      StellarSdk.nativeToScVal(trimmed, { type: "string" }),
-    ],
+    "accept_admin",
+    [StellarSdk.nativeToScVal(publicKey, { type: "address" })],
     sourceAccount
   );
   const prepared = await sorobanRpc.prepareTransaction(transaction);
@@ -566,7 +619,7 @@ export async function registerBuilderWithFreighter(
 
   if (sendResult.status === "ERROR") {
     throw new Error(
-      `Contract invoke rejected by the network. Tx hash: ${sendResult.hash}`
+      `Accept admin rejected by the network. Tx hash: ${sendResult.hash}`
     );
   }
 
@@ -577,7 +630,7 @@ export async function registerBuilderWithFreighter(
     }
     if (status.status === "FAILED") {
       throw new Error(
-        `Contract invoke failed on-chain. Tx hash: ${sendResult.hash}`
+        `Accept admin failed on-chain. Tx hash: ${sendResult.hash}`
       );
     }
     await sleep(POLL_INTERVAL_MS);
@@ -876,6 +929,69 @@ export async function claimClaimableBalanceWithFreighter(publicKey, balanceId) {
 
 export const createClaimableBalance = createClaimableBalanceWithFreighter;
 export const claimClaimableBalance = claimClaimableBalanceWithFreighter;
+
+function normalizeClaimableBalanceId(balanceId) {
+  if (!/^([0-9a-fA-F]{72}|B[1-9A-HJ-NP-Za-km-z]{55})$/.test(balanceId || "")) {
+    throw new Error("A valid claimable balance ID is required.");
+  }
+  return typeof balanceId === "string" && balanceId.startsWith("B")
+    ? StellarSdk.StrKey.decodeClaimableBalance(balanceId).toString("hex")
+    : balanceId;
+}
+
+/** Claw back a claimable balance this account created. The issuer signs. */
+export async function clawbackClaimableBalanceWithFreighter(publicKey, balanceId) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  const normalizedId = normalizeClaimableBalanceId(balanceId);
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.clawbackClaimableBalance({
+        balanceId: normalizedId,
+      })
+    )
+    .setTimeout(180)
+    .build();
+  return signAndSubmit(transaction, publicKey);
+}
+
+/** Claw back a balance sitting on someone else's trustline of an asset this account issues. */
+export async function clawbackWithFreighter(publicKey, holder, assetCode, assetIssuer, amount) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (assetIssuer !== publicKey) {
+    throw new Error("Only the issuer can claw back this asset.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(holder)) {
+    throw new Error("Holder must be a valid Stellar public key (G…).");
+  }
+  const code = (assetCode || "").trim().toUpperCase();
+  if (!code || code.length > MAX_ASSET_CODE_LENGTH) {
+    throw new Error(`Asset code must be 1–${MAX_ASSET_CODE_LENGTH} characters.`);
+  }
+  const normalizedAmount = normalizeAmount(amount, "Clawback amount");
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.clawback({
+        asset: new StellarSdk.Asset(code, assetIssuer),
+        from: holder,
+        amount: normalizedAmount,
+      })
+    )
+    .setTimeout(180)
+    .build();
+  return signAndSubmit(transaction, publicKey);
+}
 
 /**
  * Validate a Stellar amount string (positive, max 7 decimal places) without

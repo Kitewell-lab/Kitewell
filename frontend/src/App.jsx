@@ -11,6 +11,8 @@ import {
   changeTrustWithFreighter,
   createClaimableBalanceWithFreighter,
   claimClaimableBalanceWithFreighter,
+  clawbackClaimableBalanceWithFreighter,
+  clawbackWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
   readAdminState,
@@ -27,15 +29,21 @@ import {
   signChallengeWithFreighter,
   simulateRegisterBuilder,
   listKitewellBuilders,
+  readKitewellBuilder,
   createSponsoredAccountDraft,
   sponsorAccountCreationWithFreighter,
 } from "./freighter";
+import {
+  appendBuilderPage,
+  isBuilderCountMismatch,
+} from "./builderDirectory";
 import {
   createFailedSubmitLog,
   downloadFailedSubmitLog,
 } from "./failedSubmitLog";
 import { copyToClipboardResult } from "./copyToClipboardResult";
 import { shortenAddress } from "./addressFormat";
+import { generateAddressQrCode } from "./addressQr";
 import {
   fundWithFriendbot,
   buildAsset,
@@ -43,7 +51,10 @@ import {
   getAccountDetails,
   getOpenOffers,
   getPendingTransactions,
-  getClaimableBalances,
+  getSponsoredClaimableBalances,
+  getAccountTrades,
+  isHorizonSlowdownError,
+  HORIZON_SLOWDOWN_MESSAGE,
   getLiquidityPool,
   liquidityPoolDeposit,
   liquidityPoolWithdraw,
@@ -61,6 +72,7 @@ import {
   PAYMENTS_CSV_FILENAME,
 } from "./stellar";
 import { downloadCsv } from "./csvExport";
+import { buildersToCsv } from "./builderCsv";
 import {
   clearStoredOrderBookPair,
   parseOrderBookPair,
@@ -78,6 +90,11 @@ import {
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { filterTransactionHistory } from "./txHistoryFilter";
 import { fetchHealth, fetchNetworkInfo } from "./api";
+import {
+  describeEndSponsorship,
+  endSponsorshipWithFreighter,
+  hasEndSponsorshipAction,
+} from "./sponsorshipRevoke";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
 import { formatSimulationFee, isSimulationReady } from "./simulationFees";
 import {
@@ -96,6 +113,7 @@ import { decodeTransactionEnvelope } from "./txInspector";
 import TransactionHashLookup from "./TransactionHashLookup";
 import SigningPassphraseConfirmation from "./SigningPassphraseConfirmation";
 import MultisigCosignPanel from "./MultisigCosignPanel";
+import LabAdminPanel from "./LabAdminPanel";
 import { completeWebAuthChallenge } from "./sep10WebAuth";
 import { loadIssuerCurrencyList } from "./issuerToml";
 import { createPaymentStreamController } from "./paymentStream";
@@ -105,6 +123,12 @@ import {
   watchTransactionStatus,
 } from "./txStatusWatch";
 import { buildTransactionExplorerUrl } from "./explorerLink";
+import {
+  canCallContract,
+  contractStatusLabel,
+  resolveContractStatus,
+  rpcCallBlockReason,
+} from "./contractStatus";
 import "./App.css";
 
 const TABS = [
@@ -181,6 +205,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState("Wallet");
   const [publicKey, setPublicKey] = useState(null);
   const [networkId, setNetworkId] = useState(getActiveNetworkId());
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState(null);
   const [customNetworkForm, setCustomNetworkForm] = useState({
     name: "",
     horizonUrl: "",
@@ -207,6 +232,8 @@ export default function App() {
   });
   const [transactions, setTransactions] = useState([]);
   const [pendingTransactions, setPendingTransactions] = useState([]);
+  const [trades, setTrades] = useState([]);
+  const [tradesNextCursor, setTradesNextCursor] = useState(null);
   const [pendingError, setPendingError] = useState(null);
   const [nextCursor, setNextCursor] = useState(null);
   const [pageCursors, setPageCursors] = useState([null]);
@@ -235,6 +262,9 @@ export default function App() {
       ...changes,
     }));
     setSendPrepared(null);
+    // Any edit changes the operation list, so the previewed envelope is stale.
+    setUnsignedEnvelope(null);
+    setSigningConfirmationOpen(false);
   };
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
   const [createAccountForm, setCreateAccountForm] = useState({
@@ -276,6 +306,9 @@ export default function App() {
   const [simulatedRegisterKey, setSimulatedRegisterKey] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
+  const [builderAddress, setBuilderAddress] = useState("");
+  const [builderLookupResult, setBuilderLookupResult] = useState(null);
+  const [builderLookupError, setBuilderLookupError] = useState(null);
   const [adminState, setAdminState] = useState(null);
   const [proposeAdminForm, setProposeAdminForm] = useState({ address: "" });
   const [registerForm, setRegisterForm] = useState({ name: "" });
@@ -292,6 +325,12 @@ export default function App() {
   const tabRefs = useRef([]);
   const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
+  const [clawbackAssets, setClawbackAssets] = useState([]);
+  const [clawbackForm, setClawbackForm] = useState({
+    assetKey: "",
+    holder: "",
+    amount: "",
+  });
   const [claimableForm, setClaimableForm] = useState({
     claimant: "",
     amount: "",
@@ -299,7 +338,6 @@ export default function App() {
     predicateMode: "unconditional",
     ledgerTime: "",
   });
-  const [claimableBalances, setClaimableBalances] = useState([]);
   const [claimableResult, setClaimableResult] = useState(null);
   const [failedSubmits, setFailedSubmits] = useState([]);
   const failedSubmitLogRef = useRef(createFailedSubmitLog());
@@ -372,8 +410,17 @@ export default function App() {
   const [sponsorDraft, setSponsorDraft] = useState(null);
   const [sponsorResult, setSponsorResult] = useState(null);
 
+  // Issue #668: ending one sponsorship from the list.
+  const [endSponsorForm, setEndSponsorForm] = useState({
+    sponsoredAccount: "",
+    assetCode: "",
+    assetIssuer: "",
+  });
+  const [endSponsorConfirmation, setEndSponsorConfirmation] = useState(null);
+  const [endSponsorResult, setEndSponsorResult] = useState(null);
+
   // One offer watch at a time; aborting the controller only stops polling.
-  const [offerForm, setOfferForm] = useState("");
+  const [offerWatchId, setOfferWatchId] = useState("");
   const [offerWatch, setOfferWatch] = useState(null);
   const [offerWatchError, setOfferWatchError] = useState(null);
   const offerWatchRef = useRef(null);
@@ -449,17 +496,19 @@ export default function App() {
     setPathForm((prev) => ({ ...prev, ...changes }));
     // Editing the request invalidates any quote from the previous form state.
     setPathQuote(null);
-  const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
-  const updateOfferForm = (changes) => setOfferForm((prev) => ({ ...prev, ...changes }));
-  // Any edit changes the operation list, so the previewed envelope is stale.
-  const updateSendForm = (changes) => {
-    setSendForm((prev) => ({ ...prev, ...changes }));
-    setUnsignedEnvelope(null);
-    setSigningConfirmationOpen(false);
   };
+  const updateOfferForm = (changes) => setOfferForm((prev) => ({ ...prev, ...changes }));
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
   const selectedComposeAsset = balances.find((b) => b.key === composeForm.assetKey);
   const configuredContractId = labInfo?.network?.contract?.kitewell;
+  // The Lab must know whether the instance entry is live or archived before it
+  // offers an RPC call: an archived instance fails every invocation.
+  const contractStatus = resolveContractStatus({
+    contractId: configuredContractId,
+    state: labState,
+    error: labStateError,
+  });
+  const contractCallBlock = rpcCallBlockReason(contractStatus);
   const parsedBookPair = parseOrderBookPair(bookPair);
   const bookKey = JSON.stringify([networkId, bookPair.selling, bookPair.buying]);
   const currentBookResult = bookResult?.key === bookKey ? bookResult : null;
@@ -572,7 +621,7 @@ export default function App() {
       const next = await getAccountBalances(publicKey, { signal });
       setBalances(next);
       setHorizonNotice(null);
-      const claimables = await getClaimableBalances(publicKey).catch(() => []);
+      const claimables = await getSponsoredClaimableBalances(publicKey).catch(() => []);
       setClaimableBalances(claimables);
       try {
         const details = await getAccountDetails(publicKey, { signal });
@@ -591,12 +640,12 @@ export default function App() {
         if (isHorizonSlowdownError(detailsError)) {
           setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
           showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+        } else {
+          setAccountDetails(null);
         }
-      } catch {
-        setAccountDetails(null);
       }
       await refreshReserve();
-    } catch {
+    } catch (error) {
       setBalances([]);
       setClaimableBalances([]);
       if (isHorizonSlowdownError(error)) {
@@ -611,12 +660,12 @@ export default function App() {
     }
   }, [activeNetwork, publicKey]);
 
-  const handleClawback = async (balance) => {
+  const handleClawbackClaimable = async (balance) => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     setLoading(`clawback-${balance.id}`);
     try {
       await clawbackClaimableBalanceWithFreighter(publicKey, balance.id);
-      const next = await getClaimableBalances(publicKey).catch(() => []);
+      const next = await getSponsoredClaimableBalances(publicKey).catch(() => []);
       setClaimableBalances(next);
       showToast(`${balance.code} claimable balance clawed back.`);
     } catch (err) {
@@ -641,46 +690,6 @@ export default function App() {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     if (!dataForm.name) return showToast("Data name is required.", "error");
 
-    setLoading("data-set");
-    try {
-      await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
-      setDataForm({ name: "", value: "" });
-      await refreshAccountDetails();
-      showToast("Account data submitted.");
-    } catch (err) {
-      showToast(err.message || "Could not set account data.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleClearData = async (name) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading(`data-clear-${name}`);
-    try {
-      await manageDataWithFreighter(publicKey, name, null);
-      await refreshAccountDetails();
-      showToast(`Cleared account data "${name}".`);
-    } catch (err) {
-      showToast(err.message || `Could not clear "${name}".`, "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const refreshAccountDetails = async () => {
-    if (!publicKey) return;
-    try {
-      setAccountDetails(await getAccountDetails(publicKey));
-    } catch {
-      setAccountDetails(null);
-    }
-  };
-
-  const handleSetData = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!dataForm.name) return showToast("Data name is required.", "error");
     setLoading("data-set");
     try {
       await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
@@ -739,7 +748,7 @@ export default function App() {
     if (!publicKey) return;
     setLoading("claimable-list");
     try {
-      setClaimableBalances(await getClaimableBalances(publicKey));
+      setClaimableBalances(await getSponsoredClaimableBalances(publicKey));
     } catch (err) {
       setClaimableBalances([]);
       showToast(err.message || "Could not load claimable balances.", "error");
@@ -835,6 +844,8 @@ export default function App() {
       const address = await connectFreighterWallet();
       submitGuardRef.current.reset();
       setPublicKey(address);
+      // Generate a scannable QR code for the connected public address.
+      setQrCodeDataUrl(await generateAddressQrCode(address));
       setBalances([]);
       setOpenOffers([]);
       setOfferPrices({});
@@ -871,6 +882,8 @@ export default function App() {
     failedSubmitLogRef.current.clear();
     setFailedSubmits([]);
     setPublicKey(null);
+    setQrCodeDataUrl(null);
+    setQrCodeDataUrl(null);
     setBalances([]);
     setOpenOffers([]);
     setOfferPrices({});
@@ -946,6 +959,38 @@ export default function App() {
     setNetworkId(network.id);
     setCustomNetworkForm({ name: "", horizonUrl: "", rpcUrl: "", passphrase: "" });
     showToast("Custom network removed. Switched to Testnet.", "info");
+  };
+
+  const loadTrades = async (cursor) => {
+    const page = await getAccountTrades(publicKey, cursor ? { cursor } : {});
+    setTrades((previous) => (cursor ? [...previous, ...page.records] : page.records));
+    setTradesNextCursor(page.nextCursor);
+  };
+
+  const handleTrades = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("trades");
+    try {
+      await loadTrades();
+    } catch (err) {
+      setTrades([]);
+      setTradesNextCursor(null);
+      showToast(err.message || "Could not load trades.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleLoadMoreTrades = async () => {
+    if (!publicKey || !tradesNextCursor) return;
+    setLoading("trades-more");
+    try {
+      await loadTrades(tradesNextCursor);
+    } catch (err) {
+      showToast(err.message || "Could not load more trades.", "error");
+    } finally {
+      setLoading("");
+    }
   };
 
   const refreshPending = useCallback(async () => {
@@ -2038,6 +2083,7 @@ export default function App() {
     // unaffected: classic payments only need the Horizon server, not the RPC.
     if (!rpcHealth.ok) {
       setLabState(null);
+      setAdminState(null);
       setLabStateError(
         rpcHealth.error ||
           `Soroban RPC unreachable (${rpcHealth.description}). ` +
@@ -2048,6 +2094,7 @@ export default function App() {
 
     setLoading("labstate");
     setLabStateError(null);
+    setAdminState(null);
     try {
       // Always read builder state
       const state = await readKitewellState(contractId, publicKey);
@@ -2072,6 +2119,29 @@ export default function App() {
       setLoading("");
     }
   }, [labInfo, publicKey, rpcHealth]);
+
+  const handleBuilderLookup = async (e) => {
+    e.preventDefault();
+    const contractId = labInfo?.network?.contract?.kitewell;
+    setBuilderLookupResult(null);
+    setBuilderLookupError(null);
+    if (!contractId) {
+      setBuilderLookupError(
+        "No contract id configured — deploy first (contracts/README.md)."
+      );
+      return;
+    }
+    setLoading("builder-lookup");
+    try {
+      setBuilderLookupResult(
+        await readKitewellBuilder(contractId, builderAddress)
+      );
+    } catch (err) {
+      setBuilderLookupError(err.message || "Builder lookup failed.");
+    } finally {
+      setLoading("");
+    }
+  };
 
   const handleRegister = async (e) => {
     e.preventDefault();
@@ -2394,10 +2464,9 @@ export default function App() {
     }
   };
 
-  // Issue #571: page through the contract's builder index. A page past the
-  // end comes back empty, so the panel shows an empty page rather than an error.
+  // Issue #643: append fixed-size pages from the contract's builder index.
   const loadBuilderPage = useCallback(
-    async (start = 0, explicitContractId) => {
+    async (start = 0, explicitContractId, append = false) => {
       const contractId = explicitContractId ?? configuredContractId;
       if (!contractId) {
         setBuilderList(null);
@@ -2407,9 +2476,12 @@ export default function App() {
       setLoading("builders");
       setBuilderListError(null);
       try {
-        setBuilderList(await listKitewellBuilders(contractId, { start }));
+        const page = await listKitewellBuilders(contractId, { start });
+        setBuilderList((previous) =>
+          appendBuilderPage(previous, { ...page, start }, contractId)
+        );
       } catch (err) {
-        setBuilderList(null);
+        if (!append) setBuilderList(null);
         setBuilderListError(
           err.message || "Could not read the builder index."
         );
@@ -2476,6 +2548,49 @@ export default function App() {
     }
   };
 
+  // Issue #668: the confirmation names the sponsored account and the entry,
+  // and only then does Freighter open. Cancelling signs nothing.
+  const handleReviewEndSponsorship = (event) => {
+    event.preventDefault();
+    const row = { entryType: "trustline", ...endSponsorForm };
+    const confirmation = describeEndSponsorship(row);
+    setEndSponsorResult(null);
+    if (!confirmation) {
+      setEndSponsorConfirmation(null);
+      return showToast(
+        "This sponsorship entry cannot be identified, so it cannot be ended.",
+        "error"
+      );
+    }
+    setEndSponsorConfirmation({ ...confirmation, row });
+  };
+
+  const handleEndSponsorship = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!endSponsorConfirmation) return;
+
+    setLoading("end-sponsorship");
+    try {
+      const result = await endSponsorshipWithFreighter(
+        publicKey,
+        endSponsorConfirmation.row
+      );
+      setEndSponsorResult(result);
+      setEndSponsorConfirmation(null);
+      setEndSponsorForm({
+        sponsoredAccount: "",
+        assetCode: "",
+        assetIssuer: "",
+      });
+      showToast(`Sponsorship ended · ${result.hash.slice(0, 12)}…`, "success");
+    } catch (err) {
+      trackFailedSubmit("endSponsorship", err);
+      showToast(err.message || "Ending the sponsorship failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   // Issue #541: stopping the watch aborts only the polling loop.
   const stopOfferWatch = useCallback(() => {
     offerWatchRef.current?.controller.abort();
@@ -2487,7 +2602,7 @@ export default function App() {
     setOfferWatchError(null);
     stopOfferWatch();
 
-    const offerId = offerForm.trim();
+    const offerId = offerWatchId.trim();
     const controller = new AbortController();
     const token = offerWatchTokenRef.current + 1;
     offerWatchTokenRef.current = token;
@@ -2735,6 +2850,21 @@ export default function App() {
     }
   };
 
+  const refreshClawbackAssets = async () => {
+    if (!publicKey) {
+      setClawbackAssets([]);
+      return;
+    }
+    try {
+      const next = await getAccountBalances(publicKey);
+      setClawbackAssets(
+        next.filter((balance) => !balance.isNative && balance.issuer === publicKey)
+      );
+    } catch {
+      setClawbackAssets([]);
+    }
+  };
+
   const activateTab = (tab) => {
     setActiveTab(tab);
     if (tab === "Fees") loadFeeStats();
@@ -2825,18 +2955,6 @@ export default function App() {
     } catch (error) {
       setSep7Request(null);
       showToast(error.message || "Invalid SEP-7 pay URI.", "error");
-    }
-  };
-
-  const activateTab = (tab) => {
-    setActiveTab(tab);
-    if (tab === "History") handleHistory();
-    if (tab === "Lab") {
-      loadLabInfo();
-      refreshLabState();
-    }
-    if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
-      refreshBalances();
     }
   };
 
@@ -3049,6 +3167,18 @@ export default function App() {
                   Explorer ↗
                 </a>
               </div>
+              {qrCodeDataUrl && (
+                <div className="qr-code-panel">
+                  <img
+                    className="qr-code-panel__image"
+                    src={qrCodeDataUrl}
+                    alt="QR code for the connected public address"
+                  />
+                  <p className="muted qr-code-panel__hint">
+                    Scan to copy the connected public address.
+                  </p>
+                </div>
+              )}
               {balances.filter((b) => !b.isNative).length > 0 && (
                 <div className="asset-chips">
                   {balances
@@ -3545,7 +3675,7 @@ export default function App() {
                           <button
                             className="btn btn--secondary btn--sm"
                             type="button"
-                            onClick={() => handleClawback(balance)}
+                            onClick={() => handleClawbackClaimable(balance)}
                             disabled={loading === `clawback-${balance.id}`}
                           >
                             {loading === `clawback-${balance.id}` ? "Clawing back…" : "Claw back"}
@@ -4863,8 +4993,8 @@ export default function App() {
                   inputMode="numeric"
                   pattern="[0-9]+"
                   placeholder="e.g. 123456789"
-                  value={offerForm}
-                  onChange={(e) => setOfferForm(e.target.value)}
+                  value={offerWatchId}
+                  onChange={(e) => setOfferWatchId(e.target.value)}
                   required
                 />
                 <p className="muted">
@@ -5165,6 +5295,14 @@ export default function App() {
                       )}
                     </button>
                   </div>
+                  <p className="muted" role="status">
+                    Contract instance: {contractStatusLabel(contractStatus)}
+                  </p>
+                  {contractCallBlock && (
+                    <div className="info-box info-box--warning">
+                      <p className="muted">{contractCallBlock}</p>
+                    </div>
+                  )}
                   {labState ? (
                     <div className="info-box">
                       <span className="eyebrow">Contract state</span>
@@ -5202,75 +5340,16 @@ export default function App() {
                       Reads lab_name, builder_count, and get_builder via Soroban RPC.
                     </p>
                   )}
-                  {adminState && (
-                    <div className="info-box">
-                      <span className="eyebrow">Admin</span>
-                      <div style={{ marginBottom: 12 }}>
-                        <span className="metadata-label">Current admin</span>
-                        <code style={{ display: "block", marginTop: 4 }}>
-                          {adminState.admin ? shortenAddress(adminState.admin) : "Not initialized"}
-                        </code>
-                      </div>
-                      {adminState.pendingAdmin && (
-                        <div style={{ marginBottom: 12 }}>
-                          <span className="metadata-label">Pending admin</span>
-                          <code style={{ display: "block", marginTop: 4 }}>
-                            {shortenAddress(adminState.pendingAdmin)}
-                          </code>
-                        </div>
-                      )}
-                      {publicKey === adminState.admin && (
-                        <form onSubmit={handleProposeAdmin} style={{ marginTop: 12 }}>
-                          <label className="label" htmlFor="propose-admin-address">
-                            Propose successor admin
-                          </label>
-                          <input
-                            id="propose-admin-address"
-                            className="input"
-                            placeholder="G… address"
-                            value={proposeAdminForm.address}
-                            onChange={(e) =>
-                              setProposeAdminForm({ address: e.target.value })
-                            }
-                          />
-                          <button
-                            className="btn btn--primary"
-                            type="submit"
-                            disabled={loading === "propose-admin"}
-                          >
-                            {loading === "propose-admin" ? (
-                              <>
-                                <Spinner /> Proposing…
-                              </>
-                            ) : (
-                              "Propose admin"
-                            )}
-                          </button>
-                        </form>
-                      )}
-                      {publicKey === adminState.pendingAdmin && (
-                        <div style={{ marginTop: 12 }}>
-                          <p className="muted" style={{ marginBottom: 8 }}>
-                            You are the pending admin. Accept to become the live admin.
-                          </p>
-                          <button
-                            className="btn btn--primary"
-                            type="button"
-                            onClick={handleAcceptAdmin}
-                            disabled={loading === "accept-admin"}
-                          >
-                            {loading === "accept-admin" ? (
-                              <>
-                                <Spinner /> Accepting…
-                              </>
-                            ) : (
-                              "Accept admin"
-                            )}
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  <LabAdminPanel
+                    adminState={adminState}
+                    publicKey={publicKey}
+                    proposeAdminForm={proposeAdminForm}
+                    setProposeAdminForm={setProposeAdminForm}
+                    onProposeAdmin={handleProposeAdmin}
+                    onAcceptAdmin={handleAcceptAdmin}
+                    loading={loading}
+                    Spinner={Spinner}
+                  />
                   {labStateError && (
                     <div className="info-box info-box--warning">
                       <span className="eyebrow">Contract state</span>
@@ -5283,7 +5362,7 @@ export default function App() {
                     <button
                       className="btn btn--secondary"
                       type="button"
-                      onClick={() => loadBuilderPage(builderList?.start ?? 0)}
+                      onClick={() => loadBuilderPage(0)}
                       disabled={!configuredContractId || loading === "builders"}
                     >
                       {loading === "builders" ? (
@@ -5294,7 +5373,26 @@ export default function App() {
                         "Refresh"
                       )}
                     </button>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      disabled={!builderList}
+                      onClick={() =>
+                        downloadCsv(buildersToCsv(builderList?.rows), "builders.csv")
+                      }
+                      title="Download the builder page currently loaded"
+                    >
+                      Download CSV
+                    </button>
                   </div>
+                  {!builderList && (
+                    <p className="muted">Load the builder registry to export it.</p>
+                  )}
+                  {builderList && builderList.rows.length === 0 && (
+                    <p className="muted">
+                      No builders on this page — the export will contain only the header.
+                    </p>
+                  )}
                   {!configuredContractId && (
                     <p className="muted">
                       No contract id configured — no builders to list.
@@ -5307,6 +5405,22 @@ export default function App() {
                   )}
                   {builderList && configuredContractId && (
                     <>
+                      <p className="muted">
+                        Loaded {builderList.rows.length} / builder_count{" "}
+                        {labState?.builderCount ?? "unavailable"}
+                      </p>
+                      {isBuilderCountMismatch(
+                        builderList.rows.length,
+                        labState?.builderCount,
+                        builderList.nextStart
+                      ) && (
+                        <div className="info-box info-box--warning">
+                          <p className="muted">
+                            Count mismatch: loaded {builderList.rows.length} builders,
+                            but the contract reports {labState.builderCount}.
+                          </p>
+                        </div>
+                      )}
                       {builderList.rows.length > 0 ? (
                         <ul className="balance-list">
                           {builderList.rows.map((row) => (
@@ -5327,37 +5441,69 @@ export default function App() {
                             : "No builders registered yet."}
                         </p>
                       )}
-                      <div className="section__row">
-                        <button
-                          className="btn btn--secondary btn--sm"
-                          type="button"
-                          disabled={
-                            builderList.start === 0 || loading === "builders"
-                          }
-                          onClick={() =>
-                            loadBuilderPage(
-                              Math.max(0, builderList.start - builderList.limit)
-                            )
-                          }
-                        >
-                          Previous
-                        </button>
-                        <span className="muted">
-                          Showing from index {builderList.start}
-                        </span>
-                        <button
-                          className="btn btn--secondary btn--sm"
-                          type="button"
-                          disabled={
-                            builderList.nextStart === null ||
-                            loading === "builders"
-                          }
-                          onClick={() => loadBuilderPage(builderList.nextStart)}
-                        >
-                          Next
-                        </button>
-                      </div>
+                      {builderList.nextStart !== null && (
+                        <div className="section__row">
+                          <button
+                            className="btn btn--secondary btn--sm"
+                            type="button"
+                            disabled={loading === "builders"}
+                            onClick={() =>
+                              loadBuilderPage(
+                                builderList.nextStart,
+                                undefined,
+                                true
+                              )
+                            }
+                          >
+                            Load next page
+                          </button>
+                        </div>
+                      )}
                     </>
+                  )}
+
+                  <form className="form" onSubmit={handleBuilderLookup}>
+                    <div className="subhead">Builder lookup</div>
+                    <label className="label" htmlFor="builder-lookup-address">
+                      Stellar address
+                    </label>
+                    <input
+                      id="builder-lookup-address"
+                      className="input"
+                      type="text"
+                      maxLength={56}
+                      placeholder="G…"
+                      value={builderAddress}
+                      onChange={(e) => setBuilderAddress(e.target.value)}
+                    />
+                    <button
+                      className="btn btn--secondary"
+                      type="submit"
+                      disabled={loading === "builder-lookup"}
+                    >
+                      {loading === "builder-lookup" ? (
+                        <>
+                          <Spinner /> Looking up…
+                        </>
+                      ) : (
+                        "Look up builder"
+                      )}
+                    </button>
+                  </form>
+                  {builderLookupError && (
+                    <div className="info-box info-box--warning">
+                      <p className="muted">{builderLookupError}</p>
+                    </div>
+                  )}
+                  {builderLookupResult && (
+                    <div className="info-box">
+                      <span className="eyebrow">Builder</span>
+                      {builderLookupResult.registered ? (
+                        <code>{builderLookupResult.name}</code>
+                      ) : (
+                        <span className="muted">Not registered</span>
+                      )}
+                    </div>
                   )}
 
                   <form className="form" onSubmit={handleRegister}>
@@ -5383,7 +5529,8 @@ export default function App() {
                         loading === "register" ||
                         loading === "simulate" ||
                         requireWallet ||
-                        !registerSimulationReady
+                        !registerSimulationReady ||
+                        !canCallContract(contractStatus)
                       }
                     >
                       {loading === "register" ? (
@@ -5401,7 +5548,8 @@ export default function App() {
                       disabled={
                         loading === "simulate" ||
                         loading === "register" ||
-                        requireWallet
+                        requireWallet ||
+                        !canCallContract(contractStatus)
                       }
                     >
                       {loading === "simulate" ? (
@@ -5602,6 +5750,144 @@ export default function App() {
                       <code>{sponsorResult.hash}</code>
                       <a
                         href={explorerTxUrl(sponsorResult.hash)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-link"
+                      >
+                        Explorer ↗
+                      </a>
+                    </div>
+                  )}
+
+                  <div className="subhead">End a sponsorship</div>
+                  <p className="muted">
+                    Ends one entry from the sponsorship list with a single
+                    revoke-sponsorship operation. Nothing is signed until the
+                    confirmation below is accepted.
+                  </p>
+                  <form className="form" onSubmit={handleReviewEndSponsorship}>
+                    <label className="label" htmlFor="end-sponsor-account">
+                      Sponsored account
+                    </label>
+                    <input
+                      id="end-sponsor-account"
+                      className="input"
+                      type="text"
+                      placeholder="G…"
+                      value={endSponsorForm.sponsoredAccount}
+                      onChange={(e) => {
+                        setEndSponsorForm({
+                          ...endSponsorForm,
+                          sponsoredAccount: e.target.value,
+                        });
+                        setEndSponsorConfirmation(null);
+                      }}
+                    />
+                    <label className="label" htmlFor="end-sponsor-code">
+                      Asset code
+                    </label>
+                    <input
+                      id="end-sponsor-code"
+                      className="input"
+                      type="text"
+                      placeholder="USDC"
+                      maxLength={12}
+                      value={endSponsorForm.assetCode}
+                      onChange={(e) => {
+                        setEndSponsorForm({
+                          ...endSponsorForm,
+                          assetCode: e.target.value,
+                        });
+                        setEndSponsorConfirmation(null);
+                      }}
+                    />
+                    <label className="label" htmlFor="end-sponsor-issuer">
+                      Asset issuer
+                    </label>
+                    <input
+                      id="end-sponsor-issuer"
+                      className="input"
+                      type="text"
+                      placeholder="G…"
+                      value={endSponsorForm.assetIssuer}
+                      onChange={(e) => {
+                        setEndSponsorForm({
+                          ...endSponsorForm,
+                          assetIssuer: e.target.value,
+                        });
+                        setEndSponsorConfirmation(null);
+                      }}
+                    />
+                    <button
+                      className="btn btn--secondary"
+                      type="submit"
+                      disabled={
+                        loading === "end-sponsorship" ||
+                        requireWallet ||
+                        !hasEndSponsorshipAction({
+                          entryType: "trustline",
+                          ...endSponsorForm,
+                        })
+                      }
+                    >
+                      Review
+                    </button>
+                  </form>
+                  {endSponsorConfirmation && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Confirm end sponsorship</span>
+                      <p className="muted">{endSponsorConfirmation.message}</p>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">
+                            Sponsored account
+                          </span>
+                          <span className="metadata-value">
+                            {endSponsorConfirmation.sponsoredAccount}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Entry</span>
+                          <span className="metadata-value">
+                            {endSponsorConfirmation.entryLabel}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="section__row">
+                        <button
+                          className="btn btn--secondary"
+                          type="button"
+                          onClick={() => setEndSponsorConfirmation(null)}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          className="btn btn--primary"
+                          type="button"
+                          onClick={handleEndSponsorship}
+                          disabled={loading === "end-sponsorship"}
+                        >
+                          {loading === "end-sponsorship" ? (
+                            <>
+                              <Spinner /> Signing in Freighter…
+                            </>
+                          ) : (
+                            "Sign & end sponsorship"
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {endSponsorResult && (
+                    <div className="info-box">
+                      <span className="eyebrow">Sponsorship ended</span>
+                      <p className="muted">
+                        {endSponsorResult.entryLabel} held by{" "}
+                        {endSponsorResult.sponsoredAccount}
+                      </p>
+                      <code>{endSponsorResult.hash}</code>
+                      <a
+                        href={explorerTxUrl(endSponsorResult.hash)}
                         target="_blank"
                         rel="noreferrer"
                         className="text-link"
@@ -6003,17 +6289,18 @@ export default function App() {
                     )}
                     <div className="section__row">
                       <button
-        type="submit"
-        disabled={loading === "setoptions" || requireWallet}
-      >
-        {loading === "setoptions" ? (
-          <>
-            <Spinner /> Signing in Freighter…
-          </>
-        ) : (
-          "Submit setOptions"
-        )}
-      </button>
+                        className="btn btn--primary"
+                        type="submit"
+                        disabled={loading === "setoptions" || requireWallet}
+                      >
+                        {loading === "setoptions" ? (
+                          <>
+                            <Spinner /> Signing in Freighter…
+                          </>
+                        ) : (
+                          "Submit setOptions"
+                        )}
+                      </button>
                     </div>
                   </form>
                 )}
@@ -6021,9 +6308,9 @@ export default function App() {
                   <div className="warning-box">
                     <span className="eyebrow">Warning</span>
                     <p className="muted">
-                      {mediumThreshold > (signers.reduce((sum, w) => sum + (w.weight ?? 0), 0) || 0)
-                        ? "Medium threshold exceeds total signer weights!"
-                        : ""}
+                      {medThreshold > (signers.reduce((sum, signer) => sum + (signerWeights[signers.indexOf(signer)] ?? 0), 0) || 0)
+                        ? "Medium threshold exceeds total signer weights."
+                        : "Thresholds are covered by the current signer weights."}
                     </p>
                   </div>
                 )}
@@ -6032,7 +6319,6 @@ export default function App() {
               {!labInfo && !labError && (
                 <p className="muted">Open this tab to probe the backend.</p>
               )}
-              <div className="info-box">
               <div className="info-box">
                 <span className="eyebrow">Failed submits</span>
                 <p className="muted">
@@ -6063,22 +6349,8 @@ export default function App() {
                   type="button"
                   onClick={handleHistory}
                   disabled={loading === "history" || requireWallet}
-
-                <span className="eyebrow">Failed submits</span>
-                <p className="muted">
-                  {failedSubmits.length === 0
-                    ? "No failed submits this session yet."
-                    : `${failedSubmits.length} failed submission${
-                        failedSubmits.length === 1 ? "" : "s"
-                      } this session. Cleared on disconnect or reload — not stored in localStorage.`}
-                </p>
-                <button
-                  className="btn btn--secondary"
-                  type="button"
-                  onClick={handleDownloadFailedSubmits}
-                  disabled={failedSubmits.length === 0}
                 >
-                  Download failed JSON
+                  {loading === "history" ? "Loading…" : "Refresh"}
                 </button>
               </div>
 
@@ -6361,6 +6633,7 @@ export default function App() {
                   {filteredTransactions.map((tx) => {
                     const isOutgoing = tx.from === publicKey;
                     const createdAt = formatCreatedAt(tx.created_at);
+                    const memo = mapPaymentMemo(tx);
                     return (
                       <div
                         key={tx.id}
@@ -6397,43 +6670,21 @@ export default function App() {
                         <div className="tx-item__fee muted">
                           {formatHistoryFee(tx)}
                         </div>
+                        <div className="tx-item__memo">
+                          <span className="metadata-label">{memo.label}</span>
+                          <span className="tx-item__memo-value">{memo.value}</span>
+                        </div>
                         {createdAt && (
                           <time
                             className="tx-item__time"
                             dateTime={tx.created_at}
                           >
-                            <div className="tx-item__direction">
-                              {isOutgoing ? "Sent" : "Received"}
-                            </div>
-                            <div className="tx-item__amount">
-                              {parseFloat(tx.amount).toLocaleString()} {tx.asset_code || "XLM"}
-                            </div>
-                            <div className="tx-item__addr muted">
-                              {isOutgoing
-                                ? `To ${shortenAddress(tx.to)}`
-                                : `From ${shortenAddress(tx.from)}`}
-                            </div>
-                            <a
-                              href={explorerTxUrl(tx.transaction_hash)}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="tx-item__link"
-                            >
-                              Explorer ↗
-                            </a>
-                            {createdAt && (
-                              <time
-                                className="tx-item__time"
-                                dateTime={tx.created_at}
-                              >
-                                {createdAt}
-                              </time>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </section>
-                  ))}
+                            {createdAt}
+                          </time>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               ) : (
                 !loading && (
