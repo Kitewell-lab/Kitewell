@@ -101,11 +101,13 @@ describe("mapStreamPayment", () => {
         "asset_code",
         "asset_type",
         "created_at",
+        "fee_account",
         "fee_bumped",
         "fee_charged",
         "from",
         "id",
         "operation_count",
+        "source_account",
         "to",
         "transaction_hash",
       ].sort()

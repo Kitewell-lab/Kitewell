@@ -3,8 +3,8 @@ import cors from "cors";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { mapBalances } from "./mapBalances.js";
 import { createRateLimiter } from "./rateLimit.js";
-import { resolveNetwork } from "./networkConfig.js";
-import { mapTransactionFee } from "./transactionFee.js";
+import { resolveNetwork, resolveRequestNetwork } from "./networkConfig.js";
+import { mapTransactionFee, mapTransactionSources } from "./transactionFee.js";
 
 /**
  * Build the Kitewell Express app.
@@ -165,7 +165,7 @@ export function createApp({ horizon, env = process.env } = {}) {
         dataEntries: Object.entries(account.data_attr || {})
           .sort(([left], [right]) => left.localeCompare(right))
           .map(([name, value]) => ({ name, value })),
-        explorerUrl: `${EXPLORER_BASE}/account/${address}`,
+        explorerUrl: `${network.explorerBase}/account/${address}`,
       });
     } catch (err) {
       const status = err?.response?.status || 404;

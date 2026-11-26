@@ -63,7 +63,7 @@ describe("formatHistoryFee", () => {
 
   it("formats a fee-bumped transaction with its outer fee and a fee-bumped label", () => {
     expect(formatHistoryFee(mapTransactionFee(FEE_BUMP_TX))).toBe(
-      "Fee 0.00004 XLM · fee-bumped · 1 operation"
+      "Outer fee paid 0.00004 XLM · fee-bumped · 1 operation"
     );
   });
 

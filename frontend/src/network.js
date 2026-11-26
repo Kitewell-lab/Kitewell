@@ -1,4 +1,5 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { fetchHorizonRoot } from "./api";
 
 /**
  * Single source of truth for the selectable Stellar networks.
@@ -193,13 +194,14 @@ export function setActiveNetwork(id) {
   return getNetworkById(id);
 }
 
-export function saveCustomNetwork({ name, horizonUrl, rpcUrl, passphrase }) {
+/** Check the custom network form and build the network it describes, without saving it. */
+function buildCustomNetwork({ name, horizonUrl, rpcUrl, passphrase }) {
   const label = String(name || "").trim();
   const normalizedPassphrase = String(passphrase || "").trim();
   if (!label) throw new Error("Custom network name is required.");
   if (!normalizedPassphrase) throw new Error("Network passphrase is required.");
 
-  customNetwork = {
+  return {
     id: "CUSTOM",
     label,
     horizonUrl: normalizeHttpsUrl(horizonUrl, "Horizon URL"),
@@ -208,6 +210,10 @@ export function saveCustomNetwork({ name, horizonUrl, rpcUrl, passphrase }) {
     explorerBase: null,
     friendbotUrl: null,
   };
+}
+
+export function saveCustomNetwork(form) {
+  customNetwork = buildCustomNetwork(form);
   try {
     globalThis.localStorage?.setItem(
       CUSTOM_NETWORK_STORAGE_KEY,
@@ -217,6 +223,24 @@ export function saveCustomNetwork({ name, horizonUrl, rpcUrl, passphrase }) {
     /* The in-memory custom network remains usable for this session. */
   }
   return customNetwork;
+}
+
+/**
+ * Save a custom network only after its Horizon URL answers like Horizon.
+ *
+ * The form is checked first, then the Horizon root is requested over HTTPS.
+ * A root that is not Horizon, a redirect to HTTP or a timeout rejects with
+ * the reason, and the previously saved custom network (if any) is kept.
+ *
+ * @param {{ name: string, horizonUrl: string, rpcUrl: string, passphrase: string }} form
+ * @param {{ fetchRoot?: typeof fetchHorizonRoot, timeoutMs?: number }} [options]
+ * @returns {Promise<object>} The saved custom network.
+ */
+export async function saveVerifiedCustomNetwork(form, options = {}) {
+  const { fetchRoot = fetchHorizonRoot, timeoutMs } = options;
+  const network = buildCustomNetwork(form);
+  await fetchRoot(network.horizonUrl, timeoutMs === undefined ? {} : { timeoutMs });
+  return saveCustomNetwork(form);
 }
 
 export function removeCustomNetwork() {

@@ -42,6 +42,7 @@ import {
   downloadFailedSubmitLog,
 } from "./failedSubmitLog";
 import { copyToClipboardResult } from "./copyToClipboardResult";
+import { TransactionSources } from "./TransactionSources";
 import { shortenAddress } from "./addressFormat";
 import { generateAddressQrCode } from "./addressQr";
 import {
@@ -62,6 +63,9 @@ import {
   groupPaymentsByDay,
   explorerAccountUrl,
   explorerTxUrl,
+  getTrades,
+  withOfferOriginalAmounts,
+  describeOfferFill,
   downloadAccountSnapshot,
   getAccountAuthConfig,
   getIssuedAssetTrustlines,
@@ -105,7 +109,7 @@ import {
   getAvailableNetworks,
   isFriendbotAvailable,
   removeCustomNetwork,
-  saveCustomNetwork,
+  saveVerifiedCustomNetwork,
   setActiveNetwork,
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
@@ -243,6 +247,8 @@ export default function App() {
     direction: "",
   });
   const [historyError, setHistoryError] = useState(null);
+  const [trades, setTrades] = useState([]);
+  const [tradesNextCursor, setTradesNextCursor] = useState(null);
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
   const [transactionFailure, setTransactionFailure] = useState(null);
@@ -890,6 +896,8 @@ export default function App() {
     setOfferPrices({});
     setOfferResult(null);
     setTransactions([]);
+    setTrades([]);
+    setTradesNextCursor(null);
     setNextCursor(null);
     setPageCursors([null]);
     setHistoryError(null);
@@ -921,6 +929,8 @@ export default function App() {
       setOfferPrices({});
       setOfferResult(null);
       setTransactions([]);
+      setTrades([]);
+      setTradesNextCursor(null);
       setNextCursor(null);
       setPageCursors([null]);
       setHistoryError(null);
@@ -944,14 +954,18 @@ export default function App() {
     }
   };
 
-  const handleSaveCustomNetwork = (event) => {
+  const handleSaveCustomNetwork = async (event) => {
     event.preventDefault();
+    setCustomNetworkChecking(true);
     try {
-      const network = saveCustomNetwork(customNetworkForm);
+      // The Horizon root must answer like Horizon before anything is saved.
+      const network = await saveVerifiedCustomNetwork(customNetworkForm);
       handleNetworkChange(network.id);
       showToast(`Saved and selected ${network.label}.`, "info");
     } catch (error) {
       showToast(error.message || "Could not save custom network.", "error");
+    } finally {
+      setCustomNetworkChecking(false);
     }
   };
 
@@ -1648,7 +1662,7 @@ export default function App() {
   const refreshOfferData = async () => {
     const [nextBalances, nextOffers] = await Promise.all([
       getAccountBalances(publicKey),
-      getAccountOffers(publicKey),
+      getAccountOffers(publicKey).then((offers) => withOfferOriginalAmounts(offers)),
     ]);
     setBalances(nextBalances);
     setOfferList(nextOffers);
@@ -1658,7 +1672,8 @@ export default function App() {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     setLoadingOffers(true);
     try {
-      setOfferList(await getAccountOffers(publicKey));
+      const offers = await getAccountOffers(publicKey);
+      setOfferList(await withOfferOriginalAmounts(offers));
     } catch (err) {
       showToast(err.message || "Could not load active offers.", "error");
     } finally {
@@ -1741,8 +1756,43 @@ export default function App() {
     }
   };
 
+  const handleTrades = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("trades");
+    try {
+      const page = await getTrades(publicKey);
+      setTrades(page.records);
+      setTradesNextCursor(page.nextCursor);
+      if (page.records.length === 0) showToast("No trades yet.", "info");
+    } catch (e) {
+      showToast(e.message || "Could not load trades.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleLoadMoreTrades = async () => {
+    if (!publicKey || !tradesNextCursor) return;
+    setLoading("trades-more");
+    try {
+      const page = await getTrades(publicKey, undefined, tradesNextCursor);
+      setTrades((previous) => [...previous, ...page.records]);
+      setTradesNextCursor(page.nextCursor);
+    } catch (e) {
+      showToast(e.message || "Could not load older trades.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const handleCancelOffer = async (offer) => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!describeOfferFill(offer).cancellable) {
+      return showToast(
+        `Offer ${offer.offerId} has no readable open amount, so it cannot be cancelled here.`,
+        "error"
+      );
+    }
 
     setLoading(`offer-cancel-${offer.offerId}`);
     try {
@@ -3093,8 +3143,12 @@ export default function App() {
                 required
               />
               <div className="section__row">
-                <button className="btn btn--secondary btn--sm" type="submit">
-                  Save custom network
+                <button
+                  className="btn btn--secondary btn--sm"
+                  type="submit"
+                  disabled={customNetworkChecking}
+                >
+                  {customNetworkChecking ? "Checking Horizon…" : "Save custom network"}
                 </button>
                 {getAvailableNetworks().some((network) => network.id === "CUSTOM") && (
                   <button
@@ -4692,16 +4746,21 @@ export default function App() {
                             <div>
                               <strong>Offer {offer.offerId}</strong>
                               <p className="muted">
-                                Sell {offer.amount} {assetLabel(offer.selling)} for{" "}
+                                Sell {assetLabel(offer.selling)} for{" "}
                                 {assetLabel(offer.buying)} at{" "}
                                 {offer.priceNumerator}/{offer.priceDenominator}
                               </p>
+                              <OfferFillSummary
+                                offer={offer}
+                                assetLabel={assetLabel(offer.selling)}
+                              />
                             </div>
                             <button
                               className="btn btn--secondary btn--sm"
                               type="button"
                               onClick={() => handleCancelOffer(offer)}
                               disabled={
+                                !describeOfferFill(offer).cancellable ||
                                 loading === `offer-cancel-${offer.offerId}`
                               }
                             >
@@ -7148,6 +7207,7 @@ export default function App() {
                         <div className="tx-item__addr muted">
                           Price: {price}
                         </div>
+                        <TradeSettlement trade={trade} network={activeNetwork} />
                         {tradeTime && (
                           <time
                             className="tx-item__time"

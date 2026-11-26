@@ -78,7 +78,7 @@ describe("getTransactions fee and operation count", () => {
 
     expect(records.map(formatHistoryFee)).toEqual([
       "Fee 0.00001 XLM · 1 operation",
-      "Fee 0.00004 XLM · fee-bumped · 1 operation",
+      "Outer fee paid 0.00004 XLM · fee-bumped · 1 operation",
       "Fee unknown · operations unknown",
     ]);
   });

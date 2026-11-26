@@ -86,8 +86,8 @@ describe("the payments list a stream builds", () => {
     config.onRecord(event("1-0"));
     expect(Object.keys(run.controller.getRecords()[0]).sort()).toEqual(
       [
-        "amount", "asset_code", "asset_type", "created_at", "fee_bumped", "fee_charged",
-        "from", "id", "operation_count", "to", "transaction_hash",
+        "amount", "asset_code", "asset_type", "created_at", "fee_account", "fee_bumped", "fee_charged",
+        "from", "id", "operation_count", "source_account", "to", "transaction_hash",
       ].sort()
     );
   });

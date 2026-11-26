@@ -76,6 +76,8 @@ describe("Horizon transaction asset mapping", () => {
           fee_charged: null,
           operation_count: null,
           fee_bumped: false,
+          source_account: null,
+          fee_account: null,
         },
       ],
       nextCursor: null,

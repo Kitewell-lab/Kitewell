@@ -369,6 +369,8 @@ test("GET /api/payments/:address filters out non-payment records", async (t) => 
       fee_charged: null,
       operation_count: null,
       fee_bumped: false,
+      source_account: null,
+      fee_account: null,
       explorerUrl: "https://explorer.test.invalid/tx/hash-native",
     },
   ]);
