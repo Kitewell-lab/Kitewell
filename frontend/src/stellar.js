@@ -1411,4 +1411,7 @@ export async function getAccountTrades(publicKey, { limit = 10, cursor } = {}) {
   };
 }
 
-export { summarizeEnvelopeSignatures } from "./multisigEnvelope";
+export {
+  listEnvelopeSignatures,
+  summarizeEnvelopeSignatures,
+} from "./multisigEnvelope";

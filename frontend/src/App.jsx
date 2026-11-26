@@ -81,6 +81,11 @@ import {
 } from "./orderBookPair";
 import { poolShareRows } from "./poolShare";
 import {
+  clearSendFormMemory,
+  readStoredSendForm,
+  saveSendFormMemory,
+} from "./sendFormMemory";
+import {
   calculateMinimumBalance,
   formatStroops,
   minimumBalanceInStroops,
@@ -246,16 +251,20 @@ export default function App() {
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
   const [transactionFailure, setTransactionFailure] = useState(null);
-  const [sendForm, setSendForm] = useState({
-    destination: "",
-    amount: "",
-    assetKey: "native",
-    memoType: "text",
-    memo: "",
-    minTime: "",
-    maxTime: "",
+  const [sendForm, setSendForm] = useState(() => {
+    const remembered = readStoredSendForm();
+    return {
+      destination: remembered.destination,
+      amount: "",
+      assetKey: remembered.assetKey,
+      memoType: "text",
+      memo: "",
+      minTime: "",
+      maxTime: "",
+    };
   });
   const [sendPrepared, setSendPrepared] = useState(null);
+  const restoredAssetCheckedRef = useRef(false);
 
   const updateSendForm = (changes) => {
     setSendForm((previous) => ({
@@ -613,6 +622,20 @@ export default function App() {
       setSignerWeights(newWeights);
     }
   }, [signers.length, signerWeights.length]);
+
+  // Balances arrive after the restored form is rendered. Reconcile the
+  // remembered asset once they do: an asset no longer held is left blank and
+  // dropped from storage, while the remembered destination stays.
+  useEffect(() => {
+    if (restoredAssetCheckedRef.current || balances.length === 0) return;
+    restoredAssetCheckedRef.current = true;
+    const stored = readStoredSendForm(balances);
+    setSendForm((previous) =>
+      previous.assetKey === stored.assetKey
+        ? previous
+        : { ...previous, assetKey: stored.assetKey }
+    );
+  }, [balances]);
 
   const refreshBalances = useCallback(async () => {
     if (!publicKey) return;
@@ -1389,6 +1412,10 @@ export default function App() {
 
       const next = await getAccountBalances(publicKey);
       setBalances(next);
+      saveSendFormMemory(
+        { destination: sendForm.destination, assetKey: sendForm.assetKey },
+        next
+      );
       setSendPrepared(null);
 
       setSendForm({
@@ -1457,6 +1484,12 @@ export default function App() {
       hops ? `Path applied: ${hops}` : "Direct path applied.",
       "info"
     );
+  };
+
+  const handleClearSendFormMemory = () => {
+    clearSendFormMemory();
+    updateSendForm({ destination: "", assetKey: "native" });
+    showToast("Cleared the remembered destination and asset.", "info");
   };
 
   const handlePathPayment = async (e) => {
@@ -4039,6 +4072,18 @@ export default function App() {
                 Builds a payment op for XLM or a credit asset you hold. Review the unsigned
                 envelope XDR, then sign in Freighter to submit it to Horizon Testnet.
               </p>
+              <div className="section__row">
+                <p className="muted">
+                  The last destination and asset are remembered in this browser.
+                </p>
+                <button
+                  className="btn btn--secondary btn--sm"
+                  type="button"
+                  onClick={handleClearSendFormMemory}
+                >
+                  Clear remembered details
+                </button>
+              </div>
               <form onSubmit={handleSend} className="form">
                 <label className="label" htmlFor="sep7-uri">
                   SEP-7 payment URI
@@ -4089,6 +4134,7 @@ export default function App() {
                   value={sendForm.assetKey}
                   onChange={(e) => updateSendForm({ assetKey: e.target.value })}
                 >
+                  <option value="">Choose an asset</option>
                   <option value="native">XLM (native)</option>
                   {sep7Request?.assetKey && sep7Request.assetKey !== "native" &&
                     !balances.some((b) => b.key === sep7Request.assetKey) && (
