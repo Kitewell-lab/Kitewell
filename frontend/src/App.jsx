@@ -1,23 +1,26 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import {useState, useCallback, useEffect, useRef, } from "react";
 import * as StellarSdk from "@stellar/stellar-sdk";
-import {
-  checkFreighterInstalled,
+import { createTxLog } from "./txLog";
+import { minimumBalanceInStroops } from "./accountReserve";
+import {checkFreighterInstalled,
   connectFreighterWallet,
   buildPaymentEnvelope,
   buildUnsignedEnvelope,
   submitEnvelopeWithFreighter,
   pathPaymentWithFreighter,
-  changeOfferPriceWithFreighter,
+  
   changeTrustWithFreighter,
-  createClaimableBalanceWithFreighter,
-  claimClaimableBalanceWithFreighter,
+  
+  
   clawbackClaimableBalanceWithFreighter,
-  clawbackWithFreighter,
+  
   readKitewellState,
   registerBuilderWithFreighter,
   readAdminState,
   proposeAdminWithFreighter,
   acceptAdminWithFreighter,
+  getServer,
+  currentPassphrase,
   setAccountOptionsWithFreighter,
   allowTrustWithFreighter,
   readContractInstanceTtl,
@@ -33,6 +36,12 @@ import {
   createSponsoredAccountDraft,
   sponsorAccountCreationWithFreighter,
   deployKitewellContract,
+  createAccountWithFreighter,
+  preparePaymentWithFreighter,
+  confirmPaymentWithFreighter,
+  checkSorobanRpcHealth,
+  parseSep7PayUri,
+  TRANSACTION_FEE_STROOPS,
 } from "./freighter";
 import {
   appendBuilderPage,
@@ -43,27 +52,25 @@ import {
   downloadFailedSubmitLog,
 } from "./failedSubmitLog";
 import { copyToClipboardResult } from "./copyToClipboardResult";
-import { shortenAddress } from "./addressFormat";
+import {shortenAddress, splitMuxedAddress, buildMuxedAddress } from "./addressFormat";
 import { generateAddressQrCode } from "./addressQr";
-import {
-  fundWithFriendbot,
-  buildAsset,
+import {fundWithFriendbot,
+  
   getAccountBalances,
   getAccountDetails,
   getOpenOffers,
   getPendingTransactions,
-  getClaimableBalances,
   getOutgoingSponsorships,
   getSponsoredClaimableBalances,
   getOrderBook,
   getAccountTrades,
+  buildAsset,
   isHorizonSlowdownError,
   HORIZON_SLOWDOWN_MESSAGE,
   getLiquidityPool,
   liquidityPoolDeposit,
   liquidityPoolWithdraw,
   getTransactions,
-  groupPaymentsByDay,
   resolveFederationAddress,
   explorerAccountUrl,
   explorerTxUrl,
@@ -72,14 +79,13 @@ import {
   getIssuedAssetTrustlines,
   accountLedgerStatus,
   IMMUTABLE_CONFIRMATION,
-  getTransactionMemos,
-  buildPaymentsCsv,
-  PAYMENTS_CSV_FILENAME,
-} from "./stellar";
+  
+  
+  watchOfferUntilGone, filterVisibleBalances, getAccountOffers, buildManageSellOffer, getFeeStats, getLatestBaseReserve } from "./stellar";
 import { downloadCsv } from "./csvExport";
 import { buildersToCsv } from "./builderCsv";
 import {
-  clearStoredOrderBookPair,
+  
   parseOrderBookPair,
   readStoredOrderBookPair,
   saveOrderBookPair,
@@ -98,13 +104,13 @@ import {
 import {
   calculateMinimumBalance,
   formatStroops,
-  minimumBalanceInStroops,
-  parseXlmToStroops,
-  remainsAboveMinimum,
+  
+  
+  
 } from "./accountReserve";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { filterTransactionHistory } from "./txHistoryFilter";
-import { fetchHealth, fetchNetworkInfo } from "./api";
+import {fetchHealth, fetchNetworkInfo, fetchLatestHorizonLedger } from "./api";
 import {
   describeEndSponsorship,
   endSponsorshipWithFreighter,
@@ -114,7 +120,7 @@ import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
 import { formatSimulationFee } from "./simulationFees";
 import { mapPaymentMemo } from "./paymentMemo";
 import {
-  NETWORKS,
+  
   getActiveNetwork,
   getActiveNetworkId,
   getAvailableNetworks,
@@ -132,7 +138,6 @@ import MultisigCosignPanel from "./MultisigCosignPanel";
 import LabAdminPanel from "./LabAdminPanel";
 import { completeWebAuthChallenge } from "./sep10WebAuth";
 import { loadIssuerCurrencyList } from "./issuerToml";
-import { createPaymentStreamController } from "./paymentStream";
 import {
   normaliseTxHash,
   txStatusPresentation,
@@ -146,6 +151,10 @@ import {
   rpcCallBlockReason,
 } from "./contractStatus";
 import "./App.css";
+import { formatHistoryFee } from "./historyFee";
+import { TransactionFailureNotice } from "./TransactionFailureNotice";
+import {saveFeeSetting, loadFeeSetting } from "./feeSetting";
+import { createSubmitGuard } from "./submitGuard";
 
 const TABS = [
   "Wallet",
@@ -217,6 +226,14 @@ function validatePositivePrice(value, label) {
   return text;
 }
 
+
+// --- grafted module declarations ---
+const FEE_PERCENTILES = [
+  { key: "mode", label: "Mode" },
+  { key: "p10", label: "p10" },
+  { key: "p99", label: "p99" },
+];
+
 export default function App() {
   const [activeTab, setActiveTab] = useState("Wallet");
   const [publicKey, setPublicKey] = useState(null);
@@ -247,10 +264,10 @@ export default function App() {
     minAmountB: "",
   });
   const [transactions, setTransactions] = useState([]);
-  const [pendingTransactions, setPendingTransactions] = useState([]);
+  const [, setPendingTransactions] = useState([]);
   const [trades, setTrades] = useState([]);
   const [tradesNextCursor, setTradesNextCursor] = useState(null);
-  const [pendingError, setPendingError] = useState(null);
+  const [, setPendingError] = useState(null);
   const [nextCursor, setNextCursor] = useState(null);
   const [pageCursors, setPageCursors] = useState([null]);
   const [historyFilters, setHistoryFilters] = useState({
@@ -293,6 +310,18 @@ export default function App() {
   });
   const [baseReserveInStroops, setBaseReserveInStroops] = useState(null);
   const [reserveError, setReserveError] = useState(null);
+  const refreshReserve = useCallback(async () => {
+    try {
+      const baseReserve = await getLatestBaseReserve();
+      setBaseReserveInStroops(baseReserve);
+      setReserveError(null);
+    } catch (error) {
+      setBaseReserveInStroops(null);
+      setReserveError(
+        error.message || "Could not load the latest ledger reserve from Horizon."
+      );
+    }
+  }, []);
   const [reserveSubentryCount, setReserveSubentryCount] = useState("0");
   const [pathForm, setPathForm] = useState({
     mode: "strictSend",
@@ -314,6 +343,8 @@ export default function App() {
     priceDenominator: "1",
     amount: "",
   });
+  const updateOfferForm = (changes) =>
+    setOfferForm((prev) => ({ ...prev, ...changes }));
   const [offerList, setOfferList] = useState([]);
   const [orderBook, setOrderBook] = useState(null);
   const [orderBookError, setOrderBookError] = useState(null);
@@ -337,7 +368,6 @@ export default function App() {
   const [proposeAdminForm, setProposeAdminForm] = useState({ address: "" });
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
-  const [renameForm, setRenameForm] = useState({ name: "" });
   const [inspectForm, setInspectForm] = useState({ xdr: "" });
   const [inspectResult, setInspectResult] = useState(null);
   const [inspectError, setInspectError] = useState(null);
@@ -349,20 +379,7 @@ export default function App() {
   const tabRefs = useRef([]);
   const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
-  const [clawbackAssets, setClawbackAssets] = useState([]);
-  const [clawbackForm, setClawbackForm] = useState({
-    assetKey: "",
-    holder: "",
-    amount: "",
-  });
-  const [claimableForm, setClaimableForm] = useState({
-    claimant: "",
-    amount: "",
-    assetKey: "native",
-    predicateMode: "unconditional",
-    ledgerTime: "",
-  });
-  const [claimableResult, setClaimableResult] = useState(null);
+  const [, setClawbackAssets] = useState([]);
   const [failedSubmits, setFailedSubmits] = useState([]);
   const failedSubmitLogRef = useRef(createFailedSubmitLog());
   const [webAuthForm, setWebAuthForm] = useState({ endpoint: "", serverAccount: "" });
@@ -371,28 +388,17 @@ export default function App() {
   const [issuerInput, setIssuerInput] = useState("");
   const [issuerResult, setIssuerResult] = useState(null);
   const [issuerError, setIssuerError] = useState(null);
-  const [streamedPayments, setStreamedPayments] = useState([]);
-  const [streamState, setStreamState] = useState(null);
+  const [streamedPayments, ] = useState([]);
+  const [streamState, ] = useState(null);
   const [txWatch, setTxWatch] = useState(null);
   const [txWatchError, setTxWatchError] = useState(null);
   const [hashForm, setHashForm] = useState("");
   const [hashError, setHashError] = useState(null);
-  const streamSessionRef = useRef(null);
   const watchTokenRef = useRef(0);
 
   // Issue #512: the controller owns the streamed payments and their paging
   // tokens, so a duplicate event can never reach the list twice; this only
   // mirrors its state into React.
-  const paymentStream = useMemo(
-    () =>
-      createPaymentStreamController({
-        onChange: (records, state) => {
-          setStreamedPayments(records);
-          setStreamState(state);
-        },
-      }),
-    []
-  );
 
   // Issuer auth flags + trustlines the connected account issued.
   const [issuerConfig, setIssuerConfig] = useState(null);
@@ -429,6 +435,7 @@ export default function App() {
   // Sponsored account creation: draft XDR for the new account to co-sign.
   const [sponsorForm, setSponsorForm] = useState({
     newAccount: "",
+    startingBalance: "0",
     coSignedXdr: "",
   });
   const [sponsorDraft, setSponsorDraft] = useState(null);
@@ -521,9 +528,7 @@ export default function App() {
     // Editing the request invalidates any quote from the previous form state.
     setPathQuote(null);
   };
-  const updateOfferForm = (changes) => setOfferForm((prev) => ({ ...prev, ...changes }));
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
-  const selectedComposeAsset = balances.find((b) => b.key === composeForm.assetKey);
   const configuredContractId = labInfo?.network?.contract?.kitewell;
   // The Lab must know whether the instance entry is live or archived before it
   // offers an RPC call: an archived instance fails every invocation.
@@ -533,9 +538,7 @@ export default function App() {
     error: labStateError,
   });
   const contractCallBlock = rpcCallBlockReason(contractStatus);
-  const parsedBookPair = parseOrderBookPair(bookPair);
   const bookKey = JSON.stringify([networkId, bookPair.selling, bookPair.buying]);
-  const currentBookResult = bookResult?.key === bookKey ? bookResult : null;
 
   useEffect(() => {
     if (activeTab !== "Book") return;
@@ -624,7 +627,7 @@ export default function App() {
         if (!cancelled) setOfferLoading(false);
       });
     return () => { cancelled = true; };
-  }, [activeTab, publicKey, networkId, offerRefresh]);
+  }, [activeTab, publicKey, networkId]);
 
   // A pool-share balance only says how many shares the account holds. Load
   // each pool so the panel can also show both reserves and the total shares.
@@ -664,7 +667,7 @@ export default function App() {
       const newWeights = signers.map(() => 0);
       setSignerWeights(newWeights);
     }
-  }, [signers.length, signerWeights.length]);
+  }, [signers, signerWeights]);
 
   // Balances arrive after the restored form is rendered. Reconcile the
   // remembered asset once they do: an asset no longer held is left blank and
@@ -725,7 +728,7 @@ export default function App() {
     } finally {
       setLoading("");
     }
-  }, [activeNetwork, publicKey]);
+  }, [activeNetwork, publicKey, refreshReserve]);
 
   const handleClawbackClaimable = async (balance) => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -743,167 +746,12 @@ export default function App() {
     }
   };
 
-  const refreshAccountDetails = async () => {
-    if (!publicKey) return;
-    try {
-      setAccountDetails(await getAccountDetails(publicKey));
-    } catch {
-      setAccountDetails(null);
-    }
-  };
 
-  const handleSetData = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!dataForm.name) return showToast("Data name is required.", "error");
 
-    setLoading("data-set");
-    try {
-      await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
-      setDataForm({ name: "", value: "" });
-      await refreshAccountDetails();
-      showToast("Account data submitted.");
-    } catch (err) {
-      showToast(err.message || "Could not set account data.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
-  const handleClearData = async (name) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading(`data-clear-${name}`);
-    try {
-      await manageDataWithFreighter(publicKey, name, null);
-      await refreshAccountDetails();
-      showToast(`Cleared account data "${name}".`);
-    } catch (err) {
-      showToast(err.message || `Could not clear "${name}".`, "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
-  const handleMergeAccount = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading("merge");
-    try {
-      const result = await mergeAccountWithFreighter(
-        publicKey,
-        mergeForm.destination,
-        mergeForm.retypeDestination
-      );
-      showToast(
-        `Account merge submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-      setPublicKey(null);
-      setBalances([]);
-      setTransactions([]);
-      setAccountDetails(null);
-      setMergeForm({ destination: "", retypeDestination: "" });
-    } catch (err) {
-      showToast(err.message || "Account merge failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
-  const handleClaimableRefresh = useCallback(async () => {
-    if (!publicKey) return;
-    setLoading("claimable-list");
-    try {
-      setClaimableBalances(await getSponsoredClaimableBalances(publicKey));
-    } catch (err) {
-      setClaimableBalances([]);
-      showToast(err.message || "Could not load claimable balances.", "error");
-    } finally {
-      setLoading("");
-    }
-  }, [publicKey]);
 
-  const handleCreateClaimable = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!claimableForm.claimant) {
-      return showToast("Claimant is required.", "error");
-    }
-    const selected = balances.find((b) => b.key === claimableForm.assetKey);
-    if (!selected) return showToast("Choose an asset you hold.", "error");
-    if (parseFloat(claimableForm.amount) > parseFloat(selected.balance)) {
-      return showToast(
-        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
-        "error"
-      );
-    }
-    setLoading("claimable-create");
-    setClaimableResult(null);
-    try {
-      const asset = selected.isNative
-        ? { isNative: true }
-        : { isNative: false, code: selected.code, issuer: selected.issuer };
-      const result = await createClaimableBalanceWithFreighter({
-        publicKey,
-        claimant: claimableForm.claimant,
-        amount: claimableForm.amount,
-        asset,
-        predicateMode: claimableForm.predicateMode,
-        ledgerTime: claimableForm.ledgerTime,
-      });
-      setClaimableResult({ type: "created", hash: result.hash });
-      setClaimableForm({
-        claimant: "",
-        amount: "",
-        assetKey: "native",
-        predicateMode: "unconditional",
-        ledgerTime: "",
-      });
-      try {
-        setBalances(await getAccountBalances(publicKey));
-      } catch {
-        /* balances refresh separately */
-      }
-      showToast(
-        `Claimable balance created · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Could not create claimable balance.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleClaimClaimable = async (balance) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading(`claimable-${balance.id}`);
-    try {
-      const result = await claimClaimableBalanceWithFreighter(publicKey, balance.id);
-      setClaimableResult({
-        type: "claimed",
-        hash: result.hash,
-        balanceId: balance.id,
-      });
-      await handleClaimableRefresh();
-      try {
-        setBalances(await getAccountBalances(publicKey));
-      } catch {
-        /* balances refresh separately */
-      }
-      showToast(
-        `Claimable balance claimed · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Could not claim balance.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
   const handleConnect = async () => {
     setLoading("connect");
@@ -1157,6 +1005,7 @@ export default function App() {
       return showToast(err.message, "error");
     }
     setTransactionFailure(null);
+    const limit = trustForm.limit;
     setLoading("trust");
     try {
       const result = await changeTrustWithFreighter(
@@ -1181,45 +1030,6 @@ export default function App() {
     }
   };
 
-  const handleIssue = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-
-    let code;
-    let amount;
-    try {
-      code = validateAssetCode(issueForm.code);
-      amount = validatePaymentAmount(issueForm.amount, "Issuance amount");
-    } catch (err) {
-      return showToast(err.message, "error");
-    }
-
-    if (!issueForm.destination.trim()) {
-      return showToast("Holder account is required.", "error");
-    }
-
-    setLoading("issue");
-    try {
-      const result = await sendPaymentWithFreighter(
-        publicKey,
-        issueForm.destination.trim(),
-        amount,
-        { isNative: false, code, issuer: publicKey }
-      );
-      setIssueForm({ code: "", destination: "", amount: "" });
-      showToast(
-        `Issued ${amount} ${code} · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-      startTxWatch(result.hash);
-    } catch (err) {
-      trackFailedSubmit("issue", err);
-      showToast(err.message || "Issue failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
   const handleChangeLimit = async (asset) => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -1273,6 +1083,7 @@ export default function App() {
     }
 
     setTransactionFailure(null);
+    const guardKey = `remove-${asset.key}`;
     setLoading(`remove-${asset.key}`);
     try {
       const result = await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
@@ -1416,16 +1227,22 @@ export default function App() {
       return showToast(err.message || "Federation lookup failed.", "error");
     }
 
+    const sendArgs = sendFormArgs();
+    if (!sendArgs) {
+      setLoading("");
+      return;
+    }
+
     try {
       const prepared = await preparePaymentWithFreighter(
         publicKey,
         paymentDestination,
-        amount,
-        asset,
+        sendArgs.amount,
+        sendArgs.asset,
         sendForm.memoType,
         sendForm.memo,
-        minTime,
-        maxTime
+        sendForm.minTime,
+        sendForm.maxTime
       );
       setSendPrepared(prepared);
       showToast("Payment prepared. Confirm in Freighter.");
@@ -1612,95 +1429,7 @@ export default function App() {
     }
   };
 
-  const handleClawback = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
 
-    const asset = clawbackAssets.find(
-      (candidate) => candidate.key === clawbackForm.assetKey
-    );
-    if (!asset) {
-      return showToast(
-        "Choose an asset you issue with clawback enabled.",
-        "error"
-      );
-    }
-    if (!clawbackForm.holder || !clawbackForm.amount) {
-      return showToast("Holder and amount are required.", "error");
-    }
-
-    const gate = submitGuardRef.current.begin(
-      "clawback",
-      `${asset.key}|${clawbackForm.holder}|${clawbackForm.amount}`
-    );
-    if (!gate.allowed) return;
-
-    setLoading("clawback");
-    try {
-      const result = await clawbackWithFreighter(
-        publicKey,
-        clawbackForm.holder,
-        asset.code,
-        asset.issuer,
-        clawbackForm.amount
-      );
-      trackSubmission(result.hash, "clawback");
-      setClawbackForm((previous) => ({
-        ...previous,
-        holder: "",
-        amount: "",
-      }));
-      showToast(
-        `Clawback submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Clawback failed.", "error");
-    } finally {
-      submitGuardRef.current.end("clawback");
-      setLoading("");
-    }
-  };
-
-  const handleSponsor = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!sponsorForm.sponsoredAccount) {
-      return showToast("Sponsored account is required.", "error");
-    }
-    if (!sponsorForm.code || !sponsorForm.issuer) {
-      return showToast("Asset code and issuer are required.", "error");
-    }
-
-    const gate = submitGuardRef.current.begin(
-      "sponsor",
-      `${sponsorForm.sponsoredAccount}|${sponsorForm.code}|${sponsorForm.issuer}`
-    );
-    if (!gate.allowed) return;
-
-    setLoading("sponsor");
-    try {
-      const result = await sponsorTrustlineWithFreighter({
-        publicKey,
-        sponsoredAccount: sponsorForm.sponsoredAccount,
-        assetCode: sponsorForm.code,
-        assetIssuer: sponsorForm.issuer,
-      });
-      trackSubmission(result.hash, "sponsorTrustline");
-      setSponsorForm({ sponsoredAccount: "", code: "", issuer: "" });
-      showToast(
-        `Sponsored trustline submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Sponsored trustline failed.", "error");
-    } finally {
-      submitGuardRef.current.end("sponsor");
-      setLoading("");
-    }
-  };
 
   const handleOrderBook = async () => {
     setOrderBookError(null);
@@ -2303,7 +2032,6 @@ export default function App() {
   // Handle remove signer
   const handleRemoveSigner = (index) => {
     // Check if removing this signer would lock out the high threshold
-    const currentSignerWeight = signerWeights[index] ?? 0;
     const remainingWeight = signerWeights.filter((_, i) => i !== index).reduce((sum, w) => sum + (w ?? 0), 0);
     if (remainingWeight < highThreshold && signers.length > 1) {
       if (!window.confirm(
@@ -2339,7 +2067,6 @@ export default function App() {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
 
     // Build the setOptions operation with the edited values
-    const operations = [];
 
     // Build the setOptions params
     const setOptionsParams = {
@@ -2588,13 +2315,13 @@ export default function App() {
     setSponsorResult(null);
     setLoading("sponsor-draft");
     try {
-      const draft = await createSponsoredAccountDraft(
-        publicKey,
-        sponsorForm.newAccount
-      );
+      const draft = await createSponsoredAccountDraft(publicKey, {
+        newAccount: sponsorForm.newAccount,
+        startingBalance: sponsorForm.startingBalance,
+      });
       setSponsorDraft(draft);
       showToast(
-        "Unsigned sponsorship envelope ready. Have the new account sign it, then paste the signed XDR.",
+        "Review the three operations, then have the new account sign this exact XDR and paste it back.",
         "info"
       );
     } catch (err) {
@@ -2617,13 +2344,17 @@ export default function App() {
     setLoading("sponsor");
     setSponsorResult(null);
     try {
-      const result = await sponsorAccountCreationWithFreighter(
-        publicKey,
-        sponsorForm.newAccount,
-        sponsorForm.coSignedXdr.trim()
-      );
+      const result = await sponsorAccountCreationWithFreighter(publicKey, {
+        newAccount: sponsorForm.newAccount,
+        startingBalance: sponsorForm.startingBalance,
+        coSignedXdr: sponsorForm.coSignedXdr.trim(),
+      });
       setSponsorResult(result);
-      setSponsorForm({ newAccount: "", coSignedXdr: "" });
+      setSponsorForm({
+        newAccount: "",
+        startingBalance: "0",
+        coSignedXdr: "",
+      });
       setSponsorDraft(null);
       showToast(`Sponsored account created · ${result.hash.slice(0, 12)}…`);
       startTxWatch(result.hash);
@@ -2798,106 +2529,9 @@ export default function App() {
     }
   };
 
-  const handleComposeAdd = (event) => {
-    event.preventDefault();
-    if (composeOps.length >= MAX_COMPOSED_OPERATIONS) {
-      return showToast(
-        `A transaction can contain at most ${MAX_COMPOSED_OPERATIONS} operations.`,
-        "error"
-      );
-    }
 
-    const entry = { type: composeForm.type };
-    if (composeForm.type === "payment") {
-      const selected = balances.find((b) => b.key === composeForm.assetKey);
-      entry.destination = composeForm.destination.trim();
-      entry.amount = composeForm.amount;
-      entry.asset =
-        selected && !selected.isNative
-          ? { isNative: false, code: selected.code, issuer: selected.issuer }
-          : { isNative: true };
-    } else if (composeForm.type === "changeTrust") {
-      entry.code = composeForm.code.trim();
-      entry.issuer = composeForm.issuer.trim();
-      entry.limit = composeForm.limit;
-    } else {
-      entry.name = composeForm.name.trim();
-      entry.value = composeForm.value;
-    }
 
-    try {
-      buildComposedOperation(entry);
-    } catch (err) {
-      return showToast(err.message, "error");
-    }
 
-    composeId.current += 1;
-    setComposeOps((previous) => [...previous, { ...entry, id: composeId.current }]);
-    setComposeForm((previous) => ({
-      ...previous,
-      destination: "",
-      amount: "",
-      code: "",
-      issuer: "",
-      limit: "1000000",
-      name: "",
-      value: "",
-    }));
-    setComposeResult(null);
-    setComposeError(null);
-  };
-
-  const moveComposeOperation = (index, offset) => {
-    setComposeOps((previous) => {
-      const target = index + offset;
-      if (target < 0 || target >= previous.length) return previous;
-      const next = [...previous];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-    setComposeResult(null);
-    setComposeError(null);
-  };
-
-  const removeComposeOperation = (index) => {
-    setComposeOps((previous) => previous.filter((_, i) => i !== index));
-    setComposeResult(null);
-    setComposeError(null);
-  };
-
-  const handleComposeSubmit = async () => {
-    if (composeOps.length === 0) {
-      setComposeError("Add at least one operation before signing.");
-      return;
-    }
-    if (!publicKey) {
-      return showToast("Connect Freighter first.", "error");
-    }
-
-    setLoading("compose");
-    setComposeError(null);
-    setComposeResult(null);
-    try {
-      const result = await submitComposedOperations(publicKey, composeOps);
-      setComposeResult({
-        hash: result.hash,
-        explorerUrl: explorerTxUrl(result.hash),
-      });
-      setComposeOps([]);
-      showToast(`Composed transaction submitted · ${result.hash.slice(0, 12)}…`);
-      try {
-        const next = await getAccountBalances(publicKey);
-        setBalances(next);
-      } catch {
-        /* balance refresh is best-effort */
-      }
-    } catch (err) {
-      setComposeError(err.message || "Composed transaction failed.");
-      showToast(err.message || "Composed transaction failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
   const loadFeeStats = async () => {
     setLoading("feestats");
@@ -3084,7 +2718,472 @@ export default function App() {
     };
   }, [sendForm.destination]);
 
-  return (
+  
+  // --- grafted declarations ---
+  const [selectedTxHash, setSelectedTxHash] = useState(null);
+
+  const [signers, setSigners] = useState([]);
+
+  const [signerWeights, setSignerWeights] = useState([]);
+
+  const [highThreshold, setHighThreshold] = useState(0);
+
+  const [lowThreshold, setLowThreshold] = useState(0);
+
+  const [medThreshold, setMedThreshold] = useState(0);
+
+
+  const [createAccountResult, setCreateAccountResult] = useState(null);
+
+
+
+  const [, setResolvedFederation] = useState(null);
+
+  const [rpcHealth, setRpcHealth] = useState({
+    ok: null,
+    description: "checking",
+    latestLedger: null,
+    error: null,
+  });
+
+  const [sep7Uri, setSep7Uri] = useState("");
+
+  const [sep7Request, setSep7Request] = useState(null);
+
+  const [feeStatsError, setFeeStatsError] = useState(null);
+
+  const [feeStats, setFeeStats] = useState(null);
+
+  const [feeSetting, setFeeSetting] = useState(() => loadFeeSetting());
+
+  const [customFee, setCustomFee] = useState(() => {
+    const saved = loadFeeSetting();
+    return saved?.source === "custom" ? saved.stroops : "";
+  });
+
+
+
+
+
+
+  const [muxedError, setMuxedError] = useState(null);
+
+  const [muxedBuildForm, setMuxedBuildForm] = useState({ gAddress: "", id: "" });
+
+  const [muxedBuildResult, setMuxedBuildResult] = useState(null);
+
+  const [muxedSplitForm, setMuxedSplitForm] = useState({ mAddress: "" });
+
+  const [muxedSplitResult, setMuxedSplitResult] = useState(null);
+
+  const [horizonNotice, setHorizonNotice] = useState(null);
+
+  const [, setSelectedSigners] = useState([]);
+
+  const [codeTtl, setCodeTtl] = useState(null);
+
+  const [codeTtlError, setCodeTtlError] = useState(null);
+
+  const [bookPair, ] = useState(readStoredOrderBookPair);
+
+  const [, setBookResult] = useState(null);
+
+  const bookClearGenerationRef = useRef(0);
+
+  const [, setOfferLoading] = useState(false);
+
+  const [, setOfferError] = useState(null);
+
+  const [, setOpenOffers] = useState([]);
+
+
+  const [, setOfferPrices] = useState({});
+
+  const [, setOfferResult] = useState(null);
+
+  const [limitChangeForm, setLimitChangeForm] = useState({});
+
+
+
+  const [envelopeXdr, setEnvelopeXdr] = useState("");
+
+  const [decodeError, setDecodeError] = useState(null);
+
+  const [decodedEnvelope, setDecodedEnvelope] = useState(null);
+
+  const submitGuardRef = useRef(createSubmitGuard());
+
+  const startTxWatch = useCallback(
+    (hash) => {
+      const token = watchTokenRef.current + 1;
+      watchTokenRef.current = token;
+      setTxWatchError(null);
+      setTxWatch({
+        hash,
+        attempts: 0,
+        ...txStatusPresentation({
+          status: "pending",
+          explorerUrl: buildTransactionExplorerUrl(networkId, hash),
+        }),
+      });
+
+      watchTransactionStatus({
+        hash,
+        networkId,
+        onUpdate: (snapshot) => {
+          if (watchTokenRef.current !== token) return;
+          setTxWatch({ ...snapshot, ...txStatusPresentation(snapshot) });
+        },
+      }).catch((err) => {
+        if (watchTokenRef.current !== token) return;
+        setTxWatch(null);
+        setTxWatchError(err.message || "The transaction watch could not read this hash.");
+      });
+    },
+    [networkId]
+  );
+
+  
+  const readLabState = useCallback(
+    async (contractId) => {
+      if (!contractId) {
+        setLabState(null);
+        setLabStateError(null);
+        return;
+      }
+      setLoading("labstate");
+      setLabStateError(null);
+      try {
+        const state = await readKitewellState(contractId, publicKey);
+        setLabState(state);
+      } catch (e) {
+        setLabState(null);
+        setLabStateError(
+          e.message || "Could not read the kitewell contract via Soroban RPC."
+        );
+      } finally {
+        setLoading("");
+      }
+    },
+    [publicKey]
+  );
+
+  const actualSubentryCount = accountDetails?.subentryCount;
+
+  const trustlineAlreadyExists = balances.some(
+    (balance) =>
+      !balance.isNative &&
+      balance.code === trustForm.code.trim().toUpperCase() &&
+      balance.issuer === trustForm.issuer.trim()
+  );
+
+  const trustlineMinimum =
+    baseReserveInStroops != null && Number.isInteger(actualSubentryCount)
+      ? minimumBalanceInStroops(
+          baseReserveInStroops,
+          actualSubentryCount + (trustlineAlreadyExists ? 0 : 1)
+        )
+      : null;
+
+  let trustlineCheckError = null;
+
+  let trustlineAffordable = false;
+
+  const sellableAssets = assetBalances.filter(
+    (asset) => Number.parseFloat(asset.available ?? asset.balance) > 0
+  );
+
+  const refreshIssuerPanel = async () => {
+    if (!publicKey) return;
+    setLoading("issuer");
+    try {
+      const config = await getAccountAuthConfig(publicKey);
+      setIssuerConfig(config);
+      setIssuerConfigError(null);
+      setIssuerForm({
+        homeDomain: config.homeDomain || "",
+        authRequired: config.authRequired,
+        authRevocable: config.authRevocable,
+        authImmutable: config.authImmutable,
+        confirmation: "",
+      });
+    } catch (err) {
+      setIssuerConfig(null);
+      setIssuerConfigError(err.message || "Could not read account flags.");
+    }
+
+    try {
+      setIssuedTrustlines(await getIssuedAssetTrustlines(publicKey));
+      setIssuedTrustlinesError(null);
+    } catch (err) {
+      setIssuedTrustlines([]);
+      setIssuedTrustlinesError(err.message || "Could not read issued trustlines.");
+    }
+    setLoading("");
+  };
+
+  const handleSetIssuerOptions = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("issuer-update");
+    try {
+      await setAccountOptionsWithFreighter(publicKey, {
+        current: issuerConfig || {},
+        homeDomain: issuerForm.homeDomain,
+        authRequired: issuerForm.authRequired,
+        authRevocable: issuerForm.authRevocable,
+        authImmutable: issuerForm.authImmutable,
+        immutableConfirmation: issuerForm.confirmation,
+      });
+      showToast("Account flags updated.");
+      // A successful update refreshes both the flags and the account balances.
+      await refreshIssuerPanel();
+      await refreshBalances();
+    } catch (err) {
+      showToast(err.message || "Could not update account flags.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleAllowTrust = async (entry, authorize) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`allow-${entry.key}`);
+    try {
+      await allowTrustWithFreighter(publicKey, {
+        holder: entry.holder,
+        assetCode: entry.assetCode,
+        assetIssuer: entry.assetIssuer,
+        authorize,
+      });
+      showToast(
+        `${authorize ? "Authorized" : "Revoked"} ${shortenAddress(entry.holder)} for ${entry.assetCode}.`
+      );
+      await refreshIssuerPanel();
+    } catch (err) {
+      showToast(err.message || "Could not update the trustline.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const selectedSendAssetAvailable = selectedSendAsset
+    ? parseFloat(selectedSendAsset.balance) -
+      parseFloat(selectedSendAsset.sellingLiabilities || "0")
+    : null;
+
+  const txWatchPanel = (
+    <div className="section">
+      <h2>Transaction status</h2>
+      <p className="muted">
+        A transaction submitted here is followed until it reaches the ledger, fails, or passes
+        its max time.
+      </p>
+
+      {txWatch && (
+        <div
+          className={
+            txWatch.status === "failed" || txWatch.status === "expired"
+              ? "info-box info-box--warning"
+              : "info-box"
+          }
+          role="status"
+          aria-live="polite"
+        >
+          <span className="eyebrow">
+            <code>{txWatch.hash}</code> · {txWatch.status}
+          </span>
+          <p className="muted">{txWatch.text}</p>
+          <a
+            className="text-link"
+            href={txWatch.explorerUrl}
+            target="_blank"
+            rel="noreferrer"
+            style={{ marginTop: 6, display: "inline-block" }}
+          >
+            Explorer ↗
+          </a>
+        </div>
+      )}
+      {txWatchError && (
+        <div className="info-box info-box--warning">
+          <span className="eyebrow">Transaction watch</span>
+          <p className="muted">{txWatchError}</p>
+        </div>
+      )}
+
+      <form className="form" onSubmit={handleWatchHash}>
+        <label className="label" htmlFor="watch-tx-hash">
+          Watch a transaction hash
+        </label>
+        <input
+          id="watch-tx-hash"
+          className="input"
+          type="text"
+          placeholder="64 hexadecimal characters"
+          maxLength={64}
+          value={hashForm}
+          onChange={(e) => setHashForm(e.target.value)}
+          aria-describedby="watch-tx-hash-help"
+          required
+        />
+        <p className="muted" id="watch-tx-hash-help" role={hashError ? "alert" : undefined}>
+          {hashError || "Paste any transaction hash from this network to follow it."}
+        </p>
+        <button
+          className="btn btn--primary"
+          type="submit"
+          disabled={loading === "issue"}
+        >
+          Watch status
+        </button>
+      </form>
+    </div>
+  );
+
+  const muxedSendBase = (() => {
+    const value = sendForm.destination.trim();
+    if (!value) return null;
+    try {
+      return splitMuxedAddress(value).gAddress;
+    } catch {
+      return null;
+    }
+  })();
+
+  const handleBuildMuxed = (event) => {
+    event.preventDefault();
+    setMuxedError(null);
+    setMuxedBuildResult(null);
+    try {
+      setMuxedBuildResult(
+        buildMuxedAddress(
+          muxedBuildForm.gAddress.trim(),
+          muxedBuildForm.id.trim()
+        )
+      );
+    } catch (err) {
+      setMuxedError(err.message || "Could not build the muxed address.");
+    }
+  };
+
+  const handleSplitMuxed = (event) => {
+    event.preventDefault();
+    setMuxedError(null);
+    setMuxedSplitResult(null);
+    try {
+      const { gAddress, id } = splitMuxedAddress(
+        muxedSplitForm.mAddress.trim()
+      );
+      setMuxedSplitResult({ gAddress, id: id.toString() });
+    } catch (err) {
+      setMuxedError(err.message || "Could not split the muxed address.");
+    }
+  };
+
+  const handleDecodeEnvelope = (event) => {
+    event.preventDefault();
+    setDecodeError(null);
+    setDecodedEnvelope(null);
+    try {
+      setDecodedEnvelope(decodeEnvelope(envelopeXdr, activeNetwork.passphrase));
+    } catch (error) {
+      setDecodedEnvelope(null);
+      setDecodeError(error.message || "Could not decode the envelope.");
+    }
+  };
+
+  const activeContractId = sessionContractId || configuredContractId;
+
+  const trackSubmission = (hash, operationType) => {
+    txLogRef.current.record({
+      hash,
+      operationType,
+      network: getActiveNetworkId(),
+    });
+    setSessionTxs(txLogRef.current.list());
+  };
+
+  const confirmDuplicate = (message) => {
+    if (typeof window === "undefined" || typeof window.confirm !== "function") {
+      return false;
+    }
+    return window.confirm(message);
+  };
+  // --- end grafted declarations ---
+
+  // --- grafted declarations ---
+  const [signerInput, setSignerInput] = useState("");
+
+  const handleProposeAdmin = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+    if (!proposeAdminForm.address.trim()) {
+      return showToast("Enter a successor admin address.", "error");
+    }
+    setLoading("propose-admin");
+    try {
+      const result = await proposeAdminWithFreighter(
+        publicKey,
+        contractId,
+        proposeAdminForm.address.trim()
+      );
+      setProposeAdminForm({ address: "" });
+      showToast(
+        result.confirmed
+          ? `Admin proposed · ${result.hash.slice(0, 12)}…`
+          : `Submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+      await refreshLabState();
+    } catch (err) {
+      showToast(err.message || "Propose admin failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleAcceptAdmin = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+    setLoading("accept-admin");
+    try {
+      const result = await acceptAdminWithFreighter(publicKey, contractId);
+      showToast(
+        result.confirmed
+          ? `Admin accepted · ${result.hash.slice(0, 12)}…`
+          : `Submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+      await refreshLabState();
+    } catch (err) {
+      showToast(err.message || "Accept admin failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const txLogRef = useRef(createTxLog());
+
+  const [, setSessionTxs] = useState([]);
+
+  // --- end grafted declarations ---
+return (
     <div className="app">
       <div className="aurora" aria-hidden="true" />
 
@@ -5805,9 +5904,9 @@ export default function App() {
                   <div className="subhead">Sponsor a new account</div>
                   <p className="muted">
                     Creates the account and its reserve in one transaction:
-                    begin sponsoring, create the account with a starting balance of 0,
-                    then end sponsoring. The new key signs too, so both signatures are
-                    collected before submit.
+                    begin sponsoring, create the account with the starting balance
+                    below, then end sponsoring. The new key signs too, so both
+                    signatures are collected before submit.
                   </p>
                   <form className="form" onSubmit={handleSponsorAccount}>
                     <label className="label" htmlFor="sponsor-new-account">
@@ -5828,6 +5927,31 @@ export default function App() {
                       }}
                       required
                     />
+                    <label
+                      className="label"
+                      htmlFor="sponsor-starting-balance"
+                    >
+                      Starting balance (XLM)
+                    </label>
+                    <input
+                      id="sponsor-starting-balance"
+                      className="input"
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="0"
+                      value={sponsorForm.startingBalance}
+                      onChange={(e) => {
+                        setSponsorForm({
+                          ...sponsorForm,
+                          startingBalance: e.target.value,
+                        });
+                        setSponsorDraft(null);
+                      }}
+                    />
+                    <p className="muted">
+                      Minimum 0 XLM: the sponsor covers the base reserve. A
+                      negative or malformed amount is refused.
+                    </p>
                     <button
                       className="btn btn--secondary"
                       type="button"
@@ -5849,6 +5973,15 @@ export default function App() {
                           Have the new account sign this exact XDR, then paste the
                           signed XDR below. Nothing has been submitted yet.
                         </p>
+                        <ol className="muted">
+                          {sponsorDraft.operations.map((operation) => (
+                            <li key={operation.step}>
+                              {operation.operation} · source{" "}
+                              {shortenAddress(operation.source)} —{" "}
+                              {operation.detail}
+                            </li>
+                          ))}
+                        </ol>
                         <textarea
                           className="input"
                           rows={4}
@@ -6435,7 +6568,8 @@ export default function App() {
                         <input
                           type="text"
                           placeholder="Signer public key (G...)"
-                          onChange={(e) => handleAddSigner(e.target.value)}
+                          value={signerInput}
+                          onChange={(e) => setSignerInput(e.target.value)}
                         />
                         <button
                           className="btn btn--primary"
@@ -7491,23 +7625,6 @@ function streamStatusLabel(state) {
   return "Payments stream not running.";
 }
 
-function describeComposeOperation(operation) {
-  if (operation.type === "payment") {
-    const asset = operation.asset?.isNative
-      ? "XLM"
-      : `${operation.asset?.code}:${shortenAddress(operation.asset?.issuer)}`;
-    return `Payment · ${operation.amount} ${asset} to ${shortenAddress(
-      operation.destination
-    )}`;
-  }
-
-  if (operation.type === "changeTrust") {
-    return `Change trust · ${operation.code} · limit ${operation.limit}`;
-  }
-
-  const value = operation.value ? ` = ${operation.value}` : " (delete)";
-  return `Manage data · ${operation.name}${value}`;
-}
 
 function formatCreatedAt(value) {
   if (!value) return null;
