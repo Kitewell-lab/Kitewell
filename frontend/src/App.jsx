@@ -40,6 +40,11 @@ import {
   getOpenOffers,
   getPendingTransactions,
   getClaimableBalances,
+  getClaimableBalancesForClaimant,
+  getSponsoredClaimableBalances,
+  getAccountTrades,
+  isHorizonSlowdownError,
+  HORIZON_SLOWDOWN_MESSAGE,
   getSponsoredTrustlines,
   getLiquidityPool,
   getOrderBook,
@@ -225,6 +230,21 @@ export default function App() {
   const tabRefs = useRef([]);
   const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
+  const [clawbackAssets, setClawbackAssets] = useState([]);
+  const [clawbackForm, setClawbackForm] = useState({
+    assetKey: "",
+    holder: "",
+    amount: "",
+  });
+  const [claimableForm, setClaimableForm] = useState({
+    claimant: "",
+    amount: "",
+    assetKey: "native",
+    predicateMode: "unconditional",
+    ledgerTime: "",
+  });
+  const [claimableResult, setClaimableResult] = useState(null);
+  const [claimableToClaim, setClaimableToClaim] = useState([]);
   const [selectedSigners, setSelectedSigners] = useState([]);
   const [horizonNotice, setHorizonNotice] = useState(null);
   const [failedSubmits, setFailedSubmits] = useState([]);
@@ -557,6 +577,9 @@ export default function App() {
       setHorizonNotice(null);
       const claimables = await getClaimableBalances(publicKey).catch(() => []);
       setClaimableBalances(claimables);
+      getClaimableBalancesForClaimant(publicKey)
+        .then((rows) => setClaimableToClaim(rows))
+        .catch(() => setClaimableToClaim([]));
       try {
         const details = await getAccountDetails(publicKey, { signal });
         setAccountDetails(details);
@@ -2389,6 +2412,43 @@ export default function App() {
                   ))}
                 </div>
               )}
+
+              <div className="section">
+                <h3 className="subhead">Claimable balances you can claim</h3>
+                {claimableToClaim.length > 0 ? (
+                  <ul className="balance-list">
+                    {claimableToClaim.map((balance) => (
+                      <li key={balance.id} className="balance-row">
+                        <div>
+                          <strong>{balance.amount} {balance.asset}</strong>
+                          {balance.claimStatus === "not-yet" ? (
+                            <span className="muted">
+                              Not yet claimable — opens{" "}
+                              {new Date(balance.claimOpensAt).toLocaleString()}
+                            </span>
+                          ) : balance.claimStatus === "claimable" ? (
+                            <span className="muted">Claimable now</span>
+                          ) : (
+                            <span className="muted">Claim status unknown</span>
+                          )}
+                        </div>
+                        {balance.claimStatus === "claimable" && (
+                          <button
+                            className="btn btn--primary btn--sm"
+                            type="button"
+                            onClick={() => handleClaimClaimable(balance)}
+                            disabled={loading === `claimable-${balance.id}`}
+                          >
+                            {loading === `claimable-${balance.id}` ? "Claiming…" : "Claim"}
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No claimable balances you can claim.</p>
+                )}
+              </div>
 
               <div className="section">
                 <h3 className="subhead">Claimable balances you created</h3>
