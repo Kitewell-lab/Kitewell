@@ -1,8 +1,8 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { Buffer } from "buffer";
 import { fetchAccountViaApi, fetchPaymentsViaApi } from "./api";
 import { getActiveNetworkId } from "./network";
 import { normaliseTxHash } from "./txStatusWatch";
-import { mapTransactionFee } from "./historyFee";
 import { rowsToCsv } from "./csvExport";
 import {
   getActiveNetwork,
@@ -10,9 +10,9 @@ import {
   NETWORKS,
 } from "./network";
 import { ORDER_BOOK_LEVELS, orderBookView } from "./orderBook";
-import { calculateMinimumBalance } from "./accountReserve";
 import { mapOutgoingSponsorships } from "./outgoingSponsorships";
 import { paymentMemoFields } from "./paymentMemo";
+import { mapTransactionFee } from "./historyFee";
 
 /** Shown in the lab panel when Horizon asks the client to slow down. */
 export const HORIZON_SLOWDOWN_MESSAGE =
@@ -159,7 +159,7 @@ export async function withHorizon429Backoff(fn, options = {}) {
 
     const waitSeconds = recordHorizon429(error);
     await sleep(waitSeconds * 1000, signal);
-    throw new Error(HORIZON_SLOWDOWN_MESSAGE);
+    throw new Error(HORIZON_SLOWDOWN_MESSAGE, { cause: error });
   }
 }
 
@@ -824,15 +824,6 @@ export function calculateAvailableBalance(
   return Math.max(0, total - sellingLiabilities).toFixed(7);
 }
 
-function liabilityFields(balance, isNative, subentryCount, baseReserve) {
-  const sellingLiabilities = parseFloat(balance.selling_liabilities || "0");
-  const buyingLiabilities = parseFloat(balance.buying_liabilities || "0");
-  return {
-    sellingLiabilities: sellingLiabilities.toFixed(7),
-    buyingLiabilities: buyingLiabilities.toFixed(7),
-    available: calculateAvailableBalance(balance, isNative, subentryCount, baseReserve),
-  };
-}
 
 /**
  * Hide only idle, zero-balance credit trustlines. Native XLM, pool shares and
@@ -852,8 +843,9 @@ export function filterVisibleBalances(balances, hideZeroCreditAssets = false) {
   });
 }
 
+let baseReserve = 0.5;
+
 async function readBaseReserve() {
-  let baseReserve = 0.5;
   try {
     if (getServer().ledgers) {
       const ledgerInfo = await getServer().ledgers().order("desc").limit(1).call();
@@ -867,8 +859,7 @@ async function readBaseReserve() {
   return baseReserve;
 }
 
-function mapHorizonBalances(account, baseReserve = 0.5) {
-  const subentryCount = account.subentry_count || 0;
+function mapHorizonBalances(account) {
   return account.balances.map((b) => {
     const sellingLiabilities = b.selling_liabilities ?? "0";
     const buyingLiabilities = b.buying_liabilities ?? "0";
@@ -995,7 +986,6 @@ export async function getAccountDetails(publicKey) {
     subentryCount: account.subentry_count,
     lastModifiedLedger: account.last_modified_ledger ?? null,
     thresholds: account.thresholds,
-    signers: account.signers,
     balances: mapHorizonBalances(account),
     dataEntries: mapAccountDataEntries(account),
     signers: account.signers || [],
@@ -1053,7 +1043,7 @@ export async function getAccountSnapshot(publicKey) {
 
   const account = await getServer().loadAccount(publicKey);
 
-  let offers = [];
+  let offers;
   try {
     const offersResponse = await getServer()
       .offers()
@@ -1231,6 +1221,37 @@ export async function getBalance(publicKey, options = {}) {
   const balances = await getAccountBalances(publicKey, options);
   const xlm = balances.find((b) => b.isNative);
   return xlm ? xlm.balance : "0";
+}
+
+export async function getClaimableBalances(publicKey) {
+  const records = await getServer()
+    .claimableBalances()
+    .forSponsor(publicKey)
+    .limit(200)
+    .call();
+
+  const balances = await Promise.all(
+    (records.records || []).map(async (record) => {
+      const mapped = mapClaimableBalance(record, publicKey);
+      if (!mapped.issuer) return mapped;
+
+      try {
+        const assets = await getServer()
+          .assets()
+          .forCode(mapped.code)
+          .forIssuer(mapped.issuer)
+          .call();
+        return {
+          ...mapped,
+          clawbackEnabled: Boolean(assets.records?.[0]?.flags?.auth_clawback_enabled),
+        };
+      } catch {
+        return { ...mapped, clawbackEnabled: false };
+      }
+    })
+  );
+
+  return balances.filter((balance) => balance.createdByAccount);
 }
 
 export const listClaimableBalances = getClaimableBalances;
@@ -1499,8 +1520,9 @@ export async function getTransactions(publicKey, limit = 15, cursor, options = {
       .payments()
       .forAccount(publicKey)
       .limit(limit)
-      .order("desc")
-      .join("transactions");
+      .order("desc");
+    // Embeds each payment's transaction record; stubbed builders may omit it.
+    if (typeof request.join === "function") request = request.join("transactions");
     if (cursor) request = request.cursor(cursor);
     const payments = await request.call();
     const lastRaw = payments.records[payments.records.length - 1];

@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * CI-friendly tests for the Soroban helpers in ./freighter.
@@ -43,15 +43,6 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
-    Horizon: {
-      ...actual.Horizon,
-      Server: vi.fn(function () {
-        return {
-          loadAccount: horizonLoadAccountMock,
-          submitTransaction: horizonSubmitMock,
-        };
-      }),
-    },
     rpc: {
       ...actual.rpc,
       Server: vi.fn(function () {
@@ -83,36 +74,7 @@ const {
 
 const CONTRACT_ID =
   "CCWLNS5HECRJ2GM3Q6JZZDV334ZXYO6EKZLFPLQRXO6SUDAKMS4U3E3X";
-const CONTRACT_HASH =
-  "CST5BHQPSIWSFMYZUE5RZ7AXZBKTUY76HNISQ7GZYD7U7JKGJBMRQR52";
 const USER = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const DEST = StellarSdk.Keypair.random().publicKey();
-const AMOUNT = "10.0000000";
-
-// Build a valid signed transaction XDR for mocking
-let signedTxXdr;
-beforeAll(() => {
-  const account = new StellarSdk.Account(USER, "123456");
-  const tx = new StellarSdk.TransactionBuilder(account, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase: StellarSdk.Networks.TESTNET,
-  })
-    .addOperation(
-      StellarSdk.Operation.payment({
-        destination: DEST,
-        asset: StellarSdk.Asset.native(),
-        amount: AMOUNT,
-      })
-    )
-    .setTimeout(180)
-    .build();
-  // Sign with a dummy keypair to get valid XDR
-  const keypair = StellarSdk.Keypair.fromSecret(
-    "SBP4BHQPSIWSFMYZUE5RZ7AXZBKTUY76HNISQ7GZYD7U7JKGJBMRQR52"
-  );
-  tx.sign(keypair);
-  signedTxXdr = tx.toXDR();
-});
 
 /** Build the same tx shape the helpers build, for XDR round-trip asserts. */
 function buildRegisterTx(caller, name, sequence = "7") {
@@ -146,46 +108,6 @@ function simOk(retval) {
 }
 
 /** prepareTransaction's assemble step, with a fixed resource fee. */
-function assemblePrepared(tx) {
-  return StellarSdk.rpc
-    .assembleTransaction(tx, {
-      _parsed: true,
-      transactionData: new StellarSdk.SorobanDataBuilder().setResourceFee("4321"),
-      minResourceFee: "123",
-      result: {
-        auth: [],
-        retval: StellarSdk.nativeToScVal(undefined, { type: "void" }),
-      },
-    })
-    .build();
-}
-
-/** Successful create-contract result: the new contract hash in the first op. */
-function installResultXdr(contractHash = CONTRACT_HASH) {
-  const ok = StellarSdk.xdr.OperationResult.opInner(
-    StellarSdk.xdr.OperationResultTr.invokeHostFunction(
-      StellarSdk.xdr.InvokeHostFunctionResult.invokeHostFunctionSuccess(contractHash)
-    )
-  );
-  return new StellarSdk.xdr.TransactionResult({
-    feeCharged: StellarSdk.xdr.Int64.fromString("100"),
-    result: StellarSdk.xdr.TransactionResultResult.txSuccess([ok]),
-    ext: new StellarSdk.xdr.TransactionResultExt(0),
-  });
-}
-
-/** Stub the common prepare → sign → submit → poll pipeline for one invoke. */
-function stubSorobanSubmit(sendResult, successStatus = { status: "SUCCESS" }) {
-  sorobanServerMock.prepareTransaction.mockImplementation(async (tx) =>
-    assemblePrepared(tx)
-  );
-  signTransactionMock.mockImplementation(async (xdr) => ({
-    error: null,
-    signedTxXdr: xdr,
-  }));
-  sorobanServerMock.sendTransaction.mockResolvedValue(sendResult);
-  sorobanServerMock.getTransaction.mockResolvedValue(successStatus);
-}
 
 beforeEach(() => {
   vi.clearAllMocks();
