@@ -52,6 +52,11 @@ import {
   getAccountAuthConfig,
   getIssuedAssetTrustlines,
   IMMUTABLE_CONFIRMATION,
+
+  getTransactionMemos,
+  buildPaymentsCsv,
+  PAYMENTS_CSV_FILENAME,
+  getAccountMergeBlockers,
 } from "./stellar";
 import {
   clearStoredOrderBookPair,
@@ -163,6 +168,33 @@ export default function App() {
     memo: "",
   });
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
+  const [createAccountForm, setCreateAccountForm] = useState({
+    destination: "",
+    startingBalance: "",
+  });
+  const [mergeForm, setMergeForm] = useState({ destination: "", retypeDestination: "" });
+  const [mergeBlockers, setMergeBlockers] = useState([]);
+
+  useEffect(() => {
+    if (!publicKey) {
+      setMergeBlockers([]);
+      return;
+    }
+    let cancelled = false;
+    getAccountMergeBlockers(publicKey)
+      .then((blockers) => {
+        if (!cancelled) setMergeBlockers(blockers);
+      })
+      .catch(() => {
+        if (!cancelled) setMergeBlockers([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [publicKey]);
+  const [baseReserveInStroops, setBaseReserveInStroops] = useState(null);
+  const [reserveError, setReserveError] = useState(null);
+  const [reserveSubentryCount, setReserveSubentryCount] = useState("0");
   const [limitChangeForm, setLimitChangeForm] = useState({});
   const [openOffers, setOpenOffers] = useState([]);
   const [offerPrices, setOfferPrices] = useState({});
@@ -599,7 +631,175 @@ export default function App() {
       setLoading("");
     }
   };
+  const refreshAccountDetails = async () => {
+    if (!publicKey) return;
+    try {
+      setAccountDetails(await getAccountDetails(publicKey));
+    } catch {
+      setAccountDetails(null);
+    }
+  };
 
+  const handleSetData = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!dataForm.name) return showToast("Data name is required.", "error");
+
+    setLoading("data-set");
+    try {
+      await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
+      setDataForm({ name: "", value: "" });
+      await refreshAccountDetails();
+      showToast("Account data submitted.");
+    } catch (err) {
+      showToast(err.message || "Could not set account data.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleClearData = async (name) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`data-clear-${name}`);
+    try {
+      await manageDataWithFreighter(publicKey, name, null);
+      await refreshAccountDetails();
+      showToast(`Cleared account data "${name}".`);
+    } catch (err) {
+      showToast(err.message || `Could not clear "${name}".`, "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleMergeAccount = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("merge");
+    try {
+      const blockers = await getAccountMergeBlockers(publicKey);
+      setMergeBlockers(blockers);
+      if (blockers.length > 0) {
+        showToast(`Cannot merge account: ${blockers.join("; ")}`, "error");
+        setLoading("");
+        return;
+      }
+      const result = await mergeAccountWithFreighter(
+        publicKey,
+        mergeForm.destination,
+        mergeForm.retypeDestination
+      );
+      showToast(
+        `Account merge submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+      setPublicKey(null);
+      setBalances([]);
+      setTransactions([]);
+      setAccountDetails(null);
+      setMergeForm({ destination: "", retypeDestination: "" });
+      setMergeBlockers([]);
+    } catch (err) {
+      showToast(err.message || "Account merge failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleClaimableRefresh = useCallback(async () => {
+    if (!publicKey) return;
+    setLoading("claimable-list");
+    try {
+      setClaimableBalances(await getSponsoredClaimableBalances(publicKey));
+    } catch (err) {
+      setClaimableBalances([]);
+      showToast(err.message || "Could not load claimable balances.", "error");
+    } finally {
+      setLoading("");
+    }
+  }, [publicKey]);
+
+  const handleCreateClaimable = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!claimableForm.claimant) {
+      return showToast("Claimant is required.", "error");
+    }
+    const selected = balances.find((b) => b.key === claimableForm.assetKey);
+    if (!selected) return showToast("Choose an asset you hold.", "error");
+    if (parseFloat(claimableForm.amount) > parseFloat(selected.balance)) {
+      return showToast(
+        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
+        "error"
+      );
+    }
+    setLoading("claimable-create");
+    setClaimableResult(null);
+    try {
+      const asset = selected.isNative
+        ? { isNative: true }
+        : { isNative: false, code: selected.code, issuer: selected.issuer };
+      const result = await createClaimableBalanceWithFreighter({
+        publicKey,
+        claimant: claimableForm.claimant,
+        amount: claimableForm.amount,
+        asset,
+        predicateMode: claimableForm.predicateMode,
+        ledgerTime: claimableForm.ledgerTime,
+      });
+      setClaimableResult({ type: "created", hash: result.hash });
+      setClaimableForm({
+        claimant: "",
+        amount: "",
+        assetKey: "native",
+        predicateMode: "unconditional",
+        ledgerTime: "",
+      });
+      try {
+        setBalances(await getAccountBalances(publicKey));
+      } catch {
+        /* balances refresh separately */
+      }
+      showToast(
+        `Claimable balance created · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (err) {
+      showToast(err.message || "Could not create claimable balance.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleClaimClaimable = async (balance) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`claimable-${balance.id}`);
+    try {
+      const result = await claimClaimableBalanceWithFreighter(publicKey, balance.id);
+      setClaimableResult({
+        type: "claimed",
+        hash: result.hash,
+        balanceId: balance.id,
+      });
+      await handleClaimableRefresh();
+      try {
+        setBalances(await getAccountBalances(publicKey));
+      } catch {
+        /* balances refresh separately */
+      }
+      showToast(
+        `Claimable balance claimed · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (err) {
+      showToast(err.message || "Could not claim balance.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
   const handleConnect = async () => {
     setLoading("connect");
     try {
@@ -1985,6 +2185,90 @@ export default function App() {
                       </a>
                     </div>
                   )}
+                  <div className="section__row">
+                    <button className="btn btn--secondary" type="button" onClick={handleDisconnect}>
+                      Disconnect
+                    </button>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={handleDownloadAccountSnapshot}
+                      disabled={loading === "snapshot"}
+                      title="Download a JSON snapshot of this account"
+                    >
+                      {loading === "snapshot" ? (
+                        <>
+                          <Spinner /> Exporting…
+                        </>
+                      ) : (
+                        "Download account JSON"
+                      )}
+                    </button>
+                  </div>
+                  <form className="form" onSubmit={handleMergeAccount} style={{ marginTop: 16 }}>
+                    <h3 className="subhead">Merge account</h3>
+                    <p className="muted">
+                      Send all XLM to another account and close this one. The account can only be
+                      merged once it has no trustlines, offers, data entries, or created claimable
+                      balances.
+                    </p>
+                    {mergeBlockers.length > 0 && (
+                      <div className="info-box info-box--warning" role="alert">
+                        <span className="eyebrow">Merge blocked</span>
+                        <ul>
+                          {mergeBlockers.map((blocker) => (
+                            <li key={blocker}>{blocker}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    <label className="label" htmlFor="merge-destination">
+                      Destination public key
+                    </label>
+                    <input
+                      id="merge-destination"
+                      className="input"
+                      value={mergeForm.destination}
+                      onChange={(e) =>
+                        setMergeForm((prev) => ({
+                          ...prev,
+                          destination: e.target.value,
+                        }))
+                      }
+                      placeholder="G..."
+                      required
+                    />
+                    <label className="label" htmlFor="merge-retype">
+                      Retype destination public key
+                    </label>
+                    <input
+                      id="merge-retype"
+                      className="input"
+                      value={mergeForm.retypeDestination}
+                      onChange={(e) =>
+                        setMergeForm((prev) => ({
+                          ...prev,
+                          retypeDestination: e.target.value,
+                        }))
+                      }
+                      placeholder="G..."
+                      required
+                    />
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "merge" || mergeBlockers.length > 0}
+                    >
+                      {loading === "merge" ? (
+                        <>
+                          <Spinner /> Merging…
+                        </>
+                      ) : (
+                        "Merge account"
+                      )}
+                    </button>
+                  </form>
+
                   {accountDetails?.signers && accountDetails.signers.length > 0 && (
                     <div className="info-box">
                       <span className="eyebrow">Signers & thresholds</span>
@@ -2098,6 +2382,7 @@ export default function App() {
                   <button className="btn btn--secondary" type="button" onClick={handleDisconnect}>
                     Disconnect
                   </button>
+
                 </>
               )}
             </div>
