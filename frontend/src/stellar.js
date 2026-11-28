@@ -1,13 +1,17 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { fetchAccountViaApi, fetchPaymentsViaApi } from "./api";
+import { getActiveNetworkId } from "./network";
 import { normaliseTxHash } from "./txStatusWatch";
+import { mapTransactionFee } from "./historyFee";
 import { rowsToCsv } from "./csvExport";
 import {
   getActiveNetwork,
-  getActiveNetworkId,
   isFriendbotAvailable,
   NETWORKS,
 } from "./network";
+import { ORDER_BOOK_LEVELS, orderBookView } from "./orderBook";
+import { calculateMinimumBalance } from "./accountReserve";
+import { mapOutgoingSponsorships } from "./outgoingSponsorships";
 import { paymentMemoFields } from "./paymentMemo";
 import { mapTransactionFee } from "./historyFee";
 
@@ -25,55 +29,83 @@ const HORIZON_429_MAX_WAIT_SEC = 30;
  */
 const horizon429BackoffByNetwork = new Map();
 
-function horizonStatus(error) {
-  return error?.response?.status ?? error?.status ?? null;
+function getServer() {
+  return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
 }
 
+/** @param {unknown} error */
+export function isHorizon429(error) {
+  const status = error?.response?.status ?? error?.status;
+  if (status === 429) return true;
+  const message = String(error?.message ?? "");
+  return /too many requests/i.test(message);
+}
+
+/** @param {unknown} error */
 export function isHorizonSlowdownError(error) {
-  return horizonStatus(error) === 429;
+  return error instanceof Error && error.message === HORIZON_SLOWDOWN_MESSAGE;
 }
 
-function horizonRetryAfterSeconds(error, streak) {
+/** @param {unknown} error */
+function readRetryAfterSeconds(error) {
   const headers = error?.response?.headers;
-  const header = typeof headers?.get === "function"
-    ? headers.get("retry-after")
-    : headers?.["retry-after"];
-  const parsed = Number(header);
-  if (Number.isFinite(parsed) && parsed > 0) {
-    return Math.min(parsed, HORIZON_429_MAX_WAIT_SEC);
+  if (!headers) return null;
+
+  const raw =
+    typeof headers.get === "function"
+      ? headers.get("retry-after") ?? headers.get("Retry-After")
+      : headers["retry-after"] ?? headers["Retry-After"];
+
+  if (raw == null || raw === "") return null;
+
+  const asNumber = Number(raw);
+  if (Number.isFinite(asNumber) && asNumber >= 0) return asNumber;
+
+  const asDate = Date.parse(String(raw));
+  if (!Number.isNaN(asDate)) {
+    return Math.max(0, (asDate - Date.now()) / 1000);
   }
+
+  return null;
+}
+
+/** @param {number} streak 1-based count of consecutive 429s on this network */
+export function computeHorizon429WaitSeconds(streak) {
+  const safeStreak = Math.max(1, streak);
   return Math.min(
-    HORIZON_429_BASE_WAIT_SEC * 2 ** Math.max(streak, 0),
+    HORIZON_429_BASE_WAIT_SEC * 2 ** (safeStreak - 1),
     HORIZON_429_MAX_WAIT_SEC
   );
 }
 
-async function withHorizon429Backoff(task) {
-  const networkId = getActiveNetworkId();
-  const state = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
-  let attempt = 0;
-  for (;;) {
-    try {
-      const result = await task();
-      horizon429BackoffByNetwork.set(networkId, { streak: 0 });
-      return result;
-    } catch (error) {
-      if (!isHorizonSlowdownError(error) || attempt >= 2) throw error;
-      const wait = horizonRetryAfterSeconds(error, state.streak);
-      state.streak += 1;
-      horizon429BackoffByNetwork.set(networkId, state);
-      await new Promise((resolve) => setTimeout(resolve, wait * 1000));
-      attempt += 1;
-    }
-  }
+function resetHorizon429Backoff(networkId = getActiveNetworkId()) {
+  horizon429BackoffByNetwork.delete(networkId);
 }
 
+/**
+ * Record a 429 for the active network and return how long to wait (seconds).
+ * Prefers Horizon's Retry-After when present; otherwise 2 → 4 → 8 … capped at 30.
+ * @param {unknown} error
+ * @returns {number}
+ */
+export function recordHorizon429(error) {
+  const networkId = getActiveNetworkId();
+  const prior = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
+  const streak = prior.streak + 1;
+  horizon429BackoffByNetwork.set(networkId, { streak });
+
+  const retryAfter = readRetryAfterSeconds(error);
+  if (retryAfter != null) return retryAfter;
+  return computeHorizon429WaitSeconds(streak);
+}
+
+/** Test helper: clear the shared backoff clocks. */
 export function resetHorizon429BackoffForTests() {
   horizon429BackoffByNetwork.clear();
 }
 
 function abortError() {
-  const error = new Error("The request was aborted.");
+  const error = new Error("Aborted");
   error.name = "AbortError";
   return error;
 }
@@ -84,20 +116,52 @@ function defaultSleep(ms, signal) {
       reject(abortError());
       return;
     }
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(abortError());
-      },
-      { once: true }
-    );
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    function onAbort() {
+      clearTimeout(timer);
+      reject(abortError());
+    }
+
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
-function getServer() {
-  return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
+/**
+ * Run a Horizon lab read with shared per-network 429 backoff.
+ *
+ * On 429: waits Retry-After (or 2/4/8…≤30s), then rejects with
+ * {@link HORIZON_SLOWDOWN_MESSAGE}. A later success resets the clock.
+ * A 500 (or any non-429) is rethrown unchanged. The wait is cancelled when
+ * `signal` aborts (unmount / network change).
+ *
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @param {object} [options]
+ * @param {AbortSignal} [options.signal]
+ * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [options.sleep]
+ * @returns {Promise<T>}
+ */
+export async function withHorizon429Backoff(fn, options = {}) {
+  const { signal, sleep = defaultSleep } = options;
+
+  if (signal?.aborted) throw abortError();
+
+  try {
+    const result = await fn();
+    resetHorizon429Backoff();
+    return result;
+  } catch (error) {
+    if (!isHorizon429(error)) throw error;
+
+    const waitSeconds = recordHorizon429(error);
+    await sleep(waitSeconds * 1000, signal);
+    throw new Error(HORIZON_SLOWDOWN_MESSAGE);
+  }
 }
 
 export async function getLatestLedger(networkId = getActiveNetworkId()) {
@@ -141,10 +205,102 @@ export async function getLatestLedger(networkId = getActiveNetworkId()) {
   };
 }
 
+export async function getLatestBaseReserve() {
+  const response = await getServer()
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const baseReserve = response.records?.[0]?.base_reserve_in_stroops;
+  if (!/^\d+$/.test(String(baseReserve ?? "")) || Number(baseReserve) <= 0) {
+    throw new Error("Latest ledger did not include a valid base reserve.");
+  }
+  return String(baseReserve);
+}
+
+export function isFederationAddress(destination) {
+  return typeof destination === "string" && destination.includes("*");
+}
+
+/**
+ * Resolve a SEP-2 federation address to a Stellar account.
+ * Public keys and other strings without an asterisk are returned unchanged.
+ */
+export async function resolveFederationAddress(destination) {
+  const value = typeof destination === "string" ? destination.trim() : "";
+  if (!value) return value;
+  if (!isFederationAddress(value)) return value;
+
+  const separator = value.indexOf("*");
+  const name = value.slice(0, separator).trim();
+  const domain = value.slice(separator + 1).trim();
+  if (!name || !domain) {
+    throw new Error("Federation address must look like name*domain.");
+  }
+
+  let tomlResponse;
+  try {
+    tomlResponse = await fetch(`https://${domain}/.well-known/stellar.toml`);
+  } catch {
+    throw new Error(`Could not load stellar.toml for ${domain}.`);
+  }
+  if (!tomlResponse.ok) {
+    throw new Error(`Could not load stellar.toml for ${domain}.`);
+  }
+
+  const toml = await tomlResponse.text();
+  const federationMatch = toml.match(
+    /^\s*FEDERATION_SERVER\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s#]+))\s*(?:#.*)?$/im
+  );
+  const federationServer = (
+    federationMatch?.[1] ||
+    federationMatch?.[2] ||
+    federationMatch?.[3] ||
+    ""
+  ).trim();
+  if (!federationServer) {
+    throw new Error(`${domain} has no FEDERATION_SERVER in its stellar.toml.`);
+  }
+
+  let federationUrl;
+  try {
+    federationUrl = new URL(federationServer);
+  } catch {
+    throw new Error(`${domain} has an invalid FEDERATION_SERVER URL.`);
+  }
+  federationUrl.searchParams.set("type", "name");
+  federationUrl.searchParams.set("q", value);
+
+  let federationResponse;
+  try {
+    federationResponse = await fetch(federationUrl.toString());
+  } catch {
+    throw new Error("Federation lookup failed. Try again in a moment.");
+  }
+  if (!federationResponse.ok) {
+    throw new Error("Federation lookup failed. Check the federation address.");
+  }
+
+  let federation;
+  try {
+    federation = await federationResponse.json();
+  } catch {
+    throw new Error("Federation server returned an invalid response.");
+  }
+
+  const account = typeof federation.account === "string" ? federation.account.trim() : "";
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(account)) {
+    throw new Error("Federation lookup did not return a valid Stellar account.");
+  }
+  return account;
+}
+
+export const resolvePaymentDestination = resolveFederationAddress;
+
 /** The Kitewell backend is configured for Testnet, so skip it elsewhere. */
 function backendIsUsable() {
-  // The backend takes the selected network as a query parameter, so it serves
-  // every network the lab can switch to (see issue #492).
+  // The backend serves payments and account details for every network we
+  // support, including TESTNET and FUTURENET.
   return true;
 }
 
@@ -594,12 +750,11 @@ export async function getOrderBook(selling, buying) {
   }
 
   const book = await withHorizon429Backoff(() =>
-    getServer().orderbook(selling, buying).limit(10).call()
+    getServer().orderbook(selling, buying).limit(ORDER_BOOK_LEVELS).call()
   );
-  return {
-    bids: mapOrderBookRows(book.bids),
-    asks: mapOrderBookRows(book.asks),
-  };
+  // `orderBookView` caps each side at ten levels, keeps price and amount, and
+  // reports an empty book as an empty state rather than an error.
+  return orderBookView(book);
 }
 
 /**
@@ -867,6 +1022,102 @@ function offerAssetDescriptor(asset) {
 /**
  * Load and normalize the active offers for a Stellar account.
  */
+/** Read every open offer for an account, paging through Horizon. */
+export async function getOpenOffers(publicKey, options = {}) {
+  return withHorizon429Backoff(async () => {
+    let page = await getServer().offers().forAccount(publicKey).limit(200).call();
+    const offers = [];
+    while (page.records.length > 0) {
+      offers.push(...page.records);
+      if (page.records.length < 200) break;
+      page = await page.next();
+    }
+    return offers;
+  }, options);
+}
+
+/** Build a JSON-serialisable snapshot of an account for download. */
+export async function getAccountSnapshot(publicKey) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
+
+  const account = await getServer().loadAccount(publicKey);
+
+  let offers = [];
+  try {
+    const offersResponse = await getServer()
+      .offers()
+      .forAccount(publicKey)
+      .limit(200)
+      .call();
+    offers = offersResponse.records.map((offer) => ({
+      id: offer.id,
+      selling: offer.selling,
+      buying: offer.buying,
+      amount: offer.amount,
+      price: offer.price,
+      price_r: offer.price_r,
+    }));
+  } catch {
+    offers = [];
+  }
+
+  const dataEntries = {};
+  if (account.data_attr) {
+    Object.entries(account.data_attr).forEach(([key, value]) => {
+      try {
+        const decoded = Buffer.from(value, "base64").toString("utf8");
+        if (Buffer.from(decoded, "utf8").toString("base64") === value) {
+          dataEntries[key] = decoded;
+        } else {
+          dataEntries[key] = Buffer.from(value, "base64").toString("hex");
+        }
+      } catch {
+        dataEntries[key] = Buffer.from(value, "base64").toString("hex");
+      }
+    });
+  }
+
+  return {
+    id: account.id,
+    sequence: account.sequenceNumber(),
+    subentryCount: account.subentry_count,
+    thresholds: {
+      low: account.thresholds.low_threshold,
+      medium: account.thresholds.med_threshold,
+      high: account.thresholds.high_threshold,
+    },
+    signers: account.signers.map((signer) => ({
+      key: signer.key,
+      weight: signer.weight,
+      type: signer.type,
+    })),
+    balances: mapHorizonBalances(account),
+    data: dataEntries,
+    offers,
+    network: getActiveNetworkId(),
+    exportedAt: new Date().toISOString(),
+  };
+}
+
+/** Download the account snapshot as a JSON file. */
+export async function downloadAccountSnapshot(publicKey) {
+  const snapshot = await getAccountSnapshot(publicKey);
+
+  const filename = `kitewell-account-${snapshot.id.slice(0, 8)}-${Date.now()}.json`;
+  const json = JSON.stringify(snapshot, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
 export async function getAccountOffers(publicKey, options = {}) {
   return withHorizon429Backoff(async () => {
     const page = await getServer()
@@ -943,36 +1194,34 @@ export function buildManageSellOffer({
   });
 }
 
-export async function getBalance(publicKey, options = {}) {
-  const balances = await getAccountBalances(publicKey, options);
-  const xlm = balances.find((b) => b.isNative);
-  return xlm ? xlm.balance : "0";
-}
-
-export async function getClaimableBalances(publicKey) {
+/**
+ * Load the reserves this account is sponsoring for other accounts and
+ * entries. Horizon indexes the operation history, so the read stays a plain
+ * read-only pagination; the mapper turns each sponsoring transaction into one
+ * row and drops sponsorships this account received from someone else.
+ *
+ * @param {string} publicKey connected account (G…)
+ * @returns {Promise<Array<{ sponsoredAccount: string, entryType: string }>>}
+ */
+export async function getOutgoingSponsorships(publicKey) {
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
     throw new Error("Connect a valid Freighter address first.");
   }
 
   const page = await getServer()
-    .claimableBalances()
-    .claimant(publicKey)
-    .limit(200)
+    .operations()
+    .forAccount(publicKey)
     .order("desc")
+    .limit(200)
     .call();
 
-  return (page.records || []).map((balance) => ({
-    id: balance.id,
-    asset:
-      balance.asset === "native"
-        ? "XLM"
-        : `${balance.asset_code || balance.asset}`,
-    assetCode: balance.asset_code,
-    assetIssuer: balance.asset_issuer,
-    amount: balance.amount,
-    claimants: balance.claimants || [],
-    sponsor: balance.sponsor || null,
-  }));
+  return mapOutgoingSponsorships(page.records || [], publicKey);
+}
+
+export async function getBalance(publicKey, options = {}) {
+  const balances = await getAccountBalances(publicKey, options);
+  const xlm = balances.find((b) => b.isNative);
+  return xlm ? xlm.balance : "0";
 }
 
 export const listClaimableBalances = getClaimableBalances;
@@ -1052,15 +1301,185 @@ export function liquidityPoolWithdraw(poolId, amount, minAmountA, minAmountB) {
  * @returns {Promise<{ records: object[], nextCursor: string|null }>} The
  *   mapped records plus the cursor for the next page (null on the last page).
  */
+/** List an account's trades separately from its payments. */
+export async function getTrades(publicKey, limit = 15, cursor) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
+
+  let builder = getServer()
+    .trades()
+    .forAccount(publicKey)
+    .limit(limit)
+    .order("desc");
+
+  if (cursor) {
+    builder = builder.cursor(cursor);
+  }
+
+  const response = await builder.call();
+
+  return {
+    records: response.records.map((trade) => ({
+      id: trade.id,
+      ledger_close_time: trade.ledger_close_time,
+      offer_id: trade.offer_id,
+      base_account: trade.base_account,
+      base_amount: trade.base_amount,
+      base_asset_type: trade.base_asset_type,
+      base_asset_code: trade.base_asset_code,
+      base_asset_issuer: trade.base_asset_issuer,
+      counter_account: trade.counter_account,
+      counter_amount: trade.counter_amount,
+      counter_asset_type: trade.counter_asset_type,
+      counter_asset_code: trade.counter_asset_code,
+      counter_asset_issuer: trade.counter_asset_issuer,
+      price: trade.price,
+      base_is_seller: trade.base_is_seller,
+    })),
+    nextCursor: response.records.length > 0
+      ? response.records[response.records.length - 1].paging_token
+      : null,
+  };
+}
+
+const transactionDetailRequests = new Map();
+
+/**
+ * Read one transaction with its operations and effects from the active Horizon.
+ * Read-only. Failed transactions are included (`include_failed`). Concurrent
+ * reads for the same hash share one request.
+ */
+export function getTransactionDetails(input, options = {}) {
+  const hash = normaliseTxHash(input);
+  const base = getActiveNetwork().horizonUrl;
+  const key = `${base}|${hash}`;
+
+  const pending = transactionDetailRequests.get(key);
+  if (pending) return pending;
+
+  const read = async (path) => {
+    const response = await fetch(`${base}/transactions/${hash}${path}`);
+    if (response.status === 404) {
+      throw new Error("Transaction not found on this network.");
+    }
+    if (!response.ok) {
+      const error = new Error(`Could not load transaction (HTTP ${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    return response.json();
+  };
+
+  const request = withHorizon429Backoff(async () => {
+    const [transaction, operationPage, effectPage] = await Promise.all([
+      read(""),
+      read("/operations?limit=200&include_failed=true"),
+      read("/effects?limit=200"),
+    ]);
+    return {
+      transaction,
+      operations: operationPage?._embedded?.records || [],
+      effects: effectPage?._embedded?.records || [],
+    };
+  }, options).finally(() => transactionDetailRequests.delete(key));
+
+  transactionDetailRequests.set(key, request);
+  return request;
+}
+
+/** Read a domain's or issuer's stellar.toml over HTTPS only. */
+export async function fetchStellarToml(domainOrIssuer) {
+  if (!domainOrIssuer || typeof domainOrIssuer !== "string") {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  const trimmed = domainOrIssuer.trim();
+  if (!trimmed) {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  return StellarSdk.StellarTomlResolver.resolve(trimmed, {
+    allowHttp: false,
+  });
+}
+/** Fetch and parse a SEP-24 transfer server's /info endpoint. */
+export async function fetchTransferServerInfo(transferServerUrl) {
+  if (!transferServerUrl || typeof transferServerUrl !== "string") {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  const trimmed = transferServerUrl.trim();
+  if (!trimmed) {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  // Only allow HTTPS URLs for security
+  if (!trimmed.startsWith("https://")) {
+    throw new Error("Transfer server URL must use HTTPS.");
+  }
+
+  // Build info endpoint URL, ensuring no double slashes
+  const baseUrl = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  const infoUrl = `${baseUrl}/info`;
+
+  const response = await fetch(infoUrl);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch transfer server info: ${response.status} ${response.statusText}`
+    );
+  }
+
+  return response.json();
+}
+
+/** Read stellar.toml plus the anchor transfer server info when present. */
+export async function fetchAnchorInfo(domainOrIssuer) {
+  const toml = await fetchStellarToml(domainOrIssuer);
+
+  let transferServerInfo = null;
+  if (toml.TRANSFER_SERVER) {
+    try {
+      transferServerInfo = await fetchTransferServerInfo(toml.TRANSFER_SERVER);
+    } catch {
+      // If the info endpoint fails, we still return the toml data
+      transferServerInfo = null;
+    }
+  }
+
+  return {
+    toml,
+    transferServerInfo,
+  };
+}
+
+/** Read an account's balance for one issued asset; throws when no trustline. */
+export async function getAccountAssetBalance(
+  publicKey,
+  assetCode,
+  assetIssuer
+) {
+  const account = await getServer().loadAccount(publicKey);
+  const code = (assetCode || "").trim().toUpperCase();
+  const match = mapHorizonBalances(account).find(
+    (balance) =>
+      !balance.isNative &&
+      balance.code === code &&
+      balance.issuer === assetIssuer
+  );
+
+  if (!match) {
+    throw new Error(`Holder has no trustline for ${code || "that asset"}.`);
+  }
+  return match.balance;
+}
+
 export async function getTransactions(publicKey, limit = 15, cursor, options = {}) {
   if (backendIsUsable()) {
     try {
-      return await fetchPaymentsViaApi(
-        publicKey,
-        limit,
-        cursor,
-        getActiveNetworkId()
-      );
+      return options.signal
+        ? await fetchPaymentsViaApi(publicKey, limit, cursor, options)
+        : await fetchPaymentsViaApi(publicKey, limit, cursor, getActiveNetworkId());
     } catch {
       /* fall back to direct Horizon */
     }
@@ -1421,299 +1840,7 @@ export async function getAccountTrades(publicKey, { limit = 10, cursor } = {}) {
   };
 }
 
-export { summarizeEnvelopeSignatures } from "./multisigEnvelope";
-
-// --- grafted module declarations ---
-function mapOrderBookRows(rows = []) {
-  return rows.slice(0, 10).map((row) => ({
-    amount: row.amount,
-    price: row.price,
-    priceR: row.price_r,
-  }));
-}
-
-// --- grafted module declarations ---
-function base64ToBytes(value) {
-  const binary = globalThis.atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
-function bytesToHex(bytes) {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function bytesEqual(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
-  return true;
-}
-
-export function getTransactionDetails(input, options = {}) {
-  const hash = normaliseTxHash(input);
-  const base = getActiveNetwork().horizonUrl;
-  const key = `${base}|${hash}`;
-
-  const pending = transactionDetailRequests.get(key);
-  if (pending) return pending;
-
-  const read = async (path) => {
-    const response = await fetch(`${base}/transactions/${hash}${path}`);
-    if (response.status === 404) {
-      throw new Error("Transaction not found on this network.");
-    }
-    if (!response.ok) {
-      const error = new Error(`Could not load transaction (HTTP ${response.status}).`);
-      error.status = response.status;
-      throw error;
-    }
-    return response.json();
-  };
-
-  const request = withHorizon429Backoff(async () => {
-    const [transaction, operationPage, effectPage] = await Promise.all([
-      read(""),
-      read("/operations?limit=200&include_failed=true"),
-      read("/effects?limit=200"),
-    ]);
-    return {
-      transaction,
-      operations: operationPage?._embedded?.records || [],
-      effects: effectPage?._embedded?.records || [],
-    };
-  }, options).finally(() => transactionDetailRequests.delete(key));
-
-  transactionDetailRequests.set(key, request);
-  return request;
-}
-
-export async function getTrades(publicKey, limit = 15, cursor) {
-  if (!publicKey || typeof publicKey !== "string") {
-    throw new Error("Public key is required.");
-  }
-
-  let builder = getServer()
-    .trades()
-    .forAccount(publicKey)
-    .limit(limit)
-    .order("desc");
-
-  if (cursor) {
-    builder = builder.cursor(cursor);
-  }
-
-  const response = await builder.call();
-
-  return {
-    records: response.records.map((trade) => ({
-      id: trade.id,
-      ledger_close_time: trade.ledger_close_time,
-      offer_id: trade.offer_id,
-      base_account: trade.base_account,
-      base_amount: trade.base_amount,
-      base_asset_type: trade.base_asset_type,
-      base_asset_code: trade.base_asset_code,
-      base_asset_issuer: trade.base_asset_issuer,
-      counter_account: trade.counter_account,
-      counter_amount: trade.counter_amount,
-      counter_asset_type: trade.counter_asset_type,
-      counter_asset_code: trade.counter_asset_code,
-      counter_asset_issuer: trade.counter_asset_issuer,
-      price: trade.price,
-      base_is_seller: trade.base_is_seller,
-    })),
-    nextCursor: response.records.length > 0 
-      ? response.records[response.records.length - 1].paging_token 
-      : null,
-  };
-}
-
-export async function getAccountSnapshot(publicKey) {
-  if (!publicKey || typeof publicKey !== "string") {
-    throw new Error("Public key is required.");
-  }
-
-  const account = await getServer().loadAccount(publicKey);
-
-  // Fetch offers for this account
-  let offers;
-  try {
-    const offersResponse = await getServer()
-      .offers()
-      .forAccount(publicKey)
-      .limit(200)
-      .call();
-    offers = offersResponse.records.map((offer) => ({
-      id: offer.id,
-      selling: offer.selling,
-      buying: offer.buying,
-      amount: offer.amount,
-      price: offer.price,
-      price_r: offer.price_r,
-    }));
-  } catch {
-    // Offers are optional; if fetch fails, continue with empty array
-    offers = [];
-  }
-
-  // Process data entries, converting non-UTF-8 values to hex
-  const dataEntries = {};
-  if (account.data_attr) {
-    Object.entries(account.data_attr).forEach(([key, value]) => {
-      try {
-        // Try to decode as UTF-8
-        const bytes = base64ToBytes(value);
-        const decoded = new TextDecoder().decode(bytes);
-        // Check if it round-trips correctly (is valid UTF-8)
-        if (bytesEqual(bytes, new TextEncoder().encode(decoded))) {
-          dataEntries[key] = decoded;
-        } else {
-          // Not valid UTF-8, store as hex
-          dataEntries[key] = bytesToHex(bytes);
-        }
-      } catch {
-        // If decoding fails, store the raw base64 value
-        dataEntries[key] = value;
-      }
-    });
-  }
-
-  return {
-    id: account.id,
-    sequence: account.sequenceNumber(),
-    subentryCount: account.subentry_count,
-    thresholds: {
-      low: account.thresholds.low_threshold,
-      medium: account.thresholds.med_threshold,
-      high: account.thresholds.high_threshold,
-    },
-    signers: account.signers.map((signer) => ({
-      key: signer.key,
-      weight: signer.weight,
-      type: signer.type,
-    })),
-    balances: mapHorizonBalances(account),
-    data: dataEntries,
-    offers,
-    network: getActiveNetworkId(),
-    exportedAt: new Date().toISOString(),
-  };
-}
-
-export async function downloadAccountSnapshot(publicKey) {
-  const snapshot = await getAccountSnapshot(publicKey);
-
-  const filename = `kitewell-account-${snapshot.id.slice(0, 8)}-${Date.now()}.json`;
-  const json = JSON.stringify(snapshot, null, 2);
-  const blob = new Blob([json], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.click();
-
-  URL.revokeObjectURL(url);
-}
-
-export async function fetchStellarToml(domainOrIssuer) {
-  if (!domainOrIssuer || typeof domainOrIssuer !== "string") {
-    throw new Error("Domain or issuer address is required.");
-  }
-
-  const trimmed = domainOrIssuer.trim();
-  if (!trimmed) {
-    throw new Error("Domain or issuer address is required.");
-  }
-
-  return StellarSdk.StellarTomlResolver.resolve(trimmed, {
-    allowHttp: false,
-  });
-}
-
-export async function fetchTransferServerInfo(transferServerUrl) {
-  if (!transferServerUrl || typeof transferServerUrl !== "string") {
-    throw new Error("Transfer server URL is required.");
-  }
-
-  const trimmed = transferServerUrl.trim();
-  if (!trimmed) {
-    throw new Error("Transfer server URL is required.");
-  }
-
-  // Only allow HTTPS URLs for security
-  if (!trimmed.startsWith("https://")) {
-    throw new Error("Transfer server URL must use HTTPS.");
-  }
-
-  // Build info endpoint URL, ensuring no double slashes
-  const baseUrl = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
-  const infoUrl = `${baseUrl}/info`;
-
-  const response = await fetch(infoUrl);
-  if (!response.ok) {
-    throw new Error(
-      `Failed to fetch transfer server info: ${response.status} ${response.statusText}`
-    );
-  }
-
-  return response.json();
-}
-
-export async function fetchAnchorInfo(domainOrIssuer) {
-  const toml = await fetchStellarToml(domainOrIssuer);
-
-  let transferServerInfo = null;
-  if (toml.TRANSFER_SERVER) {
-    try {
-      transferServerInfo = await fetchTransferServerInfo(toml.TRANSFER_SERVER);
-    } catch {
-      // If the info endpoint fails, we still return the toml data
-      transferServerInfo = null;
-    }
-  }
-
-  return {
-    toml,
-    transferServerInfo,
-  };
-}
-
-export async function getLatestBaseReserve() {
-  if (typeof getServer().ledgers !== "function") {
-    // Horizon stubs without the ledgers resource: protocol default 0.5 XLM.
-    return "5000000";
-  }
-  const response = await getServer()
-    .ledgers()
-    .order("desc")
-    .limit(1)
-    .call();
-  if (!response) {
-    // Horizon returned nothing (stubbed or unreachable): keep the protocol
-    // default of 0.5 XLM, expressed in stroops.
-    return "5000000";
-  }
-  const baseReserve = response.records?.[0]?.base_reserve_in_stroops;
-  if (!/^\d+$/.test(String(baseReserve ?? "")) || Number(baseReserve) <= 0) {
-    throw new Error("Latest ledger did not include a valid base reserve.");
-  }
-  return String(baseReserve);
-}
-
-export async function getOpenOffers(publicKey, options = {}) {
-  return withHorizon429Backoff(async () => {
-    let page = await getServer().offers().forAccount(publicKey).limit(200).call();
-    const offers = [];
-    while (page.records.length > 0) {
-      offers.push(...page.records);
-      if (page.records.length < 200) break;
-      page = await page.next();
-    }
-    return offers;
-  }, options);
-}
-
-// --- grafted module declarations ---
-const transactionDetailRequests = new Map();
+export {
+  listEnvelopeSignatures,
+  summarizeEnvelopeSignatures,
+} from "./multisigEnvelope";

@@ -565,6 +565,24 @@ body {
   gap: 8px;
 }
 
+.signature-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+.signature-list li {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
 .order-book {
   position: relative;
   display: grid;
@@ -580,6 +598,7 @@ body {
 .order-book__rows {
   display: grid;
   gap: 4px;
+  list-style: none;
 }
 
 .order-book__row {

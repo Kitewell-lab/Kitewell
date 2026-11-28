@@ -12,6 +12,14 @@ const mockGetAccount = vi.fn();
 const mockPrepareTransaction = vi.fn();
 
 vi.mock("@stellar/freighter-api", () => ({
+  getNetwork: vi.fn().mockResolvedValue({
+    network: "TESTNET",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  }),
+  getNetworkDetails: vi.fn().mockResolvedValue({
+    network: "TESTNET",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  }),
   isConnected: vi.fn().mockResolvedValue({ isConnected: true }),
   setAllowed: vi.fn().mockResolvedValue({ isAllowed: true }),
   getAddress: vi

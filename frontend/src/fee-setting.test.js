@@ -35,6 +35,11 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
         return {
           loadAccount: loadAccountMock,
           submitTransaction: submitTransactionMock,
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({ call: vi.fn().mockResolvedValue({ records: [{ base_reserve_in_stroops: "5000000" }] }) }),
+            }),
+          }),
         };
       }),
     },
@@ -74,7 +79,10 @@ beforeEach(() => {
   setActiveNetwork("TESTNET");
   vi.stubGlobal("localStorage", memoryStorage());
   vi.clearAllMocks();
-  loadAccountMock.mockResolvedValue(new StellarSdk.Account(SOURCE, "1"));
+  const mockAccount = new StellarSdk.Account(SOURCE, "1");
+  mockAccount.balances = [{ asset_type: "native", balance: "1000.0000000" }];
+  mockAccount.subentry_count = 0;
+  loadAccountMock.mockResolvedValue(mockAccount);
   submitTransactionMock.mockResolvedValue({ hash: "feehash", ledger: 2 });
   signTransactionMock.mockImplementation(async (xdr) => ({ signedTxXdr: xdr }));
 });

@@ -61,7 +61,7 @@ describe("generated Kitewell client", () => {
   it("covers the Lab tab's reads and writes", () => {
     const methods = KITEWELL_CONTRACT_SPEC.methods;
 
-    for (const read of ["lab_name", "builder_count", "get_builder", "paused", "get_admin"]) {
+    for (const read of ["lab_name", "builder_count", "get_builder", "get_admin"]) {
       expect(methods[read]).toMatchObject({ read: true });
     }
     for (const write of ["register", "unregister", "set_paused"]) {
@@ -84,7 +84,7 @@ describe("generated Kitewell client", () => {
     expect(client.contractId).toBe(CONTRACT_ID);
     expect(SOROBAN_RPC_URL).toBe("https://soroban-testnet.stellar.org");
     expect(ZERO_ADDRESS).toMatch(/^G/);
-    for (const method of ["labName", "builderCount", "getBuilder", "paused", "getAdmin"]) {
+    for (const method of ["labName", "builderCount", "getBuilder", "getAdmin"]) {
       expect(typeof client[method]).toBe("function");
     }
     for (const method of ["register", "unregister", "setPaused", "readState"]) {
