@@ -15,7 +15,12 @@ import {
   MAX_ASSET_CODE_LENGTH,
 } from "./stellar";
 import { parseHorizonError } from "./horizonErrorParse";
-import { parseSimulationFees } from "./simulationFees";
+import { formatTrustlineLimit } from "./trustlineLimitFormat";
+import {
+  parseSimulationAuthorizationAddresses,
+  parseSimulationFees,
+} from "./simulationFees";
+import { getFeePerOperation } from "./feeSetting";
 import {
   HORIZON_FAILURE_CODE,
   freighterCancelledError,
@@ -72,6 +77,44 @@ function buildContractTx(contract, method, args, sourceAccount, timeout = 60) {
     .build();
 }
 
+/** Send prepared XDR to Freighter and return the signed transaction. */
+function freighterSigner(publicKey) {
+  return (unsignedXdr) => signWithFreighter(unsignedXdr, publicKey);
+}
+
+const WASM_MAGIC = [0x00, 0x61, 0x73, 0x6d]; // \0asm
+
+/** Accept a File.arrayBuffer(), Uint8Array, or byte array, with a magic check. */
+function normalizeWasmBytes(wasmBytes) {
+  let bytes;
+  if (wasmBytes instanceof Uint8Array) {
+    bytes = wasmBytes;
+  } else if (wasmBytes instanceof ArrayBuffer) {
+    bytes = new Uint8Array(wasmBytes);
+  } else if (Array.isArray(wasmBytes)) {
+    bytes = Uint8Array.from(wasmBytes);
+  } else {
+    throw new Error("Choose the built kitewell.wasm file to deploy.");
+  }
+
+  if (bytes.length < 8 || !WASM_MAGIC.every((byte, i) => bytes[i] === byte)) {
+    throw new Error("Not a Wasm binary — choose the built kitewell.wasm file.");
+  }
+  return bytes;
+}
+
+function newSalt() {
+  const salt = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(salt);
+  return salt;
+}
+
+function assertPublicKey(publicKey) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+}
+
 /**
  * Read-only lookups against the Kitewell registry via Soroban RPC.
  * Calls lab_name(), builder_count(), and get_builder(viewer).
@@ -98,29 +141,146 @@ export async function readKitewellState(contractId, viewerAddress) {
     return sim.result?.retval ?? null;
   };
 
-  const [labName, builderCount, builder] = await Promise.all([
-    simulate("lab_name").then((v) => (v ? StellarSdk.scValToNative(v) : null)),
-    simulate("builder_count").then((v) =>
-      v ? StellarSdk.scValToNative(v) : 0
-    ),
-    simulate("get_builder", StellarSdk.nativeToScVal(viewer, { type: "address" })).then(
-      scOptionToNative
-    ),
-  ]);
+  const retval = await simulate(
+    "list_builders",
+    StellarSdk.nativeToScVal(pageStart, { type: "u32" }),
+    StellarSdk.nativeToScVal(pageLimit + 1, { type: "u32" })
+  );
+  const addresses = retval ? StellarSdk.scValToNative(retval) : [];
+  const page = pageBuilderAddresses(addresses || [], pageStart, pageLimit);
+
+  // The index only stores addresses; the nickname still comes from
+  // get_builder so the list and the single-builder lookup never disagree.
+  const rows = await Promise.all(
+    page.rows.map(async (address) => {
+      const name = await simulate(
+        "get_builder",
+        StellarSdk.nativeToScVal(address, { type: "address" })
+      ).then(scOptionToNative);
+      return { address, name };
+    })
+  );
+
+  return {
+    start: pageStart,
+    limit: pageLimit,
+    rows,
+    nextStart: page.nextStart,
+  };
+}
+
+/**
+ * Look up one registered builder by address via Soroban RPC.
+ *
+ * The lookup is a read-only simulation, so the connected wallet does not have
+ * to be the builder: any valid G… address can be queried.
+ *
+ * @param {string} contractId Kitewell contract (C…)
+ * @param {string} address Stellar account address (G…)
+ * @returns {Promise<{ address: string, name: string|null, registered: boolean, label: string }>}
+ */
+export async function readKitewellBuilder(contractId, address) {
+  const normalized = normalizeBuilderAddress(address);
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const source = new StellarSdk.Account(ZERO_ADDRESS, "0");
+  const transaction = buildContractTx(
+    contract,
+    "get_builder",
+    [StellarSdk.nativeToScVal(normalized, { type: "address" })],
+    source,
+    30
+  );
+  const simulation = await sorobanRpc.simulateTransaction(transaction);
+  if (simulation.error) {
+    throw new Error(`get_builder() simulation failed: ${simulation.error}`);
+  }
+
+  return describeBuilderLookup(
+    normalized,
+    decodeBuilderName(simulation.result?.retval ?? null)
+  );
+}
+
+/**
+ * Propose a successor admin for the Kitewell contract.
+ * Only the current admin can call this. The proposal does not move admin
+ * rights by itself — the successor must call accept_admin.
+ *
+ * @param {string} publicKey - Current admin's public key
+ * @param {string} contractId - The contract's C… address
+ * @param {string} newAdminAddress - The proposed successor's address
+ * @returns {Promise<{ hash: string, confirmed: boolean }>}
+ */
+export async function proposeAdminWithFreighter(
+  publicKey,
+  contractId,
+  newAdminAddress
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Current admin address is invalid.");
+  }
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(newAdminAddress)) {
+    throw new Error("New admin address must be a valid Stellar public key (G…).");
+  }
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = buildContractTx(
+    contract,
+    "propose_admin",
+    [
+      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
+      StellarSdk.nativeToScVal(newAdminAddress, { type: "address" }),
+    ],
+    sourceAccount
+  );
+
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `Propose admin rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return { hash: sendResult.hash, confirmed: true };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(
+        `Propose admin failed on-chain. Tx hash: ${sendResult.hash}`
+      );
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
 
   return { labName, builderCount, builder };
 }
 
 /**
  * Simulate the builder registration without signing or submitting it, so the
- * panel can show the inclusion fee and the resource fee separately.
+ * panel can show the return value, fees, and authorization addresses first.
  *
  * @returns {Promise<{
  *   error: string|null,
  *   inclusionFee: string|null,
  *   resourceFee: string|null,
  *   totalFee: string|null,
- * }>} Fees in stroops.
+ *   returnValue: unknown,
+ *   authAddresses: string[],
+ * }>}
  */
 export async function simulateRegisterBuilder(publicKey, contractId, name) {
   const trimmed = (name || "").trim();
@@ -150,10 +310,24 @@ export async function simulateRegisterBuilder(publicKey, contractId, name) {
     ],
     sourceAccount
   );
-
-  // Simulation only: the user still has to press Sign to submit.
   const simulation = await sorobanRpc.simulateTransaction(transaction);
-  return parseSimulationFees(simulation, transaction.fee);
+  const fees = parseSimulationFees(simulation, transaction.fee);
+  const hasReturnValue =
+    simulation?.result &&
+    Object.prototype.hasOwnProperty.call(simulation.result, "retval");
+
+  return {
+    ...fees,
+    error:
+      fees.error || (hasReturnValue ? null : "Simulation returned no result."),
+    returnValue:
+      fees.error || !hasReturnValue
+        ? null
+        : StellarSdk.scValToNative(simulation.result.retval),
+    authAddresses: parseSimulationAuthorizationAddresses(
+      simulation?.result?.auth
+    ),
+  };
 }
 
 /**
@@ -161,17 +335,16 @@ export async function simulateRegisterBuilder(publicKey, contractId, name) {
  * invoke, lets Freighter sign it, then submits via Soroban RPC and waits for
  * on-chain confirmation.
  *
- * @returns {{ hash: string, returnValue: unknown, confirmed: boolean }}
+ * @returns {Promise<{
+ *   error: string|null,
+ *   inclusionFee: string|null,
+ *   resourceFee: string|null,
+ *   totalFee: string|null,
+ *   returnValue: unknown,
+ * }>} Fees in stroops.
  */
-export async function registerBuilderWithFreighter(
-  publicKey,
-  contractId,
-  name
-) {
+export async function simulateRegisterBuilder(publicKey, contractId, name) {
   const trimmed = (name || "").trim();
-  if (!trimmed) {
-    throw new Error("Enter a builder name to register.");
-  }
   if ([...trimmed].length > 64) {
     throw new Error("Builder name must be 64 characters or fewer.");
   }
@@ -227,8 +400,119 @@ export async function registerBuilderWithFreighter(
     await sleep(POLL_INTERVAL_MS);
   }
 
-  // Still pending after the polling window; the tx may land shortly.
-  return { hash: sendResult.hash, returnValue: null, confirmed: false };
+  return { hash: sendResult.hash, confirmed: false };
+}
+
+/**
+ * Accept a pending admin transfer for the Kitewell contract.
+ * Only the pending admin can call this. On success, the caller becomes the
+ * live admin and the pending slot clears.
+ *
+ * @param {string} publicKey - Pending admin's public key (must match pending)
+ * @param {string} contractId - The contract's C… address
+ * @returns {Promise<{ hash: string, confirmed: boolean }>}
+ */
+export async function registerBuilderWithFreighter(
+  publicKey,
+  contractId,
+  name,
+  expectedPassphrase = currentPassphrase()
+) {
+  const trimmed = (name || "").trim();
+  if (!trimmed) {
+    throw new Error("Enter a builder name to register.");
+  }
+  if ([...trimmed].length > 64) {
+    throw new Error("Builder name must be 64 characters or fewer.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Pending admin address is invalid.");
+  }
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  if (expectedPassphrase !== currentPassphrase()) {
+    throw new Error("The selected network does not match the contract network.");
+  }
+  await assertFreighterNetworkMatches();
+
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = buildContractTx(
+    contract,
+    "accept_admin",
+    [StellarSdk.nativeToScVal(publicKey, { type: "address" })],
+    sourceAccount
+  );
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `Accept admin rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return { hash: sendResult.hash, confirmed: true };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(
+        `Accept admin failed on-chain. Tx hash: ${sendResult.hash}`
+      );
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  return { hash: sendResult.hash, confirmed: false };
+}
+
+/**
+ * Pause or unpause registration. Only the contract admin's signature is
+ * accepted; anyone else gets the contract's NotAdmin error in plain language
+ * and the flag is left untouched.
+ */
+export async function setPausedWithFreighter(
+  publicKey,
+  contractId,
+  paused,
+  expectedPassphrase = currentPassphrase()
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  await assertFreighterNetwork(expectedPassphrase);
+
+  return kitewellClient(contractId).setPaused(
+    publicKey,
+    Boolean(paused),
+    freighterSigner(publicKey)
+  );
+}
+
+/** Remove the connected builder's own check-in with their signature. */
+export async function unregisterBuilderWithFreighter(
+  publicKey,
+  contractId,
+  expectedPassphrase = currentPassphrase()
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  await assertFreighterNetwork(expectedPassphrase);
+
+  return kitewellClient(contractId).unregister(
+    publicKey,
+    freighterSigner(publicKey)
+  );
 }
 
 function createMemo(memoType, value) {
@@ -836,16 +1120,8 @@ export async function allowTrustWithFreighter(
   return signAndSubmit(transaction, publicKey);
 }
 
-/**
- * Read the configured contract instance's TTL from Soroban RPC.
- *
- * @returns {{ latestLedger: number, liveUntilLedgerSeq: number|null,
- *   ledgersRemaining: number }}
- */
-export async function readContractInstanceTtl(contractId) {
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
-  }
+async function dryRunPaymentTransaction(transaction) {
+  if (typeof fetch !== "function") return;
 
   const contract = new StellarSdk.Contract(contractId);
   const response = await sorobanRpc.getLedgerEntries(contract.getFootprint());
@@ -892,14 +1168,22 @@ export async function extendContractTtlWithFreighter(
     throw new Error("Extend to a valid positive ledger number.");
   }
 
-  let ttlInfo = null;
-  const currentDeadline =
-    options.currentDeadline ??
-    (ttlInfo = await readContractInstanceTtl(contractId)).liveUntilLedgerSeq ??
-    0;
-  if (target <= currentDeadline) {
-    throw new Error(
-      `New deadline must be later than the current one (${currentDeadline}).`
+    if (response.ok) return;
+
+    const resultCodes = result?.extras?.result_codes;
+    const transactionCode =
+      resultCodes?.transaction || result?.transaction_result_code;
+    const horizonRejected =
+      !response.ok &&
+      ([400, 422].includes(response.status) ||
+        Boolean(resultCodes || result?.transaction_result_code));
+    const operationCodes = Array.isArray(resultCodes?.operations)
+      ? resultCodes.operations.filter(Boolean).join(", ")
+      : null;
+    const unsuccessfulDryRun = Boolean(
+      transactionCode &&
+        transactionCode !== "tx_success" &&
+        transactionCode !== "success"
     );
   }
 
@@ -912,7 +1196,13 @@ export async function extendContractTtlWithFreighter(
   const extendBy = target - latestLedger;
   if (!Number.isSafeInteger(extendBy) || extendBy <= 0) {
     throw new Error(
-      `New deadline must be later than the latest ledger (${latestLedger}).`
+      `Horizon rejected this payment${
+        transactionCode
+          ? ` (${transactionCode}${
+              operationCodes ? `: ${operationCodes}` : ""
+            })`
+          : ""
+      }.`
     );
   }
 

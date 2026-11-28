@@ -1,3 +1,5 @@
+import * as StellarSdk from "@stellar/stellar-sdk";
+
 /**
  * Soroban simulation fee helpers.
  *
@@ -61,6 +63,66 @@ export function parseSimulationFees(simulation, inclusionFee = null) {
       : null;
 
   return { error: null, inclusionFee: inclusion, resourceFee, totalFee };
+}
+
+/**
+ * Extract address credentials from the authorization entries returned by
+ * Soroban simulation. Source-account credentials need no extra address entry.
+ *
+ * @param {unknown} entries Simulation result authorization entries.
+ * @returns {string[]} Authorized addresses.
+ */
+export function parseSimulationAuthorizationAddresses(entries) {
+  if (!Array.isArray(entries)) return [];
+
+  return entries.flatMap((entry) => {
+    const credentials = entry?.credentials?.();
+    const credentialType = credentials?.switch?.().name;
+    let addressCredentials;
+
+    switch (credentialType) {
+      case "sorobanCredentialsAddress":
+        addressCredentials = credentials.address();
+        break;
+      case "sorobanCredentialsAddressV2":
+        addressCredentials = credentials.addressV2();
+        break;
+      case "sorobanCredentialsAddressWithDelegates":
+        addressCredentials =
+          credentials.addressWithDelegates().addressCredentials();
+        break;
+      case "sorobanCredentialsSourceAccount":
+        return [];
+      default:
+        throw new TypeError("Simulation returned an invalid authorization entry.");
+    }
+
+    const address = addressCredentials.address();
+    if (!address) {
+      throw new TypeError("Simulation authorization entry has no address.");
+    }
+
+    return [
+      StellarSdk.scValToNative(StellarSdk.xdr.ScVal.scvAddress(address)),
+    ];
+  });
+}
+
+/**
+ * Whether the current form has a successful simulation for its exact inputs.
+ *
+ * @param {object|null} simulation Simulation state.
+ * @param {string|null} simulationKey Inputs used for the simulation.
+ * @param {string} currentKey Current form inputs.
+ * @returns {boolean}
+ */
+export function isSimulationReady(simulation, simulationKey, currentKey) {
+  return Boolean(
+    simulation &&
+      !simulation.error &&
+      simulationKey &&
+      simulationKey === currentKey
+  );
 }
 
 /**

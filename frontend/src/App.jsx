@@ -63,7 +63,7 @@ import { poolShareRows } from "./poolShare";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { fetchHealth, fetchNetworkInfo } from "./api";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
-import { formatSimulationFee } from "./simulationFees";
+import { formatSimulationFee, isSimulationReady } from "./simulationFees";
 import {
   NETWORKS,
   getActiveNetworkId,
@@ -1255,6 +1255,31 @@ export default function App() {
 
   const requireWallet = !publicKey;
   const visibleTransactions = mergeStreamedPayments(streamedPayments, transactions);
+  const currentRegisterSimulationKey = JSON.stringify([
+    publicKey,
+    networkId,
+    labInfo?.network?.contract?.kitewell,
+    registerForm.name.trim(),
+  ]);
+  const registerSimulationReady = isSimulationReady(
+    simulationFees,
+    simulatedRegisterKey,
+    currentRegisterSimulationKey
+  );
+  const historyAssets = [
+    ...new Set(
+      visibleTransactions
+        .map((tx) => (tx.asset_type === "native" ? "XLM" : tx.asset_code))
+        .filter(Boolean)
+        .concat(historyFilters.asset ? [historyFilters.asset] : [])
+    ),
+  ].sort();
+  const filteredTransactions = filterTransactionHistory(visibleTransactions, {
+    asset: historyFilters.asset || null,
+    direction: publicKey ? historyFilters.direction || null : null,
+    publicKey,
+  });
+  const currentHistoryCursor = pageCursors[pageCursors.length - 1];
 
   const loadLabInfo = async () => {
     setLoading("lab");
@@ -1715,34 +1740,231 @@ export default function App() {
         </div>
       )}
 
-      <form className="form" onSubmit={handleWatchHash}>
-        <label className="label" htmlFor="watch-tx-hash">
-          Watch a transaction hash
-        </label>
-        <input
-          id="watch-tx-hash"
-          className="input"
-          type="text"
-          placeholder="64 hexadecimal characters"
-          maxLength={64}
-          value={hashForm}
-          onChange={(e) => setHashForm(e.target.value)}
-          aria-describedby="watch-tx-hash-help"
-          required
-        />
-        <p className="muted" id="watch-tx-hash-help" role={hashError ? "alert" : undefined}>
-          {hashError || "Paste any transaction hash from this network to follow it."}
-        </p>
-        <button
-          className="btn btn--primary"
-          type="submit"
-          disabled={loading === "issue"}
-        >
-          Watch status
-        </button>
-      </form>
-    </div>
-  );
+  const removeComposeOperation = (index) => {
+    setComposeOps((previous) => previous.filter((_, i) => i !== index));
+    setComposeResult(null);
+    setComposeError(null);
+  };
+
+  const handleComposeSubmit = async () => {
+    if (composeOps.length === 0) {
+      setComposeError("Add at least one operation before signing.");
+      return;
+    }
+    if (!publicKey) {
+      return showToast("Connect Freighter first.", "error");
+    }
+
+    setLoading("compose");
+    setComposeError(null);
+    setComposeResult(null);
+    try {
+      const result = await submitComposedOperations(publicKey, composeOps);
+      setComposeResult({
+        hash: result.hash,
+        explorerUrl: explorerTxUrl(result.hash),
+      });
+      setComposeOps([]);
+      showToast(`Composed transaction submitted · ${result.hash.slice(0, 12)}…`);
+      try {
+        const next = await getAccountBalances(publicKey);
+        setBalances(next);
+      } catch {
+        /* balance refresh is best-effort */
+      }
+    } catch (err) {
+      setComposeError(err.message || "Composed transaction failed.");
+      showToast(err.message || "Composed transaction failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const loadFeeStats = async () => {
+    setLoading("feestats");
+    setFeeStatsError(null);
+    setFeeStats(null);
+    try {
+      setFeeStats(await getFeeStats());
+    } catch {
+      setFeeStatsError("Fee stats could not be loaded.");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const applyFeePreset = (source) => {
+    const stroops = feeStats?.[source];
+    if (!stroops) {
+      return showToast("Load fee stats before choosing a percentile.", "error");
+    }
+
+    try {
+      setFeeSetting(saveFeeSetting({ source, stroops }));
+      showToast(`Fee set to ${stroops} stroops per operation.`);
+    } catch (err) {
+      showToast(err.message || "Could not save the fee.", "error");
+    }
+  };
+
+  const handleCustomFee = (event) => {
+    event.preventDefault();
+    try {
+      const saved = saveFeeSetting({ source: "custom", stroops: customFee });
+      setFeeSetting(saved);
+      showToast(`Fee set to ${saved.stroops} stroops per operation.`);
+    } catch (err) {
+      showToast(err.message || "Could not save the fee.", "error");
+    }
+  };
+
+  const refreshClawbackAssets = async () => {
+    if (!publicKey) {
+      setClawbackAssets([]);
+      return;
+    }
+    try {
+      const next = await getAccountBalances(publicKey);
+      setClawbackAssets(
+        next.filter((balance) => !balance.isNative && balance.issuer === publicKey)
+      );
+    } catch {
+      setClawbackAssets([]);
+    }
+  };
+
+  const activateTab = (tab) => {
+    setActiveTab(tab);
+    if (tab === "Fees") loadFeeStats();
+    if (tab === "History") handleHistory();
+    if (tab === "Trades") handleTrades();
+    if (tab === "Lab") {
+      loadLabInfo().then((info) => {
+        const contractId = info?.network?.contract?.kitewell;
+        refreshLabState(contractId);
+        refreshTtlInfo(contractId);
+        loadBuilderPage(0, contractId);
+      });
+    }
+    if (tab === "Assets") {
+      if (publicKey) refreshBalances();
+      else refreshReserve();
+    } else if ((tab === "Wallet" || tab === "Send") && publicKey) {
+      refreshBalances();
+    }
+    if (tab === "Assets") refreshClawbackAssets();
+  };
+
+  const handleSimulateRegister = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+    setLoading("simulate");
+    setSimulationFees(null);
+    setSimulatedRegisterKey(null);
+    try {
+      const fees = await simulateRegisterBuilder(
+        publicKey,
+        contractId,
+        registerForm.name
+      );
+      setSimulationFees(fees);
+      if (fees.error) {
+        showToast(`Simulation failed: ${fees.error}`, "error");
+      } else {
+        setSimulatedRegisterKey(
+          JSON.stringify([
+            publicKey,
+            networkId,
+            contractId,
+            registerForm.name.trim(),
+          ])
+        );
+      }
+    } catch (err) {
+      const error = err.message || "Simulation failed.";
+      setSimulationFees({
+        error,
+        inclusionFee: null,
+        resourceFee: null,
+        totalFee: null,
+        returnValue: null,
+        authAddresses: [],
+      });
+      showToast(error, "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleSep7UriChange = (value) => {
+    setSep7Uri(value);
+    if (!value.trim()) {
+      setSep7Request(null);
+      return;
+    }
+
+    try {
+      const request = parseSep7PayUri(value);
+      setSep7Request(request);
+      setSendForm((previous) => ({
+        ...previous,
+        destination: request.destination,
+        amount: request.amount,
+        assetKey: request.assetKey,
+        memoType: request.memoType,
+        memo: request.memo,
+      }));
+    } catch (error) {
+      setSep7Request(null);
+      showToast(error.message || "Invalid SEP-7 pay URI.", "error");
+    }
+  };
+
+  const handleTabKeyDown = (event, index) => {
+    let nextIndex;
+
+    if (event.key === "ArrowRight") nextIndex = (index + 1) % TABS.length;
+    else if (event.key === "ArrowLeft") nextIndex = (index - 1 + TABS.length) % TABS.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = TABS.length - 1;
+    else return;
+
+    event.preventDefault();
+    activateTab(TABS[nextIndex]);
+    tabRefs.current[nextIndex]?.focus();
+  };
+
+  useEffect(() => {
+    const destination = sendForm.destination.trim();
+    if (!destination || !destination.includes("*")) {
+      setResolvedFederation(null);
+      return;
+    }
+
+    let cancelled = false;
+    setLoading("resolve");
+    setResolvedFederation(null);
+    resolveFederationAddress(destination)
+      .then((account) => {
+        if (!cancelled) setResolvedFederation(account);
+      })
+      .catch((err) => {
+        if (!cancelled) showToast(err.message || "Federation lookup failed.", "error");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading("");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sendForm.destination]);
 
   return (
     <div className="app">
@@ -3496,18 +3718,32 @@ export default function App() {
                             </span>
                           </div>
                           <div>
-                            <span className="metadata-label">Resource fee</span>
-                            <span className="metadata-value">
-                              {formatSimulationFee(simulationFees.resourceFee)}
+                            <span className="metadata-label">
+                              Authorization entries
                             </span>
+                            {simulationFees.authAddresses.length > 0 ? (
+                              <ul>
+                                {simulationFees.authAddresses.map((address) => (
+                                  <li key={address}>
+                                    <code>{address}</code>{" "}
+                                    {address === publicKey
+                                      ? "(connected wallet)"
+                                      : "(someone else's)"}
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p className="muted">
+                                Connected wallet ({shortenAddress(publicKey)}) is
+                                the only signer.
+                              </p>
+                            )}
                           </div>
-                          <div>
-                            <span className="metadata-label">Total fee</span>
-                            <span className="metadata-value">
-                              {formatSimulationFee(simulationFees.totalFee)}
-                            </span>
-                          </div>
-                        </div>
+                          <p className="muted">
+                            Simulation does not submit. Press Sign &amp; register to sign
+                            and submit this invocation.
+                          </p>
+                        </>
                       )}
                       <p className="muted">
                         Simulation does not submit. Press Sign &amp; register to sign
