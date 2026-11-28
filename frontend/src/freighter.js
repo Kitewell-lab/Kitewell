@@ -1841,7 +1841,9 @@ export async function manageDataWithFreighter(publicKey, name, value = null) {
   const normalizedValue =
     value === null || value === undefined
       ? null
-      : Buffer.from(validateDataValue(value), "utf8");
+      : value instanceof Uint8Array
+        ? Buffer.from(validateDataValue(value))
+        : Buffer.from(validateDataValue(value), "utf8");
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
