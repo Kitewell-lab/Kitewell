@@ -32,6 +32,7 @@ import {
   readKitewellBuilder,
   createSponsoredAccountDraft,
   sponsorAccountCreationWithFreighter,
+  deployKitewellContract,
 } from "./freighter";
 import {
   appendBuilderPage,
@@ -60,6 +61,7 @@ import {
   liquidityPoolWithdraw,
   getTransactions,
   groupPaymentsByDay,
+  resolveFederationAddress,
   explorerAccountUrl,
   explorerTxUrl,
   downloadAccountSnapshot,
@@ -6376,8 +6378,6 @@ export default function App() {
                   {loading === "history" ? "Loading…" : "Refresh"}
                 </button>
               </div>
-
-              {txWatchPanel}
             </div>
           )}
 

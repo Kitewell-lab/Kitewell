@@ -14,10 +14,22 @@ vi.mock("./api", () => ({
   fetchPaymentsViaApi: vi.fn(),
 }));
 
-const { loadAccountMock, paymentsCallMock, offersCallMock } = vi.hoisted(() => ({
+const {
+  loadAccountMock,
+  paymentsCallMock,
+  offersCallMock,
+  ledgerCallMock,
+  orderBookCallMock,
+  claimableCallMock,
+  assetCallMock,
+} = vi.hoisted(() => ({
   loadAccountMock: vi.fn(),
   paymentsCallMock: vi.fn(),
   offersCallMock: vi.fn(),
+  ledgerCallMock: vi.fn(),
+  orderBookCallMock: vi.fn(),
+  claimableCallMock: vi.fn(),
+  assetCallMock: vi.fn(),
 }));
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
@@ -29,6 +41,18 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
       Server: vi.fn(function () {
         return {
           loadAccount: loadAccountMock,
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({ call: ledgerCallMock }),
+            }),
+          }),
+          trades: () => ({
+            forAccount: () => ({
+              limit: () => ({
+                order: () => ({ cursor: () => ({ call: ledgerCallMock }) }),
+              }),
+            }),
+          }),
           offers: () => ({
             forAccount: () => ({
               order: () => ({ call: offersCallMock }),
@@ -37,7 +61,13 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
           payments: () => ({
             forAccount: () => ({
               limit: () => ({
-                order: () => ({ join: () => ({ call: paymentsCallMock }) }),
+                order: () => ({
+                  join: () => ({
+                    cursor: () => ({ call: paymentsCallMock }),
+                    call: paymentsCallMock,
+                  }),
+                  call: paymentsCallMock,
+                }),
               }),
             }),
           }),
@@ -80,6 +110,7 @@ const {
   validateDataValue,
   validateAccountMerge,
   mergeBlockersFromAccount,
+  resetHorizon429BackoffForTests,
 } = await import("./stellar");
 
 /** Minimal Horizon account payload: 3.5 XLM + an issued asset. */
@@ -113,6 +144,10 @@ beforeEach(() => {
   loadAccountMock.mockReset();
   paymentsCallMock.mockReset();
   offersCallMock.mockReset();
+  ledgerCallMock.mockReset();
+  orderBookCallMock.mockReset();
+  claimableCallMock.mockReset();
+  assetCallMock.mockReset();
   resetHorizon429BackoffForTests();
 });
 
@@ -396,6 +431,16 @@ describe("getBalance", () => {
 
 describe("getLatestBaseReserve", () => {
   it("reads the base reserve from the latest Horizon ledger", async () => {
+    ledgerCallMock.mockResolvedValue({
+      records: [
+        {
+          sequence: 123456,
+          closed_at: "2026-11-20T15:00:00Z",
+          base_fee_in_stroops: 100,
+          base_reserve_in_stroops: 5000000,
+        },
+      ],
+    });
     await expect(getLatestBaseReserve()).resolves.toBe("5000000");
     expect(ledgerCallMock).toHaveBeenCalledTimes(1);
   });

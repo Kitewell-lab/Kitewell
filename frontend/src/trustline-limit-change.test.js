@@ -4,12 +4,15 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
  * Test changing trustline limits with changeTrustWithFreighter.
  */
 
-const { horizonServerMock, signTransactionMock } = vi.hoisted(() => ({
+const { horizonServerMock, signTransactionMock, ledgerCallMock } = vi.hoisted(() => ({
   horizonServerMock: {
     loadAccount: vi.fn(),
     submitTransaction: vi.fn(),
   },
   signTransactionMock: vi.fn(),
+  ledgerCallMock: vi.fn().mockResolvedValue({
+    records: [{ base_reserve_in_stroops: "5000000" }],
+  }),
 }));
 
 vi.mock("@stellar/freighter-api", () => ({
@@ -31,7 +34,14 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
     Horizon: {
       ...actual.Horizon,
       Server: vi.fn(function () {
-        return horizonServerMock;
+        return {
+          ...horizonServerMock,
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({ call: ledgerCallMock }),
+            }),
+          }),
+        };
       }),
     },
   };
@@ -47,6 +57,8 @@ describe("changeTrustWithFreighter - limit changes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     const mockAccount = new StellarSdk.Account(mockPublicKey, "100");
+    mockAccount.balances = [{ asset_type: "native", balance: "100.0000000" }];
+    mockAccount.subentry_count = 0;
     horizonServerMock.loadAccount.mockResolvedValue(mockAccount);
     horizonServerMock.submitTransaction.mockResolvedValue({
       hash: "tx-hash",
