@@ -8,6 +8,67 @@ import { getNetwork, signTransaction } from "@stellar/freighter-api";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { findNetworkByPassphrase, getActiveNetwork } from "./network";
 
+function toBytes(value) {
+  if (value instanceof Uint8Array) return value;
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return Uint8Array.from(value || []);
+}
+
+function toHex(value) {
+  return Array.from(toBytes(value), (byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+}
+
+function toBase64(value) {
+  const bytes = toBytes(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+/**
+ * List the signatures already on an envelope, with the hint of each signer.
+ *
+ * The four-byte hint only narrows the candidates, so a signature is matched
+ * only after it verifies against this transaction's hash. A signature with no
+ * signer on the source account is `unmatched`; one whose hint matches but does
+ * not verify is `invalid` (usually signed for another network).
+ */
+export function listEnvelopeSignatures(transaction, account = {}, publicKey = null) {
+  const hash = transaction.hash();
+  const signers = (account?.signers || []).filter(
+    (signer) =>
+      signer.weight > 0 &&
+      StellarSdk.StrKey.isValidEd25519PublicKey(signer.key)
+  );
+
+  return (transaction.signatures || []).map((signature) => {
+    const hint = toHex(signature.hint());
+    const candidates = signers.filter(
+      (signer) =>
+        toHex(StellarSdk.Keypair.fromPublicKey(signer.key).signatureHint()) === hint
+    );
+    const match = candidates.find((signer) =>
+      StellarSdk.Keypair.fromPublicKey(signer.key).verify(
+        hash,
+        signature.signature()
+      )
+    );
+
+    return {
+      hint,
+      signature: toBase64(signature.signature()),
+      signer: match?.key ?? null,
+      matched: Boolean(match),
+      isConnected: Boolean(match && match.key === publicKey),
+      status: match ? "matched" : candidates.length > 0 ? "invalid" : "unmatched",
+    };
+  });
+}
+
 /**
  * Summarize which account signers already signed `transaction` and which
  * thresholds their combined weight meets. `account` is a Horizon account
@@ -18,8 +79,8 @@ import { findNetworkByPassphrase, getActiveNetwork } from "./network";
  * verify is reported in `invalid` — usually an envelope signed on another
  * network.
  */
-export function summarizeEnvelopeSignatures(transaction, account) {
-  const hash = transaction.hash();
+export function summarizeEnvelopeSignatures(transaction, account, publicKey = null) {
+  const signatures = listEnvelopeSignatures(transaction, account, publicKey);
   const signers = (account?.signers || []).filter(
     (signer) =>
       signer.weight > 0 &&
@@ -32,30 +93,11 @@ export function summarizeEnvelopeSignatures(transaction, account) {
     high: raw.high_threshold ?? raw.high ?? 0,
   };
 
-  const signed = new Set();
-  let invalid = 0;
-  let unknown = 0;
-  for (const signature of transaction.signatures || []) {
-    const hint = signature.hint().toString("hex");
-    const candidates = signers.filter(
-      (signer) =>
-        StellarSdk.Keypair.fromPublicKey(signer.key)
-          .signatureHint()
-          .toString("hex") === hint
-    );
-    if (candidates.length === 0) {
-      unknown += 1;
-      continue;
-    }
-    const match = candidates.find((signer) =>
-      StellarSdk.Keypair.fromPublicKey(signer.key).verify(
-        hash,
-        signature.signature()
-      )
-    );
-    if (match) signed.add(match.key);
-    else invalid += 1;
-  }
+  const signed = new Set(
+    signatures.filter((row) => row.matched).map((row) => row.signer)
+  );
+  const invalid = signatures.filter((row) => row.status === "invalid").length;
+  const unknown = signatures.filter((row) => row.status === "unmatched").length;
 
   const rows = signers.map((signer) => ({
     key: signer.key,
@@ -68,6 +110,7 @@ export function summarizeEnvelopeSignatures(transaction, account) {
 
   return {
     signers: rows,
+    signatures,
     totalWeight,
     thresholds,
     meets: {
@@ -146,10 +189,10 @@ function assertSummaryOnLabNetwork(summary) {
  * Load the envelope's source account and report which of its signers already
  * signed and which thresholds are met.
  */
-export async function inspectMultisigEnvelope(envelopeXdr) {
+export async function inspectMultisigEnvelope(envelopeXdr, publicKey = null) {
   const transaction = parseMultisigEnvelope(envelopeXdr);
   const account = await getServer().loadAccount(transaction.source);
-  const summary = summarizeEnvelopeSignatures(transaction, account);
+  const summary = summarizeEnvelopeSignatures(transaction, account, publicKey);
   assertSummaryOnLabNetwork(summary);
   return {
     ...summary,
@@ -185,7 +228,7 @@ export async function addSignatureToEnvelopeWithFreighter(envelopeXdr, publicKey
   assertPublicKey(publicKey);
   await assertFreighterNetworkMatches();
 
-  const before = await inspectMultisigEnvelope(envelopeXdr);
+  const before = await inspectMultisigEnvelope(envelopeXdr, publicKey);
   const row = before.signers.find((signer) => signer.key === publicKey);
   if (!row) {
     throw new Error("The connected account is not a signer on this envelope's source account.");
@@ -202,7 +245,7 @@ export async function addSignatureToEnvelopeWithFreighter(envelopeXdr, publicKey
   const merged = mergeEnvelopeSignatures(original, signed);
 
   const account = await getServer().loadAccount(merged.source);
-  const summary = summarizeEnvelopeSignatures(merged, account);
+  const summary = summarizeEnvelopeSignatures(merged, account, publicKey);
   assertSummaryOnLabNetwork(summary);
   return {
     ...summary,

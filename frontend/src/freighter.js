@@ -20,11 +20,22 @@ import {buildAsset,
   validateDataName,
   validateDataValue,
   validateAccountMerge,
-  getAccountMergeBlockers, resolveFederationAddress, getLatestBaseReserve } from "./stellar";
+  getAccountMergeBlockers,
+  getLatestBaseReserve,
+  resolveFederationAddress,
+  getAccountAssetBalance,
+} from "./stellar";
 import { getTransactionFailure, parseHorizonError } from "./horizonErrorParse";
+import { formatTrustlineLimit } from "./trustlineLimitFormat";
 import { parseSimulationFees } from "./simulationFees";
 import { pageBuilderAddresses } from "./builderDirectory";
 import { getFeePerOperation } from "./feeSetting";
+import { createKitewellClient } from "./kitewellClient";
+import {
+  formatStroops,
+  minimumBalanceInStroops,
+  remainsAboveMinimum,
+} from "./accountReserve";
 import {
   
   freighterCancelledError,
@@ -115,6 +126,14 @@ function buildContractTx(contract, method, args, sourceAccount, timeout = 30) {
     .build();
 }
 
+/** Build a spec-driven client for the active network's contract calls. */
+function kitewellClient(contractId) {
+  return createKitewellClient({
+    contractId,
+    networkPassphrase: currentPassphrase(),
+  });
+}
+
 /** Send prepared XDR to Freighter and return the signed transaction. */
 function freighterSigner(publicKey) {
   return (unsignedXdr) => signWithFreighter(unsignedXdr, publicKey);
@@ -132,6 +151,237 @@ function freighterSigner(publicKey) {
  *
  * @returns {{ labName: string, builderCount: number, builder: string|null, archived: boolean }}
  */
+function contractIdFromResult(resultXdr) {
+  try {
+    const result =
+      typeof resultXdr === "string"
+        ? StellarSdk.xdr.TransactionResult.fromXDR(resultXdr, "base64")
+        : resultXdr;
+    const createResult = result
+      ?.result?.()
+      ?.results?.()[0]
+      ?.tr?.()
+      ?.invokeHostFunctionResult?.();
+    if (!createResult || createResult.switch().value !== 0) return null;
+    return StellarSdk.Address.contract(createResult.success()).toString();
+  } catch {
+    return null;
+  }
+}
+
+/** Prepare, sign with Freighter, submit, and poll until the tx is applied. */
+async function prepareSignSubmit(transaction, publicKey, label) {
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `${label} rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  // RPC submission is asynchronous: poll getTransaction until applied.
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return { hash: sendResult.hash, returnValue: status.returnValue ?? null, status };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(`${label} failed on-chain. Tx hash: ${sendResult.hash}`);
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  // Still pending after the polling window; the tx may land shortly.
+  return { hash: sendResult.hash, returnValue: null, status: null };
+}
+
+/**
+ * Refuse to sign a contract invoke when Freighter is pointed at a different
+ * network than the contract the backend reports. Previously this surfaced as
+ * an opaque signing or submission failure after the wallet had already been
+ * prompted.
+ */
+async function assertFreighterNetwork(expectedPassphrase) {
+  const details = await getNetworkDetails();
+  if (details.error) {
+    throw new Error(
+      details.error.message || "Could not read the network from Freighter."
+    );
+  }
+  if (details.networkPassphrase !== expectedPassphrase) {
+    throw new Error(
+      `Freighter is on ${details.network}, but this contract is on a different network. ` +
+        "Switch Freighter to the Lab network and try again."
+    );
+  }
+}
+
+/**
+ * Read-only lookups against the Kitewell registry through the generated
+ * client: lab_name(), builder_count(), get_builder(viewer), paused(), and
+ * get_admin().
+ *
+ * When the contract instance is archived on-chain, the simulated read fails
+ * with a host error. Rather than surface that as a hard failure, the wrapper
+ * catches the archived case and returns a state shape with `archived: true`.
+ *
+ * @returns {{ labName: string|null, builderCount: number, builder: string|null,
+ *   paused: boolean, admin: string|null, archived: boolean }}
+ */
+export async function readKitewellState(contractId, viewerAddress) {
+  try {
+    return { ...(await kitewellClient(contractId).readState(viewerAddress)), archived: false };
+  } catch (error) {
+    const message = error?.message || String(error ?? "");
+    if (/archived/i.test(message) && /restore/i.test(message)) {
+      return { labName: null, builderCount: 0, builder: null, paused: false, admin: null, archived: true };
+    }
+    throw error;
+  }
+}
+
+/** Upload the Wasm bytes in their own Soroban tx (one host op per tx). */
+async function uploadKitewellWasm(publicKey, wasm) {
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(StellarSdk.Operation.uploadContractWasm({ wasm }))
+    .setTimeout(60)
+    .build();
+
+  const submitted = await prepareSignSubmit(transaction, publicKey, "Wasm upload");
+  if (!submitted.status) {
+    throw new Error(
+      `Wasm upload submitted (${submitted.hash}) but not confirmed; install stopped.`
+    );
+  }
+  return { wasmHash: StellarSdk.hash(wasm), hash: submitted.hash };
+}
+
+/** Create the contract instance from an uploaded Wasm hash. */
+async function createKitewellContract(publicKey, wasmHash, salt) {
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.createCustomContract({
+        address: new StellarSdk.Address(publicKey),
+        wasmHash,
+        salt,
+      })
+    )
+    .setTimeout(60)
+    .build();
+
+  const submitted = await prepareSignSubmit(
+    transaction,
+    publicKey,
+    "Contract create"
+  );
+  if (!submitted.status) {
+    throw new Error(
+      `Contract create submitted (${submitted.hash}) but not confirmed; no contract id yet.`
+    );
+  }
+
+  const contractId = contractIdFromResult(submitted.status.resultXdr);
+  if (!contractId) {
+    throw new Error(
+      `Contract create confirmed (${submitted.hash}) but returned no contract id.`
+    );
+  }
+  return { contractId, hash: submitted.hash };
+}
+
+/**
+ * Install the Kitewell Wasm: upload bytes, then create a contract instance from
+ * the uploaded hash. Each phase is a Freighter-signed Soroban tx; the new
+ * contract ID comes from the create tx result. No `init` is called here.
+ *
+ * @returns {{ contractId: string, hash: string, uploadHash: string, confirmed: true }}
+ */
+export async function installKitewellContract(publicKey, wasmBytes, options = {}) {
+  assertPublicKey(publicKey);
+  const wasm = normalizeWasmBytes(wasmBytes);
+  const salt = options.salt ?? newSalt();
+
+  const upload = await uploadKitewellWasm(publicKey, wasm);
+  const created = await createKitewellContract(publicKey, upload.wasmHash, salt);
+
+  return {
+    contractId: created.contractId,
+    hash: created.hash,
+    uploadHash: upload.hash,
+    confirmed: true,
+  };
+}
+
+/**
+ * One-time `init(admin)` invoke for a freshly installed registry. The connected
+ * account is the admin; the contract itself rejects a second init.
+ */
+export async function initializeKitewellContract(publicKey, contractId) {
+  assertPublicKey(publicKey);
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const transaction = buildContractTx(
+    contract,
+    "init",
+    [StellarSdk.nativeToScVal(publicKey, { type: "address" })],
+    sourceAccount
+  );
+
+  const submitted = await prepareSignSubmit(transaction, publicKey, "Contract init");
+  return { hash: submitted.hash, confirmed: Boolean(submitted.status) };
+}
+
+/** Install and initialize the registry in one Freighter-signed flow. */
+export async function deployKitewellContract(publicKey, wasmBytes, options = {}) {
+  const {
+    install = installKitewellContract,
+    init = initializeKitewellContract,
+  } = options;
+
+  // Validate before submitting anything so a bad file/key cannot half-deploy.
+  assertPublicKey(publicKey);
+  normalizeWasmBytes(wasmBytes);
+
+  const installed = await install(publicKey, wasmBytes, {
+    salt: options.salt,
+  });
+  if (!StellarSdk.StrKey.isValidContract(installed?.contractId)) {
+    throw new Error("Install did not return a valid contract id; init was not called.");
+  }
+
+  let initialized;
+  try {
+    initialized = await init(publicKey, installed.contractId);
+  } catch (error) {
+    // The install already succeeded, so surface its id for diagnostics without
+    // treating it as a usable deployment.
+    if (error instanceof Error) error.contractId = installed.contractId;
+    throw error;
+  }
+
+  return {
+    contractId: installed.contractId,
+    installHash: installed.hash,
+    initHash: initialized?.hash ?? null,
+    confirmed: Boolean(installed.confirmed && initialized?.confirmed),
+  };
+}
 
 /**
  * Read admin addresses from the Kitewell contract.
@@ -418,6 +668,32 @@ export async function acceptAdminWithFreighter(publicKey, contractId) {
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
     throw new Error("Pending admin address is invalid.");
   }
+
+  await assertFreighterNetwork(expectedPassphrase);
+
+  return kitewellClient(contractId).register(
+    publicKey,
+    trimmed,
+    freighterSigner(publicKey)
+  );
+}
+
+/** Rename the connected builder's own check-in. */
+export async function renameBuilderWithFreighter(
+  publicKey,
+  contractId,
+  newName
+) {
+  const trimmed = (newName || "").trim();
+  if (!trimmed) {
+    throw new Error("Enter a builder name to rename.");
+  }
+  if ([...trimmed].length > 64) {
+    throw new Error("Builder name must be 64 characters or fewer.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
   if (!StellarSdk.StrKey.isValidContract(contractId)) {
     throw new Error(
       "Contract ID must be a valid Soroban contract strkey (C…)."
@@ -460,37 +736,71 @@ export async function acceptAdminWithFreighter(publicKey, contractId) {
   return { hash: sendResult.hash, confirmed: false };
 }
 
-/**
- * Check in a builder: builds + simulates a Soroban `register(caller, name)`
- * invoke, lets Freighter sign it, then submits via Soroban RPC and waits for
- * on-chain confirmation.
- *
- * @returns {{ hash: string, returnValue: unknown, confirmed: boolean }}
- */
-export async function registerBuilderWithFreighter(
-  publicKey,
-  contractId,
-  name,
-  expectedPassphrase = currentPassphrase()
-) {
-  const trimmed = (name || "").trim();
-  if (!trimmed) {
-    throw new Error("Enter a builder name to register.");
-  }
-  if ([...trimmed].length > 64) {
-    throw new Error("Builder name must be 64 characters or fewer.");
-  }
+/** Restore an archived contract instance from the Soroban ledger. */
+export async function restoreContractWithFreighter(publicKey, contractId) {
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
     throw new Error("Connect a valid Freighter address first.");
   }
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error(
+      "Contract ID must be a valid Soroban contract strkey (C…)."
+    );
+  }
 
-  await assertFreighterNetwork(expectedPassphrase);
-
-  return kitewellClient(contractId).register(
-    publicKey,
-    trimmed,
-    freighterSigner(publicKey)
+  const contractAddress = new StellarSdk.Address(contractId);
+  const instanceKey = StellarSdk.xdr.LedgerKey.contractData(
+    new StellarSdk.xdr.LedgerKeyContractData({
+      contract: contractAddress.toScAddress(),
+      key: StellarSdk.xdr.ScVal.scvLedgerKeyContractInstance(),
+      durability: StellarSdk.xdr.ContractDataDurability.persistent(),
+    })
   );
+
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const restoreOp = StellarSdk.Operation.restoreFootprint({
+    source: publicKey,
+  });
+
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: "100000",
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(restoreOp)
+    .setSorobanData(
+      new StellarSdk.SorobanDataBuilder()
+        .setReadWrite([instanceKey])
+        .build()
+    )
+    .setTimeout(180)
+    .build();
+
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `Restore operation rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return {
+        hash: sendResult.hash,
+        confirmed: true,
+      };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(
+        `Restore operation failed on-chain. Tx hash: ${sendResult.hash}`
+      );
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  return { hash: sendResult.hash, confirmed: false };
 }
 
 /**
@@ -688,6 +998,11 @@ async function signWithFreighter(unsignedXdr, publicKey) {
   );
 }
 
+async function signAndSubmit(transaction, publicKey) {
+  const signedTx = await signWithFreighter(transaction.toXDR(), publicKey);
+  return submitSignedTransaction(signedTx);
+}
+
 async function submitSignedTransaction(signedTx) {
   try {
     return await getServer().submitTransaction(signedTx);
@@ -869,6 +1184,149 @@ export async function clawbackWithFreighter(publicKey, holder, assetCode, assetI
  * Validate a Stellar amount string (positive, max 7 decimal places) without
  * going through floating point, so values like 0.0000001 stay intact.
  */
+/** Hard cap on the number of operations in one composed transaction. */
+export const MAX_COMPOSED_OPERATIONS = 100;
+const MAX_MANAGE_DATA_NAME_BYTES = 64;
+const MAX_MANAGE_DATA_VALUE_BYTES = 64;
+
+function assertComposedEntries(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error("Add at least one operation before signing.");
+  }
+  if (entries.length > MAX_COMPOSED_OPERATIONS) {
+    throw new Error(
+      `A transaction can contain at most ${MAX_COMPOSED_OPERATIONS} operations.`
+    );
+  }
+}
+
+/** Build one operation from a composer entry, validating it first. */
+export function buildComposedOperation(entry = {}) {
+  if (entry.type === "payment") {
+    if (!StellarSdk.StrKey.isValidEd25519PublicKey(entry.destination)) {
+      throw new Error("Destination must be a valid Stellar public key (G…).");
+    }
+
+    return StellarSdk.Operation.payment({
+      destination: entry.destination,
+      asset: resolvePaymentAsset(entry.asset),
+      amount: normalizeAmount(entry.amount),
+    });
+  }
+
+  if (entry.type === "changeTrust") {
+    const code = String(entry.code ?? "").trim().toUpperCase();
+    if (!code || code.length > 12) {
+      throw new Error("Asset code must be 1–12 characters.");
+    }
+    if (!StellarSdk.StrKey.isValidEd25519PublicKey(entry.issuer)) {
+      throw new Error("Issuer must be a valid Stellar public key (G…).");
+    }
+
+    return StellarSdk.Operation.changeTrust({
+      asset: new StellarSdk.Asset(code, entry.issuer),
+      limit: formatTrustlineLimit(entry.limit).formatted,
+    });
+  }
+
+  if (entry.type === "manageData") {
+    const name = String(entry.name ?? "").trim();
+    if (!name) {
+      throw new Error("Data entry name is required.");
+    }
+    if (new TextEncoder().encode(name).length > MAX_MANAGE_DATA_NAME_BYTES) {
+      throw new Error("Data entry name must be 64 UTF-8 bytes or fewer.");
+    }
+
+    const value = String(entry.value ?? "");
+    if (new TextEncoder().encode(value).length > MAX_MANAGE_DATA_VALUE_BYTES) {
+      throw new Error("Data entry value must be 64 UTF-8 bytes or fewer.");
+    }
+
+    return StellarSdk.Operation.manageData({ name, value });
+  }
+
+  throw new Error(`Unsupported operation type: ${entry.type}`);
+}
+
+/** Build a multi-operation transaction from composer entries. */
+export function buildComposedTransaction(sourceAccount, entries) {
+  assertComposedEntries(entries);
+
+  const builder = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  });
+
+  for (const entry of entries) {
+    builder.addOperation(buildComposedOperation(entry));
+  }
+
+  return builder.setTimeout(180).build();
+}
+
+/**
+ * Extract the Horizon operation index from a transaction-failed error so the
+ * compose panel can point the user at the failing step.
+ */
+export function getFailedOperationIndex(error) {
+  const codes =
+    error?.response?.data?.extras?.result_codes?.operations ?? error?.response?.data?.extras?.result_codes?.operations;
+  if (Array.isArray(codes)) {
+    const failed = codes.findIndex(
+      (code) => code && code !== "op_success"
+    );
+    if (failed !== -1) return failed;
+  }
+  return undefined;
+}
+
+/**
+ * Build, sign with Freighter, and submit a multi-operation transaction.
+ *
+ * A failure response names the operation index Horizon rejected, so the panel
+ * can point the user at the failing step rather than the whole transaction.
+ */
+export async function submitComposedOperations(publicKey, entries) {
+  const transaction = buildComposedTransaction(
+    new StellarSdk.Account(publicKey, "0"),
+    entries
+  );
+
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const built = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  });
+
+  for (const entry of entries) {
+    built.addOperation(buildComposedOperation(entry));
+  }
+  const tx = built.setTimeout(180).build();
+
+  const signedTx = await signWithFreighter(tx.toXDR(), publicKey);
+
+  try {
+    const result = await getServer().submitTransaction(signedTx);
+    return result;
+  } catch (error) {
+    const idx = getFailedOperationIndex(error);
+    if (idx != null) {
+      error.operationIndex = idx;
+      error.message = `Operation index ${idx} failed: ${error.message}`;
+    }
+    throw error;
+  }
+}
+
+function amountToStroops(value) {
+  const [whole, fraction = ""] = String(value).trim().split(".");
+  return (
+    BigInt(whole || "0") * 10000000n +
+    BigInt((fraction + "0000000").slice(0, 7))
+  );
+}
+
 export function normalizeAmount(value, label = "Amount") {
   const text = String(value ?? "").trim();
   if (!/^\d+(\.\d{1,7})?$/.test(text)) {
@@ -933,6 +1391,36 @@ export async function createAccountWithFreighter(
   }
 
   const sourceAccount = await getServer().loadAccount(publicKey);
+
+  // Check that the source retains enough lumens after the transfer and the
+  // new subentry the createAccount operation adds.
+  const baseReserveStroops = await getLatestBaseReserve();
+  const baseReserve =
+    typeof baseReserveStroops === "bigint"
+      ? Number(baseReserveStroops) / 1e7
+      : Number(baseReserveStroops) / 1e7;
+  const reservePerSubentry = baseReserve;
+  const currentSubentryCount = Number(sourceAccount.subentry_count ?? 0);
+  // createAccount adds one new account subentry.
+  const futureSubentryCount = currentSubentryCount + 1;
+  const minimumBalance =
+    baseReserve + futureSubentryCount * reservePerSubentry;
+  const nativeBalance =
+    sourceAccount.balances?.find((b) => b.asset_type === "native")?.balance;
+  if (nativeBalance == null) {
+    throw new Error(
+      "Could not verify the account balance and subentries; account creation is disabled."
+    );
+  }
+  const sourceBalance = Number(nativeBalance);
+  const transferAmount = Number(formattedAmount);
+  const balanceAfterTransfer = sourceBalance - transferAmount;
+  if (balanceAfterTransfer <= minimumBalance) {
+    throw new Error(
+      `source must retain ${minimumBalance.toFixed(7)} XLM to create an account.`
+    );
+  }
+
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
@@ -949,7 +1437,9 @@ export async function createAccountWithFreighter(
   try {
     return await signAndSubmit(transaction, publicKey);
   } catch (error) {
-    throw new Error(`Create account failed: ${horizonCreateAccountError(error)}`, { cause: error });
+    throw new Error(`Create account failed: ${horizonCreateAccountError(error)}`, {
+      cause: error,
+    });
   }
 }
 
@@ -1077,17 +1567,23 @@ export async function sendPaymentWithFreighter(
   minTime = null,
   maxTime = null
 ) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
-    if (typeof destination !== "string" || !destination.includes("*")) {
-      throw new Error("Destination must be a valid Stellar public key (G…).");
+  const isAccountAddress =
+    StellarSdk.StrKey.isValidEd25519PublicKey(destination) ||
+    StellarSdk.StrKey.isValidMed25519PublicKey(destination);
+  if (!isAccountAddress) {
+    if (typeof destination === "string" && destination.startsWith("M")) {
+      throw new Error(
+        "Destination must be a valid Stellar public key or a muxed address (G… or M…)."
+      );
     }
+    throw new Error("Destination must be a valid Stellar public key (G…).");
   }
 
-  const resolvedDestination =
-    typeof destination === "string" && destination.includes("*")
-      ? await resolveFederationAddress(destination)
-      : destination;
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(resolvedDestination)) {
+  const resolvedDestination = await resolveFederationAddress(destination);
+  const isResolvedAccountAddress =
+    StellarSdk.StrKey.isValidEd25519PublicKey(resolvedDestination) ||
+    StellarSdk.StrKey.isValidMed25519PublicKey(resolvedDestination);
+  if (!isResolvedAccountAddress) {
     throw new Error("Destination must be a valid Stellar public key (G…).");
   }
 
@@ -1178,6 +1674,8 @@ export async function pathPaymentWithFreighter({
     isStrictReceive ? sendMax : destMin,
     isStrictReceive ? "Maximum to send" : "Minimum received"
   );
+
+  const resolvedDestination = await resolveFederationAddress(destination);
 
   const operation = isStrictReceive
     ? StellarSdk.Operation.pathPaymentStrictReceive({
@@ -1421,6 +1919,131 @@ export async function setAccountOptionsWithFreighter(publicKey, options = {}) {
   return signAndSubmit(transaction, publicKey);
 }
 
+/** Claw back part of a holder's balance for an asset the issuer controls. */
+export async function clawbackWithFreighter(
+  issuer,
+  holder,
+  assetCode,
+  assetIssuer,
+  amount
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(holder)) {
+    throw new Error("Holder must be a valid Stellar public key (G…).");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(assetIssuer)) {
+    throw new Error("Asset issuer must be a valid Stellar public key (G…).");
+  }
+  if (assetIssuer !== issuer) {
+    throw new Error("Only the asset issuer can claw back a balance.");
+  }
+
+  const clawbackAmount = normalizeAmount(amount, "Clawback amount");
+  const asset = resolvePaymentAsset({
+    isNative: false,
+    code: assetCode,
+    issuer: assetIssuer,
+  });
+
+  const holderBalance = await getAccountAssetBalance(
+    holder,
+    asset.getCode(),
+    assetIssuer
+  );
+  if (amountToStroops(clawbackAmount) > amountToStroops(holderBalance)) {
+    throw new Error(
+      `Clawback amount exceeds the holder's ${asset.getCode()} balance of ${holderBalance}.`
+    );
+  }
+
+  const sourceAccount = await getServer().loadAccount(issuer);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.clawback({
+        asset,
+        amount: clawbackAmount,
+        from: holder,
+      })
+    )
+    .setTimeout(180)
+    .build();
+
+  return signAndSubmit(transaction, issuer);
+}
+
+/** Sponsor a trustline: the sponsor and the sponsored account both sign. */
+export async function sponsorTrustlineWithFreighter({
+  publicKey,
+  sponsoredAccount,
+  assetCode,
+  assetIssuer,
+  limit = "1000000",
+} = {}) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(sponsoredAccount)) {
+    throw new Error("Sponsored account must be a valid Stellar public key (G…).");
+  }
+  if (sponsoredAccount === publicKey) {
+    throw new Error("You cannot sponsor a trustline for the connected account.");
+  }
+
+  const code = (assetCode || "").trim().toUpperCase();
+  if (!code || code.length > 12) {
+    throw new Error("Asset code must be 1–12 characters.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(assetIssuer)) {
+    throw new Error("Issuer must be a valid Stellar public key (G…).");
+  }
+
+  const asset = new StellarSdk.Asset(code, assetIssuer);
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  })
+    .addOperation(
+      StellarSdk.Operation.beginSponsoringFutureReserves({
+        sponsoredId: sponsoredAccount,
+      })
+    )
+    .addOperation(
+      StellarSdk.Operation.changeTrust({
+        asset,
+        limit: limit.toString(),
+        source: sponsoredAccount,
+      })
+    )
+    .addOperation(
+      StellarSdk.Operation.endSponsoringFutureReserves({ source: publicKey })
+    )
+    .setTimeout(180)
+    .build();
+
+  const sponsorSigned = await signWithFreighter(
+    transaction.toXDR(),
+    publicKey
+  );
+  if (!hasSignatureFrom(sponsorSigned, publicKey)) {
+    throw new Error("Freighter did not return the sponsor signature.");
+  }
+
+  const fullySigned = await signWithFreighter(
+    sponsorSigned.toXDR(),
+    sponsoredAccount
+  );
+  if (!hasSignatureFrom(fullySigned, sponsoredAccount)) {
+    throw new Error(
+      "Both the sponsor and the sponsored account must sign the envelope."
+    );
+  }
+
+  return getServer().submitTransaction(fullySigned);
+}
+
 /**
  * Authorize or revoke one holder's trustline with `allowTrust`.
  *
@@ -1555,24 +2178,47 @@ export function mapKitewellEvents(rawEvents = [], contractId) {
       const common = {
         id: event.id ?? `${event.ledger ?? event.ledgerSeq ?? 0}-${kind}`,
         ledger: event.ledger ?? event.ledgerSeq ?? null,
+        functionName: kind ?? null,
       };
 
       if (kind === "register") {
         const [name, isNew] = Array.isArray(value) ? value : [null, null];
+        // Only treat as a register event when topic[1] is an address ScVal
+        const topic1Raw = topic[1];
+        const isAddressTopic =
+          topic1Raw &&
+          typeof topic1Raw.switch === "function" &&
+          topic1Raw.switch().value === 18; // scvAddress
+        const caller = isAddressTopic ? nativeOrValue(topic1Raw) : null;
+        if (isAddressTopic && caller && StellarSdk.StrKey.isValidEd25519PublicKey(caller)) {
+          return {
+            ...common,
+            type: "register",
+            functionName: "register",
+            caller,
+            name: name ?? null,
+            isNew: Boolean(isNew),
+          };
+        }
+        // Non-address register topic: treat as unknown
         return {
           ...common,
-          type: "register",
-          caller: topic[1] ? nativeOrValue(topic[1]) : null,
-          name: name ?? null,
-          isNew: Boolean(isNew),
+          type: "unknown",
+          functionName: null,
+          topics: topic.map((t) => nativeOrValue(t) ?? null),
         };
       }
       if (kind === "paused") {
-        return { ...common, type: "paused", paused: Boolean(value) };
+        return { ...common, type: "paused", functionName: "set_paused", paused: Boolean(value) };
       }
-      return null;
-    })
-    .filter(Boolean);
+      // Unknown event type: keep with raw topics
+      return {
+        ...common,
+        type: "unknown",
+        functionName: null,
+        topics: topic.map((t) => nativeOrValue(t) ?? null),
+      };
+    });
 }
 
 /**
@@ -1706,6 +2352,120 @@ export async function readContractTTL(contractId) {
   }
 
   return { instanceTTL, codeTTL, wasmHash, currentLedger };
+}
+
+/**
+ * Read the live-until ledger for a contract instance and compare it with the
+ * latest ledger so the UI can show how many ledgers remain.
+ */
+export async function readContractInstanceTtl(contractId) {
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const response = await sorobanRpc.getLedgerEntries(contract.getFootprint());
+  const latestLedger = response.latestLedger ?? 0;
+  const liveUntilLedgerSeq = response.entries?.[0]?.liveUntilLedgerSeq ?? null;
+
+  return {
+    latestLedger,
+    liveUntilLedgerSeq,
+    ledgersRemaining: liveUntilLedgerSeq
+      ? Math.max(0, liveUntilLedgerSeq - latestLedger)
+      : 0,
+  };
+}
+
+/** Extend a contract instance's TTL with a Freighter-signed Soroban tx. */
+export async function extendContractTtlWithFreighter(
+  publicKey,
+  contractId,
+  extendTo,
+  options = {}
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
+  }
+
+  const target = Number(extendTo);
+  if (!Number.isSafeInteger(target) || target <= 0) {
+    throw new Error("Extend to a valid positive ledger number.");
+  }
+
+  const currentDeadline =
+    options.currentDeadline ??
+    (await readContractInstanceTtl(contractId)).liveUntilLedgerSeq ??
+    0;
+  if (target <= currentDeadline) {
+    throw new Error(
+      `New deadline must be later than the current one (${currentDeadline}).`
+    );
+  }
+
+  const contract = new StellarSdk.Contract(contractId);
+  const sourceAccount = await sorobanRpc.getAccount(publicKey);
+  const latestLedger =
+    options.latestLedger ??
+    (await sorobanRpc.getLatestLedger()).sequence ??
+    0;
+  const sorobanData = new StellarSdk.SorobanDataBuilder()
+    .setFootprint([contract.getFootprint()], [])
+    .setResourceFee("100")
+    .build();
+
+  // extendTo is relative to the latest ledger, not an absolute sequence.
+  const extendBy = target - latestLedger;
+  if (extendBy <= 0) {
+    throw new Error(
+      `New deadline (${target}) must be later than the latest ledger (${latestLedger}).`
+    );
+  }
+
+  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+    sorobanData,
+  })
+    .addOperation(StellarSdk.Operation.extendFootprintTtl({ extendTo: extendBy }))
+    .setTimeout(180)
+    .build();
+
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(
+      `TTL extension rejected by the network. Tx hash: ${sendResult.hash}`
+    );
+  }
+
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return {
+        hash: sendResult.hash,
+        liveUntilLedgerSeq: target,
+        confirmed: true,
+      };
+    }
+    if (status.status === "FAILED") {
+      throw new Error(
+        `TTL extension failed on-chain. Tx hash: ${sendResult.hash}`
+      );
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  return {
+    hash: sendResult.hash,
+    liveUntilLedgerSeq: target,
+    confirmed: false,
+  };
 }
 
 export async function preparePaymentWithFreighter(

@@ -34,7 +34,9 @@ import {checkFreighterInstalled,
   listKitewellBuilders,
   readKitewellBuilder,
   createSponsoredAccountDraft,
-  sponsorAccountCreationWithFreighter, preparePaymentWithFreighter, confirmPaymentWithFreighter, createAccountWithFreighter, parseSep7PayUri, checkSorobanRpcHealth, TRANSACTION_FEE_STROOPS, deployKitewellContract, } from "./freighter";
+  sponsorAccountCreationWithFreighter,
+  deployKitewellContract,
+} from "./freighter";
 import {
   appendBuilderPage,
   isBuilderCountMismatch,
@@ -52,7 +54,10 @@ import {fundWithFriendbot,
   getAccountDetails,
   getOpenOffers,
   getPendingTransactions,
+  getClaimableBalances,
+  getOutgoingSponsorships,
   getSponsoredClaimableBalances,
+  getOrderBook,
   getAccountTrades,
   isHorizonSlowdownError,
   HORIZON_SLOWDOWN_MESSAGE,
@@ -60,7 +65,8 @@ import {fundWithFriendbot,
   liquidityPoolDeposit,
   liquidityPoolWithdraw,
   getTransactions,
-  
+  groupPaymentsByDay,
+  resolveFederationAddress,
   explorerAccountUrl,
   explorerTxUrl,
   downloadAccountSnapshot,
@@ -79,7 +85,17 @@ import {
   readStoredOrderBookPair,
   saveOrderBookPair,
 } from "./orderBookPair";
+import {
+  assertTradablePair,
+  offerPriceFractionFromRow,
+  orderBookFailureMessage,
+} from "./orderBook";
 import { poolShareRows } from "./poolShare";
+import {
+  clearSendFormMemory,
+  readStoredSendForm,
+  saveSendFormMemory,
+} from "./sendFormMemory";
 import {
   calculateMinimumBalance,
   formatStroops,
@@ -257,16 +273,20 @@ export default function App() {
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
   const [transactionFailure, setTransactionFailure] = useState(null);
-  const [sendForm, setSendForm] = useState({
-    destination: "",
-    amount: "",
-    assetKey: "native",
-    memoType: "text",
-    memo: "",
-    minTime: "",
-    maxTime: "",
+  const [sendForm, setSendForm] = useState(() => {
+    const remembered = readStoredSendForm();
+    return {
+      destination: remembered.destination,
+      amount: "",
+      assetKey: remembered.assetKey,
+      memoType: "text",
+      memo: "",
+      minTime: "",
+      maxTime: "",
+    };
   });
   const [sendPrepared, setSendPrepared] = useState(null);
+  const restoredAssetCheckedRef = useRef(false);
 
   const updateSendForm = (changes) => {
     setSendForm((previous) => ({
@@ -307,6 +327,8 @@ export default function App() {
     amount: "",
   });
   const [offerList, setOfferList] = useState([]);
+  const [orderBook, setOrderBook] = useState(null);
+  const [orderBookError, setOrderBookError] = useState(null);
   const [loadingOffers, setLoadingOffers] = useState(false);
   const [pathResult, setPathResult] = useState(null);
   const [pathQuote, setPathQuote] = useState(null);
@@ -318,6 +340,8 @@ export default function App() {
   const [simulatedRegisterKey, setSimulatedRegisterKey] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
+  const [outgoingSponsorships, setOutgoingSponsorships] = useState(null);
+  const [sponsorshipsError, setSponsorshipsError] = useState(null);
   const [builderAddress, setBuilderAddress] = useState("");
   const [builderLookupResult, setBuilderLookupResult] = useState(null);
   const [builderLookupError, setBuilderLookupError] = useState(null);
@@ -517,12 +541,49 @@ export default function App() {
     return () => { cancelled = true; };
   }, [activeTab, bookPair, bookKey]);
 
+  /** The offer form's selected balance descriptor, or null when unset. */
+  const offerAsset = (side) =>
+    balances.find((b) => b.key === offerForm[`${side}AssetKey`]) ?? null;
+
+  const fillOfferPrice = (row) => {
+    const { numerator, denominator } = offerPriceFractionFromRow(row);
+    updateOfferForm({ priceNumerator: numerator, priceDenominator: denominator });
+  };
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
   }, []);
 
   useEffect(() => () => cancelHorizonReads(), []);
+
+  // Outgoing sponsorships are a read-only Horizon view. Reload them when the
+  // connected account or the selected network changes.
+  useEffect(() => {
+    if (!publicKey) {
+      setOutgoingSponsorships([]);
+      setSponsorshipsError(null);
+      return undefined;
+    }
+
+    let cancelled = false;
+    setOutgoingSponsorships(null);
+    setSponsorshipsError(null);
+    getOutgoingSponsorships(publicKey)
+      .then((rows) => {
+        if (!cancelled) setOutgoingSponsorships(rows);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setOutgoingSponsorships([]);
+        setSponsorshipsError(
+          err.message || "Could not read sponsorships from Horizon."
+        );
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [publicKey, networkId]);
 
   useEffect(() => {
     if (activeTab !== "Offers" || !publicKey) return;
@@ -589,20 +650,21 @@ export default function App() {
     }
   }, [signers, signerWeights]);
 
-  const refreshReserve = useCallback(async () => {
-    try {
-      const baseReserve = await getLatestBaseReserve();
-      setBaseReserveInStroops(baseReserve);
-      setReserveError(null);
-    } catch (error) {
-      setBaseReserveInStroops(null);
-      setReserveError(
-        error.message || "Could not load the latest ledger reserve from Horizon."
-      );
-    }
-  }, []);
+  // Balances arrive after the restored form is rendered. Reconcile the
+  // remembered asset once they do: an asset no longer held is left blank and
+  // dropped from storage, while the remembered destination stays.
+  useEffect(() => {
+    if (restoredAssetCheckedRef.current || balances.length === 0) return;
+    restoredAssetCheckedRef.current = true;
+    const stored = readStoredSendForm(balances);
+    setSendForm((previous) =>
+      previous.assetKey === stored.assetKey
+        ? previous
+        : { ...previous, assetKey: stored.assetKey }
+    );
+  }, [balances]);
 
-const refreshBalances = useCallback(async () => {
+  const refreshBalances = useCallback(async () => {
     if (!publicKey) return;
     setLoading("balance");
     const signal = beginHorizonRead();
@@ -1191,6 +1253,10 @@ const refreshBalances = useCallback(async () => {
 
       const next = await getAccountBalances(publicKey);
       setBalances(next);
+      saveSendFormMemory(
+        { destination: sendForm.destination, assetKey: sendForm.assetKey },
+        next
+      );
       setSendPrepared(null);
 
       setSendForm({
@@ -1259,6 +1325,12 @@ const refreshBalances = useCallback(async () => {
       hops ? `Path applied: ${hops}` : "Direct path applied.",
       "info"
     );
+  };
+
+  const handleClearSendFormMemory = () => {
+    clearSendFormMemory();
+    updateSendForm({ destination: "", assetKey: "native" });
+    showToast("Cleared the remembered destination and asset.", "info");
   };
 
   const handlePathPayment = async (e) => {
@@ -1340,6 +1412,108 @@ const refreshBalances = useCallback(async () => {
 
 
 
+    const gate = submitGuardRef.current.begin(
+      "clawback",
+      `${asset.key}|${clawbackForm.holder}|${clawbackForm.amount}`
+    );
+    if (!gate.allowed) return;
+
+    setLoading("clawback");
+    try {
+      const result = await clawbackWithFreighter(
+        publicKey,
+        clawbackForm.holder,
+        asset.code,
+        asset.issuer,
+        clawbackForm.amount
+      );
+      trackSubmission(result.hash, "clawback");
+      setClawbackForm((previous) => ({
+        ...previous,
+        holder: "",
+        amount: "",
+      }));
+      showToast(
+        `Clawback submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (err) {
+      showToast(err.message || "Clawback failed.", "error");
+    } finally {
+      submitGuardRef.current.end("clawback");
+      setLoading("");
+    }
+  };
+
+  const handleSponsor = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!sponsorForm.sponsoredAccount) {
+      return showToast("Sponsored account is required.", "error");
+    }
+    if (!sponsorForm.code || !sponsorForm.issuer) {
+      return showToast("Asset code and issuer are required.", "error");
+    }
+
+    const gate = submitGuardRef.current.begin(
+      "sponsor",
+      `${sponsorForm.sponsoredAccount}|${sponsorForm.code}|${sponsorForm.issuer}`
+    );
+    if (!gate.allowed) return;
+
+    setLoading("sponsor");
+    try {
+      const result = await sponsorTrustlineWithFreighter({
+        publicKey,
+        sponsoredAccount: sponsorForm.sponsoredAccount,
+        assetCode: sponsorForm.code,
+        assetIssuer: sponsorForm.issuer,
+      });
+      trackSubmission(result.hash, "sponsorTrustline");
+      setSponsorForm({ sponsoredAccount: "", code: "", issuer: "" });
+      showToast(
+        `Sponsored trustline submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (err) {
+      showToast(err.message || "Sponsored trustline failed.", "error");
+    } finally {
+      submitGuardRef.current.end("sponsor");
+      setLoading("");
+    }
+  };
+
+  const handleOrderBook = async () => {
+    setOrderBookError(null);
+    setOrderBook(null);
+
+    const selling = offerAsset("selling");
+    const buying = offerAsset("buying");
+    if (!selling || !buying) {
+      setOrderBookError("Choose both selling and buying assets first.");
+      return;
+    }
+
+    try {
+      // A pair of the same asset has no book to read.
+      assertTradablePair(selling, buying);
+    } catch (error) {
+      setOrderBookError(error.message);
+      return;
+    }
+
+    setLoading("order-book");
+    try {
+      setOrderBook(await getOrderBook(buildAsset(selling), buildAsset(buying)));
+    } catch (error) {
+      // Keep the offer form and say the book could not be read.
+      setOrderBookError(orderBookFailureMessage(error));
+    } finally {
+      setLoading("");
+    }
+  };
 
   const refreshOfferData = async () => {
     const [nextBalances, nextOffers] = await Promise.all([
@@ -3396,6 +3570,34 @@ return (
                       </a>
                     </div>
                   )}
+                  <div className="info-box">
+                    <span className="eyebrow">Sponsorships given</span>
+                    {sponsorshipsError ? (
+                      <p className="muted">{sponsorshipsError}</p>
+                    ) : outgoingSponsorships === null ? (
+                      <p className="muted">Reading sponsorships…</p>
+                    ) : outgoingSponsorships.length === 0 ? (
+                      <p className="muted">No outgoing sponsorships.</p>
+                    ) : (
+                      <ul className="balance-list">
+                        {outgoingSponsorships.map((sponsorship) => (
+                          <li
+                            key={`${sponsorship.sponsoredAccount}-${sponsorship.entryType}`}
+                            className="balance-row"
+                          >
+                            <div>
+                              <strong>
+                                {shortenAddress(sponsorship.sponsoredAccount)}
+                              </strong>
+                              <span className="muted balance-row__issuer">
+                                {sponsorship.entryType}
+                              </span>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
                   <div className="section__row">
                     <button className="btn btn--secondary" type="button" onClick={handleDisconnect}>
                       Disconnect
@@ -4105,6 +4307,18 @@ return (
                 Builds a payment op for XLM or a credit asset you hold. Review the unsigned
                 envelope XDR, then sign in Freighter to submit it to Horizon Testnet.
               </p>
+              <div className="section__row">
+                <p className="muted">
+                  The last destination and asset are remembered in this browser.
+                </p>
+                <button
+                  className="btn btn--secondary btn--sm"
+                  type="button"
+                  onClick={handleClearSendFormMemory}
+                >
+                  Clear remembered details
+                </button>
+              </div>
               <form onSubmit={handleSend} className="form">
                 <label className="label" htmlFor="sep7-uri">
                   SEP-7 payment URI
@@ -4155,6 +4369,7 @@ return (
                   value={sendForm.assetKey}
                   onChange={(e) => updateSendForm({ assetKey: e.target.value })}
                 >
+                  <option value="">Choose an asset</option>
                   <option value="native">XLM (native)</option>
                   {sep7Request?.assetKey && sep7Request.assetKey !== "native" &&
                     !balances.some((b) => b.key === sep7Request.assetKey) && (
@@ -4734,6 +4949,61 @@ return (
                       {loading === "offer-place" ? "Submitting…" : "Place offer"}
                     </button>
                   </form>
+
+                  <div className="section__row">
+                    <h3 className="subhead">Order book</h3>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={handleOrderBook}
+                      disabled={loading === "order-book"}
+                    >
+                      {loading === "order-book" ? "Loading…" : "Load order book"}
+                    </button>
+                  </div>
+                  <p className="muted">
+                    Best bids and asks for the offer pair, up to ten each. Choosing a row fills
+                    the offer price; it does not place an offer.
+                  </p>
+                  {orderBookError && (
+                    <p className="muted" role="alert">
+                      {orderBookError}
+                    </p>
+                  )}
+                  {orderBook && orderBook.isEmpty && (
+                    <p className="muted">No resting offers for this pair yet.</p>
+                  )}
+                  {orderBook && !orderBook.isEmpty && (
+                    <div className="order-book">
+                      {[
+                        { label: "Bids", rows: orderBook.bids },
+                        { label: "Asks", rows: orderBook.asks },
+                      ].map((side) => (
+                        <div key={side.label} className="order-book__side">
+                          <span className="eyebrow">{side.label}</span>
+                          {side.rows.length === 0 ? (
+                            <p className="muted">No {side.label.toLowerCase()}.</p>
+                          ) : (
+                            <ul className="order-book__rows">
+                              {side.rows.map((row, index) => (
+                                <li key={`${side.label}-${index}`}>
+                                  <button
+                                    className="order-book__row"
+                                    type="button"
+                                    onClick={() => fillOfferPrice(row)}
+                                    title="Fill the offer price from this row"
+                                  >
+                                    <span>{row.amount}</span>
+                                    <span>{row.price}</span>
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
                   <div className="section__row">
                     <h3 className="subhead">Active offers</h3>
@@ -6431,8 +6701,6 @@ return (
                   {loading === "history" ? "Loading…" : "Refresh"}
                 </button>
               </div>
-
-              {txWatchPanel}
             </div>
           )}
 

@@ -26,6 +26,11 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
               }),
             }),
           }),
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({ call: vi.fn().mockResolvedValue({ records: [{ base_reserve_in_stroops: "5000000" }] }) }),
+            }),
+          }),
         };
       }),
     },
