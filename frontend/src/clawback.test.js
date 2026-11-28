@@ -14,6 +14,14 @@ const { loadAccountMock, submitTransactionMock, signTransactionMock } =
   }));
 
 vi.mock("@stellar/freighter-api", () => ({
+  getNetwork: vi.fn().mockResolvedValue({
+    network: "TESTNET",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  }),
+  getNetworkDetails: vi.fn().mockResolvedValue({
+    network: "TESTNET",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  }),
   isConnected: vi.fn(),
   setAllowed: vi.fn(),
   getAddress: vi.fn(),
