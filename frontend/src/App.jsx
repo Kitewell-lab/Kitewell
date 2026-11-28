@@ -1,23 +1,18 @@
-import { useState, useCallback, useEffect, useRef } from "react";
-import * as StellarSdk from "@stellar/stellar-sdk";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import {
   checkFreighterInstalled,
   connectFreighterWallet,
   buildPaymentEnvelope,
-  buildUnsignedEnvelope,
   submitEnvelopeWithFreighter,
+  sendPaymentWithFreighter,
   pathPaymentWithFreighter,
   changeOfferPriceWithFreighter,
   changeTrustWithFreighter,
-  createClaimableBalanceWithFreighter,
-  claimClaimableBalanceWithFreighter,
+  revokeTrustlineSponsorshipWithFreighter,
   clawbackClaimableBalanceWithFreighter,
-  clawbackWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
-  readAdminState,
-  proposeAdminWithFreighter,
-  acceptAdminWithFreighter,
+  simulateRegisterBuilder,
   setAccountOptionsWithFreighter,
   allowTrustWithFreighter,
   readContractInstanceTtl,
@@ -27,23 +22,16 @@ import {
   readKitewellEvents,
   submitFailureResult,
   signChallengeWithFreighter,
-  simulateRegisterBuilder,
-  listKitewellBuilders,
-  readKitewellBuilder,
-  createSponsoredAccountDraft,
-  sponsorAccountCreationWithFreighter,
 } from "./freighter";
-import {
-  appendBuilderPage,
-  isBuilderCountMismatch,
-} from "./builderDirectory";
 import {
   createFailedSubmitLog,
   downloadFailedSubmitLog,
 } from "./failedSubmitLog";
-import { copyToClipboardResult } from "./copyToClipboardResult";
-import { shortenAddress } from "./addressFormat";
-import { generateAddressQrCode } from "./addressQr";
+import {
+  shortenAddress,
+  buildMuxedAddress,
+  splitMuxedAddress,
+} from "./addressFormat";
 import {
   fundWithFriendbot,
   buildAsset,
@@ -57,24 +45,19 @@ import {
   getAccountTrades,
   isHorizonSlowdownError,
   HORIZON_SLOWDOWN_MESSAGE,
+  getSponsoredTrustlines,
   getLiquidityPool,
-  liquidityPoolDeposit,
-  liquidityPoolWithdraw,
+  getOrderBook,
   getTransactions,
-  groupPaymentsByDay,
   explorerAccountUrl,
   explorerTxUrl,
-  downloadAccountSnapshot,
+  isHorizonSlowdownError,
+  HORIZON_SLOWDOWN_MESSAGE,
+  statusWatchHref,
   getAccountAuthConfig,
   getIssuedAssetTrustlines,
-  accountLedgerStatus,
   IMMUTABLE_CONFIRMATION,
-  getTransactionMemos,
-  buildPaymentsCsv,
-  PAYMENTS_CSV_FILENAME,
 } from "./stellar";
-import { downloadCsv } from "./csvExport";
-import { buildersToCsv } from "./builderCsv";
 import {
   clearStoredOrderBookPair,
   parseOrderBookPair,
@@ -82,41 +65,20 @@ import {
   saveOrderBookPair,
 } from "./orderBookPair";
 import { poolShareRows } from "./poolShare";
-import {
-  calculateMinimumBalance,
-  formatStroops,
-  minimumBalanceInStroops,
-  parseXlmToStroops,
-  remainsAboveMinimum,
-} from "./accountReserve";
 import { validatePaymentAmount } from "./validatePaymentAmount";
-import { filterTransactionHistory } from "./txHistoryFilter";
 import { fetchHealth, fetchNetworkInfo } from "./api";
-import {
-  describeEndSponsorship,
-  endSponsorshipWithFreighter,
-  hasEndSponsorshipAction,
-} from "./sponsorshipRevoke";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
 import { formatSimulationFee } from "./simulationFees";
-import { mapPaymentMemo } from "./paymentMemo";
 import {
   NETWORKS,
-  getActiveNetwork,
   getActiveNetworkId,
-  getAvailableNetworks,
   isFriendbotAvailable,
-  removeCustomNetwork,
-  saveCustomNetwork,
   setActiveNetwork,
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
-import { fetchPathQuote, formatPathHops } from "./paths";
+import { checkThresholds } from "./thresholdCheck";
 import { decodeTransactionEnvelope } from "./txInspector";
 import TransactionHashLookup from "./TransactionHashLookup";
-import SigningPassphraseConfirmation from "./SigningPassphraseConfirmation";
-import MultisigCosignPanel from "./MultisigCosignPanel";
-import LabAdminPanel from "./LabAdminPanel";
 import { completeWebAuthChallenge } from "./sep10WebAuth";
 import { loadIssuerCurrencyList } from "./issuerToml";
 import { createPaymentStreamController } from "./paymentStream";
@@ -126,42 +88,30 @@ import {
   watchTransactionStatus,
 } from "./txStatusWatch";
 import { buildTransactionExplorerUrl } from "./explorerLink";
-import {
-  canCallContract,
-  contractStatusLabel,
-  resolveContractStatus,
-  rpcCallBlockReason,
-} from "./contractStatus";
 import "./App.css";
 
 const TABS = [
   "Wallet",
   "Fund",
   "Assets",
+  "Offers",
+  "Issuer",
   "Send",
   "Path",
-  "Order",
+  "Offer",
+  "Book",
   "History",
-  "Trades",
+  "Pending",
   "Inspect",
   "Decode",
   "Issuer",
   "Web auth",
-  "Offers",
+  "Muxed",
   "Lab",
-  "Liquidity",
+  "Issue",
 ];
 const PENDING_REFRESH_MS = 8000;
 const EVENT_POLL_MS = 6000;
-const HIDE_ZERO_ASSETS_STORAGE_KEY = "kitewell.hideZeroCreditAssets";
-
-function readHideZeroAssetsPreference() {
-  try {
-    return globalThis.localStorage?.getItem(HIDE_ZERO_ASSETS_STORAGE_KEY) === "true";
-  } catch {
-    return false;
-  }
-}
 const PATH_MODE_FIELDS = {
   strictSend: {
     amountLabel: "Amount to send",
@@ -192,91 +142,39 @@ const MEMO_FIELDS = {
   },
 };
 
-function validatePositivePrice(value, label) {
-  const text = String(value ?? "").trim();
-  if (!/^\d+(?:\.\d+)?$/.test(text)) {
-    throw new Error(`${label} must be a positive decimal.`);
-  }
-  const price = Number(text);
-  if (!Number.isFinite(price) || price <= 0) {
-    throw new Error(`${label} must be greater than zero.`);
-  }
-  return text;
-}
-
 export default function App() {
   const [activeTab, setActiveTab] = useState("Wallet");
   const [publicKey, setPublicKey] = useState(null);
   const [networkId, setNetworkId] = useState(getActiveNetworkId());
-  const [qrCodeDataUrl, setQrCodeDataUrl] = useState(null);
-  const [customNetworkForm, setCustomNetworkForm] = useState({
-    name: "",
-    horizonUrl: "",
-    rpcUrl: "",
-    passphrase: "",
-  });
   const [freighterInstalled, setFreighterInstalled] = useState(null);
   const [balances, setBalances] = useState([]);
-  const [hideZeroCreditAssets, setHideZeroCreditAssets] = useState(
-    readHideZeroAssetsPreference
-  );
+  const [sponsoredTrustlines, setSponsoredTrustlines] = useState([]);
+  const [sponsoredTrustlinesLoading, setSponsoredTrustlinesLoading] = useState(false);
+  const [sponsoredTrustlinesError, setSponsoredTrustlinesError] = useState(null);
+  const [sponsoredTrustlineRefresh, setSponsoredTrustlineRefresh] = useState(0);
   const [claimableBalances, setClaimableBalances] = useState([]);
   const [liquidityPools, setLiquidityPools] = useState({});
-  const [liquidityForm, setLiquidityForm] = useState({
-    poolId: "",
-    mode: "deposit",
-    maxAmountA: "",
-    maxAmountB: "",
-    minPrice: "",
-    maxPrice: "",
-    amount: "",
-    minAmountA: "",
-    minAmountB: "",
-  });
   const [transactions, setTransactions] = useState([]);
   const [pendingTransactions, setPendingTransactions] = useState([]);
-  const [trades, setTrades] = useState([]);
-  const [tradesNextCursor, setTradesNextCursor] = useState(null);
   const [pendingError, setPendingError] = useState(null);
   const [nextCursor, setNextCursor] = useState(null);
-  const [pageCursors, setPageCursors] = useState([null]);
-  const [historyFilters, setHistoryFilters] = useState({
-    asset: "",
-    direction: "",
-  });
-  const [historyError, setHistoryError] = useState(null);
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
-  const [transactionFailure, setTransactionFailure] = useState(null);
   const [sendForm, setSendForm] = useState({
     destination: "",
     amount: "",
     assetKey: "native",
     memoType: "text",
     memo: "",
-    minTime: "",
-    maxTime: "",
   });
-  const [sendPrepared, setSendPrepared] = useState(null);
-
-  const updateSendForm = (changes) => {
-    setSendForm((previous) => ({
-      ...previous,
-      ...changes,
-    }));
-    setSendPrepared(null);
-    // Any edit changes the operation list, so the previewed envelope is stale.
-    setUnsignedEnvelope(null);
-    setSigningConfirmationOpen(false);
-  };
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
-  const [createAccountForm, setCreateAccountForm] = useState({
-    destination: "",
-    startingBalance: "",
-  });
-  const [baseReserveInStroops, setBaseReserveInStroops] = useState(null);
-  const [reserveError, setReserveError] = useState(null);
-  const [reserveSubentryCount, setReserveSubentryCount] = useState("0");
+  const [limitChangeForm, setLimitChangeForm] = useState({});
+  const [openOffers, setOpenOffers] = useState([]);
+  const [offerPrices, setOfferPrices] = useState({});
+  const [offerError, setOfferError] = useState(null);
+  const [offerLoading, setOfferLoading] = useState(false);
+  const [offerRefresh, setOfferRefresh] = useState(0);
+  const [offerResult, setOfferResult] = useState(null);
   const [pathForm, setPathForm] = useState({
     mode: "strictSend",
     destination: "",
@@ -290,41 +188,45 @@ export default function App() {
     destIssuer: "",
     path: "",
   });
-  const [offerForm, setOfferForm] = useState({
-    sellingAssetKey: "native",
-    buyingAssetKey: "",
-    priceNumerator: "1",
-    priceDenominator: "1",
+  const [issueForm, setIssueForm] = useState({
+    code: "",
+    destination: "",
     amount: "",
   });
-  const [offerList, setOfferList] = useState([]);
-  const [loadingOffers, setLoadingOffers] = useState(false);
   const [pathResult, setPathResult] = useState(null);
-  const [pathQuote, setPathQuote] = useState(null);
+  const [offerForm, setOfferForm] = useState({
+    sellingType: "native",
+    sellingCode: "",
+    sellingIssuer: "",
+    buyingType: "credit",
+    buyingCode: "",
+    buyingIssuer: "",
+    price: "",
+  });
+  const [orderBook, setOrderBook] = useState(null);
+  const [orderBookError, setOrderBookError] = useState(null);
+  const [bookPair, setBookPair] = useState(readStoredOrderBookPair);
+  const [bookResult, setBookResult] = useState(null);
+  const bookClearGenerationRef = useRef(0);
   const [unsignedEnvelope, setUnsignedEnvelope] = useState(null);
-  const [signingConfirmationOpen, setSigningConfirmationOpen] = useState(false);
   const [labInfo, setLabInfo] = useState(null);
   const [labError, setLabError] = useState(null);
   const [simulationFees, setSimulationFees] = useState(null);
-  const [simulatedRegisterKey, setSimulatedRegisterKey] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
-  const [builderAddress, setBuilderAddress] = useState("");
-  const [builderLookupResult, setBuilderLookupResult] = useState(null);
-  const [builderLookupError, setBuilderLookupError] = useState(null);
-  const [adminState, setAdminState] = useState(null);
-  const [proposeAdminForm, setProposeAdminForm] = useState({ address: "" });
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
-  const [renameForm, setRenameForm] = useState({ name: "" });
+  const [muxedBuildForm, setMuxedBuildForm] = useState({ gAddress: "", id: "" });
+  const [muxedBuildResult, setMuxedBuildResult] = useState(null);
+  const [muxedSplitForm, setMuxedSplitForm] = useState({ mAddress: "" });
+  const [muxedSplitResult, setMuxedSplitResult] = useState(null);
+  const [muxedError, setMuxedError] = useState(null);
   const [inspectForm, setInspectForm] = useState({ xdr: "" });
   const [inspectResult, setInspectResult] = useState(null);
   const [inspectError, setInspectError] = useState(null);
-  const [sessionContractId, setSessionContractId] = useState(null);
-  const [deployedContracts, setDeployedContracts] = useState([]);
-  const [wasmFile, setWasmFile] = useState(null);
-  const [confirmRedeploy, setConfirmRedeploy] = useState(false);
-  const [deployError, setDeployError] = useState(null);
+  const [envelopeXdr, setEnvelopeXdr] = useState("");
+  const [decodedEnvelope, setDecodedEnvelope] = useState(null);
+  const [decodeError, setDecodeError] = useState(null);
   const tabRefs = useRef([]);
   const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
@@ -343,6 +245,8 @@ export default function App() {
   });
   const [claimableResult, setClaimableResult] = useState(null);
   const [claimableToClaim, setClaimableToClaim] = useState([]);
+  const [selectedSigners, setSelectedSigners] = useState([]);
+  const [horizonNotice, setHorizonNotice] = useState(null);
   const [failedSubmits, setFailedSubmits] = useState([]);
   const failedSubmitLogRef = useRef(createFailedSubmitLog());
   const [webAuthForm, setWebAuthForm] = useState({ endpoint: "", serverAccount: "" });
@@ -392,43 +296,12 @@ export default function App() {
   const [ttlError, setTtlError] = useState(null);
   const [ttlForm, setTtlForm] = useState({ extendTo: "" });
   const [ttlResult, setTtlResult] = useState(null);
+  const [codeTtl, setCodeTtl] = useState(null);
+  const [codeTtlError, setCodeTtlError] = useState(null);
   const [labEvents, setLabEvents] = useState([]);
   const [labEventsError, setLabEventsError] = useState(null);
   const eventCursorRef = useRef(null);
   const eventStartLedgerRef = useRef(null);
-
-  // Replay read: one shot from a chosen ledger, separate from the live tail.
-  const [replayForm, setReplayForm] = useState("");
-  const [replayEvents, setReplayEvents] = useState([]);
-  const [replayError, setReplayError] = useState(null);
-
-  // Paged list of registered builders (contract index).
-  const [builderList, setBuilderList] = useState(null);
-  const [builderListError, setBuilderListError] = useState(null);
-
-  // Sponsored account creation: draft XDR for the new account to co-sign.
-  const [sponsorForm, setSponsorForm] = useState({
-    newAccount: "",
-    coSignedXdr: "",
-  });
-  const [sponsorDraft, setSponsorDraft] = useState(null);
-  const [sponsorResult, setSponsorResult] = useState(null);
-
-  // Issue #668: ending one sponsorship from the list.
-  const [endSponsorForm, setEndSponsorForm] = useState({
-    sponsoredAccount: "",
-    assetCode: "",
-    assetIssuer: "",
-  });
-  const [endSponsorConfirmation, setEndSponsorConfirmation] = useState(null);
-  const [endSponsorResult, setEndSponsorResult] = useState(null);
-
-  // One offer watch at a time; aborting the controller only stops polling.
-  const [offerWatchId, setOfferWatchId] = useState("");
-  const [offerWatch, setOfferWatch] = useState(null);
-  const [offerWatchError, setOfferWatchError] = useState(null);
-  const offerWatchRef = useRef(null);
-  const offerWatchTokenRef = useRef(0);
 
   const showToast = (message, type = "success", explorerUrl = null) => {
     setToast({ message, type, explorerUrl });
@@ -462,57 +335,31 @@ export default function App() {
     downloadFailedSubmitLog(failedSubmitLogRef.current);
   };
 
-  const handleDownloadAccountSnapshot = async () => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading("snapshot");
-    try {
-      await downloadAccountSnapshot(publicKey);
-      showToast("Account snapshot downloaded.");
-    } catch (e) {
-      showToast(e.message || "Could not download account snapshot.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
   const xlmBalance = balances.find((b) => b.isNative)?.balance ?? null;
   const assetBalances = balances.filter((b) => !b.isPoolShare);
-  const visibleAssetBalances = filterVisibleBalances(
-    assetBalances,
-    hideZeroCreditAssets
-  );
   const poolShares = poolShareRows(balances, liquidityPools);
   const memoField = MEMO_FIELDS[sendForm.memoType];
-  const activeNetwork = getActiveNetwork();
+  const activeNetwork = NETWORKS[networkId];
   const friendbotAvailable = isFriendbotAvailable();
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
-  const pathSendAsset = {
-    isNative: pathForm.sendAssetType === "native",
-    code: pathForm.sendCode,
-    issuer: pathForm.sendIssuer,
-  };
-  const pathDestAsset = {
-    isNative: pathForm.destAssetType === "native",
-    code: pathForm.destCode,
-    issuer: pathForm.destIssuer,
-  };
-  const updatePathForm = (changes) => {
-    setPathForm((prev) => ({ ...prev, ...changes }));
-    // Editing the request invalidates any quote from the previous form state.
-    setPathQuote(null);
-  };
+  const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
   const updateOfferForm = (changes) => setOfferForm((prev) => ({ ...prev, ...changes }));
+  // Any edit changes the operation list, so the previewed envelope is stale.
+  const updateSendForm = (changes) => {
+    setSendForm((prev) => ({ ...prev, ...changes }));
+    setUnsignedEnvelope(null);
+  };
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
-  const selectedComposeAsset = balances.find((b) => b.key === composeForm.assetKey);
+  const muxedSendBase = (() => {
+    const value = sendForm.destination.trim();
+    if (!value) return null;
+    try {
+      return splitMuxedAddress(value).gAddress;
+    } catch {
+      return null;
+    }
+  })();
   const configuredContractId = labInfo?.network?.contract?.kitewell;
-  // The Lab must know whether the instance entry is live or archived before it
-  // offers an RPC call: an archived instance fails every invocation.
-  const contractStatus = resolveContractStatus({
-    contractId: configuredContractId,
-    state: labState,
-    error: labStateError,
-  });
-  const contractCallBlock = rpcCallBlockReason(contractStatus);
   const parsedBookPair = parseOrderBookPair(bookPair);
   const bookKey = JSON.stringify([networkId, bookPair.selling, bookPair.buying]);
   const currentBookResult = bookResult?.key === bookKey ? bookResult : null;
@@ -549,6 +396,40 @@ export default function App() {
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
   }, []);
+
+  useEffect(() => {
+    if (!publicKey) return;
+
+    let cancelled = false;
+    const controller = new AbortController();
+
+    Promise.resolve()
+      .then(() => {
+        if (cancelled) return null;
+        setSponsoredTrustlines([]);
+        setSponsoredTrustlinesError(null);
+        setSponsoredTrustlinesLoading(true);
+        return getSponsoredTrustlines(publicKey, { signal: controller.signal });
+      })
+      .then((trustlines) => {
+        if (!cancelled && trustlines) setSponsoredTrustlines(trustlines);
+      })
+      .catch((error) => {
+        if (cancelled || error?.name === "AbortError") return;
+        setSponsoredTrustlines([]);
+        setSponsoredTrustlinesError(
+          error.message || "Could not load sponsored trustlines."
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setSponsoredTrustlinesLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [publicKey, networkId, sponsoredTrustlineRefresh]);
 
   useEffect(() => () => cancelHorizonReads(), []);
 
@@ -608,14 +489,83 @@ export default function App() {
     };
   }, [balances]);
 
-  // Keep signerWeights in sync with signers
+  // Issue #512: payments stream only while the history tab is open on a
+  // connected account. Every way the issue closes the stream names itself here,
+  // and a network switch is handled by `start`, which closes the old stream
+  // before opening the new one.
   useEffect(() => {
-    if (signers.length !== signerWeights.length) {
-      // Initialize or trim weights to match signers count
-      const newWeights = signers.map(() => 0);
-      setSignerWeights(newWeights);
+    const previous = streamSessionRef.current;
+
+    if (activeTab !== "History" || !publicKey) {
+      if (paymentStream.isOpen()) {
+        paymentStream.stop(
+          !publicKey
+            ? "disconnect"
+            : previous?.networkId !== networkId
+              ? "network-change"
+              : "tab-hidden"
+        );
+      }
+      streamSessionRef.current = null;
+      return;
     }
-  }, [signers.length, signerWeights.length]);
+
+    if (
+      paymentStream.isOpen() &&
+      previous &&
+      previous.publicKey === publicKey &&
+      previous.networkId === networkId
+    ) {
+      return;
+    }
+
+    streamSessionRef.current = { publicKey, networkId };
+    try {
+      paymentStream.start({ publicKey, networkId });
+    } catch (err) {
+      paymentStream.fail(err);
+    }
+  }, [activeTab, publicKey, networkId, paymentStream]);
+
+  useEffect(
+    () => () => {
+      if (paymentStream.isOpen()) paymentStream.stop("tab-hidden");
+      streamSessionRef.current = null;
+    },
+    [paymentStream]
+  );
+
+  // Issue #513: one watch runs at a time, so a token makes an older watch's
+  // remaining polls invisible instead of letting two hashes fight over the box.
+  const startTxWatch = useCallback(
+    (hash) => {
+      const token = watchTokenRef.current + 1;
+      watchTokenRef.current = token;
+      setTxWatchError(null);
+      setTxWatch({
+        hash,
+        attempts: 0,
+        ...txStatusPresentation({
+          status: "pending",
+          explorerUrl: buildTransactionExplorerUrl(networkId, hash),
+        }),
+      });
+
+      watchTransactionStatus({
+        hash,
+        networkId,
+        onUpdate: (snapshot) => {
+          if (watchTokenRef.current !== token) return;
+          setTxWatch({ ...snapshot, ...txStatusPresentation(snapshot) });
+        },
+      }).catch((err) => {
+        if (watchTokenRef.current !== token) return;
+        setTxWatch(null);
+        setTxWatchError(err.message || "The transaction watch could not read this hash.");
+      });
+    },
+    [networkId]
+  );
 
   const refreshBalances = useCallback(async () => {
     if (!publicKey) return;
@@ -625,34 +575,24 @@ export default function App() {
       const next = await getAccountBalances(publicKey, { signal });
       setBalances(next);
       setHorizonNotice(null);
-      const claimables = await getSponsoredClaimableBalances(publicKey).catch(() => []);
+      const claimables = await getClaimableBalances(publicKey).catch(() => []);
       setClaimableBalances(claimables);
       getClaimableBalancesForClaimant(publicKey)
         .then((rows) => setClaimableToClaim(rows))
         .catch(() => setClaimableToClaim([]));
       try {
         const details = await getAccountDetails(publicKey, { signal });
-        const latestLedger = await fetchLatestHorizonLedger(
-          activeNetwork.horizonUrl
-        ).catch(() => null);
-        setAccountDetails({
-          ...details,
-          ledgerStatus: accountLedgerStatus(
-            details.lastModifiedLedger,
-            latestLedger
-          ),
-        });
+        setAccountDetails(details);
       } catch (detailsError) {
         if (detailsError?.name === "AbortError") return;
         if (isHorizonSlowdownError(detailsError)) {
           setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
           showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
-        } else {
-          setAccountDetails(null);
         }
+        setAccountDetails(null);
       }
-      await refreshReserve();
     } catch (error) {
+      if (error?.name === "AbortError") return;
       setBalances([]);
       setClaimableBalances([]);
       if (isHorizonSlowdownError(error)) {
@@ -665,14 +605,14 @@ export default function App() {
     } finally {
       setLoading("");
     }
-  }, [activeNetwork, publicKey]);
+  }, [publicKey]);
 
-  const handleClawbackClaimable = async (balance) => {
+  const handleClawback = async (balance) => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     setLoading(`clawback-${balance.id}`);
     try {
       await clawbackClaimableBalanceWithFreighter(publicKey, balance.id);
-      const next = await getSponsoredClaimableBalances(publicKey).catch(() => []);
+      const next = await getClaimableBalances(publicKey).catch(() => []);
       setClaimableBalances(next);
       showToast(`${balance.code} claimable balance clawed back.`);
     } catch (err) {
@@ -683,187 +623,20 @@ export default function App() {
     }
   };
 
-  const refreshAccountDetails = async () => {
-    if (!publicKey) return;
-    try {
-      setAccountDetails(await getAccountDetails(publicKey));
-    } catch {
-      setAccountDetails(null);
-    }
-  };
-
-  const handleSetData = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!dataForm.name) return showToast("Data name is required.", "error");
-
-    setLoading("data-set");
-    try {
-      await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
-      setDataForm({ name: "", value: "" });
-      await refreshAccountDetails();
-      showToast("Account data submitted.");
-    } catch (err) {
-      showToast(err.message || "Could not set account data.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleClearData = async (name) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading(`data-clear-${name}`);
-    try {
-      await manageDataWithFreighter(publicKey, name, null);
-      await refreshAccountDetails();
-      showToast(`Cleared account data "${name}".`);
-    } catch (err) {
-      showToast(err.message || `Could not clear "${name}".`, "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleMergeAccount = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading("merge");
-    try {
-      const result = await mergeAccountWithFreighter(
-        publicKey,
-        mergeForm.destination,
-        mergeForm.retypeDestination
-      );
-      showToast(
-        `Account merge submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-      setPublicKey(null);
-      setBalances([]);
-      setTransactions([]);
-      setAccountDetails(null);
-      setMergeForm({ destination: "", retypeDestination: "" });
-    } catch (err) {
-      showToast(err.message || "Account merge failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleClaimableRefresh = useCallback(async () => {
-    if (!publicKey) return;
-    setLoading("claimable-list");
-    try {
-      setClaimableBalances(await getSponsoredClaimableBalances(publicKey));
-    } catch (err) {
-      setClaimableBalances([]);
-      showToast(err.message || "Could not load claimable balances.", "error");
-    } finally {
-      setLoading("");
-    }
-  }, [publicKey]);
-
-  const handleCreateClaimable = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!claimableForm.claimant) {
-      return showToast("Claimant is required.", "error");
-    }
-    const selected = balances.find((b) => b.key === claimableForm.assetKey);
-    if (!selected) return showToast("Choose an asset you hold.", "error");
-    if (parseFloat(claimableForm.amount) > parseFloat(selected.balance)) {
-      return showToast(
-        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
-        "error"
-      );
-    }
-    setLoading("claimable-create");
-    setClaimableResult(null);
-    try {
-      const asset = selected.isNative
-        ? { isNative: true }
-        : { isNative: false, code: selected.code, issuer: selected.issuer };
-      const result = await createClaimableBalanceWithFreighter({
-        publicKey,
-        claimant: claimableForm.claimant,
-        amount: claimableForm.amount,
-        asset,
-        predicateMode: claimableForm.predicateMode,
-        ledgerTime: claimableForm.ledgerTime,
-      });
-      setClaimableResult({ type: "created", hash: result.hash });
-      setClaimableForm({
-        claimant: "",
-        amount: "",
-        assetKey: "native",
-        predicateMode: "unconditional",
-        ledgerTime: "",
-      });
-      try {
-        setBalances(await getAccountBalances(publicKey));
-      } catch {
-        /* balances refresh separately */
-      }
-      showToast(
-        `Claimable balance created · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Could not create claimable balance.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleClaimClaimable = async (balance) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading(`claimable-${balance.id}`);
-    try {
-      const result = await claimClaimableBalanceWithFreighter(publicKey, balance.id);
-      setClaimableResult({
-        type: "claimed",
-        hash: result.hash,
-        balanceId: balance.id,
-      });
-      await handleClaimableRefresh();
-      try {
-        setBalances(await getAccountBalances(publicKey));
-      } catch {
-        /* balances refresh separately */
-      }
-      showToast(
-        `Claimable balance claimed · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Could not claim balance.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
   const handleConnect = async () => {
     setLoading("connect");
     try {
       const address = await connectFreighterWallet();
-      submitGuardRef.current.reset();
       setPublicKey(address);
-      // Generate a scannable QR code for the connected public address.
-      setQrCodeDataUrl(await generateAddressQrCode(address));
       setBalances([]);
+      setSponsoredTrustlines([]);
+      setSponsoredTrustlinesError(null);
+      setSponsoredTrustlinesLoading(false);
       setOpenOffers([]);
       setOfferPrices({});
       setOfferResult(null);
       setClaimableBalances([]);
       setTransactions([]);
-      setNextCursor(null);
-      setPageCursors([null]);
-      setHistoryError(null);
-      setSimulationFees(null);
-      setSimulatedRegisterKey(null);
       setPendingTransactions([]);
       setPendingError(null);
       showToast("Freighter connected.");
@@ -872,11 +645,6 @@ export default function App() {
         setBalances(next);
       } catch {
         /* unfunded until Friendbot */
-      }
-      try {
-        setAccountDetails(await getAccountDetails(address));
-      } catch {
-        setAccountDetails(null);
       }
     } catch (e) {
       showToast(e.message || "Failed to connect Freighter.", "error");
@@ -889,18 +657,14 @@ export default function App() {
     failedSubmitLogRef.current.clear();
     setFailedSubmits([]);
     setPublicKey(null);
-    setQrCodeDataUrl(null);
-    setQrCodeDataUrl(null);
     setBalances([]);
+    setSponsoredTrustlines([]);
+    setSponsoredTrustlinesError(null);
+    setSponsoredTrustlinesLoading(false);
     setOpenOffers([]);
     setOfferPrices({});
     setOfferResult(null);
     setTransactions([]);
-    setNextCursor(null);
-    setPageCursors([null]);
-    setHistoryError(null);
-    setSimulationFees(null);
-    setSimulatedRegisterKey(null);
     setPendingTransactions([]);
     setPendingError(null);
     setAccountDetails(null);
@@ -913,90 +677,26 @@ export default function App() {
   const handleNetworkChange = (id) => {
     try {
       cancelHorizonReads();
-      // The watched offer id belongs to the old network's book.
-      offerWatchRef.current?.controller.abort();
-      offerWatchRef.current = null;
-      setOfferWatch(null);
-      setOfferWatchError(null);
       setHorizonNotice(null);
       const next = setActiveNetwork(id);
-      submitGuardRef.current.reset();
       setNetworkId(id);
       setBalances([]);
+      setSponsoredTrustlines([]);
+      setSponsoredTrustlinesError(null);
+      setSponsoredTrustlinesLoading(false);
       setOpenOffers([]);
       setOfferPrices({});
       setOfferResult(null);
       setTransactions([]);
-      setNextCursor(null);
-      setPageCursors([null]);
-      setHistoryError(null);
       setPendingTransactions([]);
-      setSimulationFees(null);
-      setSimulatedRegisterKey(null);
       setPendingError(null);
       setAccountDetails(null);
-      setUnsignedEnvelope(null);
-      setSigningConfirmationOpen(false);
       setInspectResult(null);
       setInspectError(null);
-      setBaseReserveInStroops(null);
-      setReserveError(null);
-      setReserveSubentryCount("0");
       showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
       if (publicKey) refreshBalances();
-      else if (activeTab === "Assets") refreshReserve();
     } catch (e) {
       showToast(e.message || "Could not switch network.", "error");
-    }
-  };
-
-  const handleSaveCustomNetwork = (event) => {
-    event.preventDefault();
-    try {
-      const network = saveCustomNetwork(customNetworkForm);
-      handleNetworkChange(network.id);
-      showToast(`Saved and selected ${network.label}.`, "info");
-    } catch (error) {
-      showToast(error.message || "Could not save custom network.", "error");
-    }
-  };
-
-  const handleRemoveCustomNetwork = () => {
-    const network = removeCustomNetwork();
-    setNetworkId(network.id);
-    setCustomNetworkForm({ name: "", horizonUrl: "", rpcUrl: "", passphrase: "" });
-    showToast("Custom network removed. Switched to Testnet.", "info");
-  };
-
-  const loadTrades = async (cursor) => {
-    const page = await getAccountTrades(publicKey, cursor ? { cursor } : {});
-    setTrades((previous) => (cursor ? [...previous, ...page.records] : page.records));
-    setTradesNextCursor(page.nextCursor);
-  };
-
-  const handleTrades = async () => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading("trades");
-    try {
-      await loadTrades();
-    } catch (err) {
-      setTrades([]);
-      setTradesNextCursor(null);
-      showToast(err.message || "Could not load trades.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleLoadMoreTrades = async () => {
-    if (!publicKey || !tradesNextCursor) return;
-    setLoading("trades-more");
-    try {
-      await loadTrades(tradesNextCursor);
-    } catch (err) {
-      showToast(err.message || "Could not load more trades.", "error");
-    } finally {
-      setLoading("");
     }
   };
 
@@ -1055,34 +755,6 @@ export default function App() {
     }
   };
 
-  const handleCreateAccount = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading("create-account");
-    setCreateAccountResult(null);
-    try {
-      const result = await createAccountWithFreighter(
-        publicKey,
-        createAccountForm.destination,
-        createAccountForm.startingBalance
-      );
-      setCreateAccountResult({
-        destination: createAccountForm.destination,
-        hash: result.hash,
-      });
-      await refreshBalances();
-      showToast(
-        `Account created · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Create account failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
   const handleTrust = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -1093,19 +765,16 @@ export default function App() {
     try {
       code = validateAssetCode(trustForm.code);
     } catch (err) {
-      setTransactionFailure(null);
       return showToast(err.message, "error");
     }
-    setTransactionFailure(null);
     setLoading("trust");
     try {
       const result = await changeTrustWithFreighter(
         publicKey,
         code,
         trustForm.issuer,
-        limit
+        trustForm.limit || "1000000"
       );
-      trackSubmission(result.hash, "changeTrust");
       const next = await getAccountBalances(publicKey);
       setBalances(next);
       setTrustForm({ code: "", issuer: "", limit: "1000000" });
@@ -1113,10 +782,8 @@ export default function App() {
       startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("changeTrust", err);
-      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || "Change trust failed.", "error");
     } finally {
-      submitGuardRef.current.end("trust");
       setLoading("");
     }
   };
@@ -1212,7 +879,6 @@ export default function App() {
       );
     }
 
-    setTransactionFailure(null);
     setLoading(`remove-${asset.key}`);
     try {
       const result = await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
@@ -1222,10 +888,39 @@ export default function App() {
       startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("changeTrust", err);
-      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
     } finally {
-      submitGuardRef.current.end(guardKey);
+      setLoading("");
+    }
+  };
+
+  const handleRevokeSponsorship = async (asset) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`revoke-${asset.key}`);
+    try {
+      await revokeTrustlineSponsorshipWithFreighter(
+        publicKey,
+        asset.code,
+        asset.issuer,
+        asset.holder
+      );
+      setSponsoredTrustlineRefresh((refresh) => refresh + 1);
+      showToast(`${asset.code} sponsorship revoked.`);
+      try {
+        const next = await getAccountBalances(publicKey);
+        setBalances(next);
+      } catch (refreshError) {
+        showToast(
+          `Sponsorship was revoked, but balances could not be refreshed: ${
+            refreshError.message || "unknown error"
+          }`,
+          "error"
+        );
+      }
+    } catch (err) {
+      trackFailedSubmit("revokeSponsorship", err);
+      showToast(err.message || `Could not revoke the ${asset.code} sponsorship.`, "error");
+    } finally {
       setLoading("");
     }
   };
@@ -1341,72 +1036,22 @@ export default function App() {
       return;
     }
 
-    setSigningConfirmationOpen(true);
-  };
-
-  const handleConfirmedSend = async () => {
-    if (!unsignedEnvelope || !publicKey) return;
-    setSigningConfirmationOpen(false);
     setLoading("send");
-    let paymentDestination;
     try {
-      paymentDestination = await resolveFederationAddress(sendForm.destination);
-    } catch (err) {
-      setLoading("");
-      return showToast(err.message || "Federation lookup failed.", "error");
-    }
-
-    try {
-      const prepared = await preparePaymentWithFreighter(
-        publicKey,
-        paymentDestination,
-        amount,
-        asset,
-        sendForm.memoType,
-        sendForm.memo,
-        minTime,
-        maxTime
-      );
-      setSendPrepared(prepared);
-      showToast("Payment prepared. Confirm in Freighter.");
-    } catch (err) {
-      showToast(err.message || "Payment preparation failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleConfirmSend = async () => {
-    if (!publicKey) {
-      return showToast("Connect Freighter first.", "error");
-    }
-
-    if (!sendPrepared?.transaction) {
-      return showToast("No payment prepared.", "error");
-    }
-
-    setLoading("send");
-
-    try {
-      const result = await confirmPaymentWithFreighter(
-        sendPrepared,
+      const result = await submitEnvelopeWithFreighter(
+        unsignedEnvelope,
         publicKey
       );
-
       const next = await getAccountBalances(publicKey);
       setBalances(next);
-      setSendPrepared(null);
-
       setSendForm({
         destination: "",
         amount: "",
         assetKey: "native",
         memoType: "text",
         memo: "",
-        minTime: "",
-        maxTime: "",
       });
-
+      setUnsignedEnvelope(null);
       showToast(
         `Payment submitted · ${result.hash.slice(0, 12)}…`,
         "success",
@@ -1414,55 +1059,11 @@ export default function App() {
       );
       startTxWatch(result.hash);
     } catch (err) {
-      // Preserve form values if the user refuses to sign or submission fails.
+      trackFailedSubmit("payment", err);
       showToast(err.message || "Payment failed.", "error");
     } finally {
-      submitGuardRef.current.end("send");
       setLoading("");
     }
-  };
-
-  const handlePathQuote = async () => {
-    if (!pathForm.destination || !pathForm.amount) {
-      return showToast("Destination and amount are required for a quote.", "error");
-    }
-    if (pathForm.sendAssetType === "credit" && (!pathForm.sendCode || !pathForm.sendIssuer)) {
-      return showToast("Send asset code and issuer are required.", "error");
-    }
-    if (pathForm.destAssetType === "credit" && (!pathForm.destCode || !pathForm.destIssuer)) {
-      return showToast("Destination asset code and issuer are required.", "error");
-    }
-
-    setLoading("pathquote");
-    setPathQuote(null);
-    try {
-      const paths = await fetchPathQuote({
-        mode: pathForm.mode,
-        sendAsset: pathSendAsset,
-        destAsset: pathDestAsset,
-        destination: pathForm.destination,
-        amount: pathForm.amount,
-      });
-      setPathQuote({
-        paths,
-        error: paths.length
-          ? null
-          : "Horizon found no path for this asset pair and amount.",
-      });
-    } catch (err) {
-      setPathQuote({ paths: [], error: err.message || "Path lookup failed." });
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleUsePath = (path) => {
-    const hops = formatPathHops(path);
-    setPathForm((prev) => ({ ...prev, path: hops }));
-    showToast(
-      hops ? `Path applied: ${hops}` : "Direct path applied.",
-      "info"
-    );
   };
 
   const handlePathPayment = async (e) => {
@@ -1478,48 +1079,29 @@ export default function App() {
       return showToast("Destination asset code and issuer are required.", "error");
     }
 
-    const fingerprint = [
-      pathForm.mode,
-      pathForm.destination,
-      pathForm.amount,
-      pathForm.bound,
-      pathForm.sendAssetType,
-      pathForm.sendCode,
-      pathForm.sendIssuer,
-      pathForm.destAssetType,
-      pathForm.destCode,
-      pathForm.destIssuer,
-      pathForm.path,
-    ].join("|");
-    const gate = submitGuardRef.current.begin("path", fingerprint);
-    if (!gate.allowed) return;
-    if (
-      gate.duplicate &&
-      !confirmDuplicate(
-        "You submitted this exact path payment in the last 15 seconds. Submit it again?"
-      )
-    ) {
-      submitGuardRef.current.end("path");
-      return;
-    }
-
     setLoading("path");
-    setTransactionFailure(null);
     setPathResult(null);
     try {
       const result = await pathPaymentWithFreighter({
         publicKey,
         destination: pathForm.destination,
         mode: pathForm.mode,
-        sendAsset: pathSendAsset,
-        destAsset: pathDestAsset,
+        sendAsset: {
+          isNative: pathForm.sendAssetType === "native",
+          code: pathForm.sendCode,
+          issuer: pathForm.sendIssuer,
+        },
+        destAsset: {
+          isNative: pathForm.destAssetType === "native",
+          code: pathForm.destCode,
+          issuer: pathForm.destIssuer,
+        },
         amount: pathForm.amount,
         destMin: pathForm.mode === "strictSend" ? pathForm.bound : undefined,
         sendMax: pathForm.mode === "strictReceive" ? pathForm.bound : undefined,
         path: pathForm.path,
       });
 
-      trackSubmission(result.hash, "pathPayment");
       setPathResult({
         hash: result.hash,
         explorerUrl: explorerTxUrl(result.hash),
@@ -1534,100 +1116,8 @@ export default function App() {
       startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("pathPayment", err);
-      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || "Path payment failed.", "error");
     } finally {
-      submitGuardRef.current.end("path");
-      setLoading("");
-    }
-  };
-
-  const handleClawback = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-
-    const asset = clawbackAssets.find(
-      (candidate) => candidate.key === clawbackForm.assetKey
-    );
-    if (!asset) {
-      return showToast(
-        "Choose an asset you issue with clawback enabled.",
-        "error"
-      );
-    }
-    if (!clawbackForm.holder || !clawbackForm.amount) {
-      return showToast("Holder and amount are required.", "error");
-    }
-
-    const gate = submitGuardRef.current.begin(
-      "clawback",
-      `${asset.key}|${clawbackForm.holder}|${clawbackForm.amount}`
-    );
-    if (!gate.allowed) return;
-
-    setLoading("clawback");
-    try {
-      const result = await clawbackWithFreighter(
-        publicKey,
-        clawbackForm.holder,
-        asset.code,
-        asset.issuer,
-        clawbackForm.amount
-      );
-      trackSubmission(result.hash, "clawback");
-      setClawbackForm((previous) => ({
-        ...previous,
-        holder: "",
-        amount: "",
-      }));
-      showToast(
-        `Clawback submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Clawback failed.", "error");
-    } finally {
-      submitGuardRef.current.end("clawback");
-      setLoading("");
-    }
-  };
-
-  const handleSponsor = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!sponsorForm.sponsoredAccount) {
-      return showToast("Sponsored account is required.", "error");
-    }
-    if (!sponsorForm.code || !sponsorForm.issuer) {
-      return showToast("Asset code and issuer are required.", "error");
-    }
-
-    const gate = submitGuardRef.current.begin(
-      "sponsor",
-      `${sponsorForm.sponsoredAccount}|${sponsorForm.code}|${sponsorForm.issuer}`
-    );
-    if (!gate.allowed) return;
-
-    setLoading("sponsor");
-    try {
-      const result = await sponsorTrustlineWithFreighter({
-        publicKey,
-        sponsoredAccount: sponsorForm.sponsoredAccount,
-        assetCode: sponsorForm.code,
-        assetIssuer: sponsorForm.issuer,
-      });
-      trackSubmission(result.hash, "sponsorTrustline");
-      setSponsorForm({ sponsoredAccount: "", code: "", issuer: "" });
-      showToast(
-        `Sponsored trustline submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Sponsored trustline failed.", "error");
-    } finally {
-      submitGuardRef.current.end("sponsor");
       setLoading("");
     }
   };
@@ -1651,237 +1141,49 @@ export default function App() {
     }
   };
 
-  const refreshOfferData = async () => {
-    const [nextBalances, nextOffers] = await Promise.all([
-      getAccountBalances(publicKey),
-      getAccountOffers(publicKey),
-    ]);
-    setBalances(nextBalances);
-    setOfferList(nextOffers);
-  };
-
-  const handleListOffers = async () => {
+  const handleOfferPriceChange = async (event, offer) => {
+    event.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoadingOffers(true);
+    const newPrice = offerPrices[offer.id]?.trim();
+    setLoading("offer");
+    setOfferResult(null);
     try {
-      setOfferList(await getAccountOffers(publicKey));
-    } catch (err) {
-      showToast(err.message || "Could not load active offers.", "error");
-    } finally {
-      setLoadingOffers(false);
-    }
-  };
-
-  const handlePlaceOffer = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-
-    const sellingAsset = assetBalances.find(
-      (asset) => asset.key === offerForm.sellingAssetKey
-    );
-    const buyingAsset = assetBalances.find(
-      (asset) => asset.key === offerForm.buyingAssetKey
-    );
-    if (!sellingAsset || !buyingAsset) {
-      return showToast("Choose both selling and buying assets.", "error");
-    }
-    if (sellingAsset.key === buyingAsset.key) {
-      return showToast("Selling and buying assets must be different.", "error");
-    }
-
-    let amount;
-    try {
-      amount = validatePaymentAmount(offerForm.amount, "Offer amount");
-    } catch (err) {
-      return showToast(err.message, "error");
-    }
-
-    const available = Number.parseFloat(sellingAsset.available ?? sellingAsset.balance);
-    if (!Number.isFinite(available) || available <= 0) {
-      return showToast(`You do not hold any available ${sellingAsset.code}.`, "error");
-    }
-    if (Number(amount) > available) {
-      return showToast(
-        `Insufficient ${sellingAsset.code} balance. Available: ${available}.`,
-        "error"
-      );
-    }
-
-    const describeAsset = (asset) =>
-      asset.isNative
-        ? { isNative: true }
-        : { isNative: false, code: asset.code, issuer: asset.issuer };
-
-    setLoading("offer-place");
-    try {
-      const operation = buildManageSellOffer({
-        selling: describeAsset(sellingAsset),
-        buying: describeAsset(buyingAsset),
-        amount,
-        priceNumerator: offerForm.priceNumerator,
-        priceDenominator: offerForm.priceDenominator,
+      const result = await changeOfferPriceWithFreighter(publicKey, offer, newPrice);
+      setOfferResult({
+        id: offer.id,
+        oldPrice: result.oldPrice,
+        newPrice,
+        hash: result.hash,
       });
-      const unsignedXdr = await buildUnsignedEnvelope(publicKey, [operation]);
-      const result = await submitEnvelopeWithFreighter(unsignedXdr, publicKey);
-      setOfferForm((previous) => ({ ...previous, amount: "" }));
-      showToast(
-        `Offer placed · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
+      setOfferPrices((previous) => ({ ...previous, [offer.id]: "" }));
+      setOfferRefresh((count) => count + 1);
+      showToast(`Offer ${offer.id} price change submitted.`);
       startTxWatch(result.hash);
-      try {
-        await refreshOfferData();
-      } catch (refreshError) {
-        showToast(
-          `Offer submitted, but balances and offers could not refresh: ${refreshError.message}`,
-          "error",
-          explorerTxUrl(result.hash)
-        );
-      }
-    } catch (err) {
-      trackFailedSubmit("manageSellOffer", err);
-      showToast(err.message || "Could not place offer.", "error");
+    } catch (error) {
+      trackFailedSubmit("manageSellOffer", error);
+      showToast(error.message || "Could not change offer price.", "error");
     } finally {
       setLoading("");
     }
   };
 
-  const handleCancelOffer = async (offer) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-
-    setLoading(`offer-cancel-${offer.offerId}`);
-    try {
-      const operation = buildManageSellOffer({
-        selling: offer.selling,
-        buying: offer.buying,
-        amount: "0",
-        priceNumerator: offer.priceNumerator,
-        priceDenominator: offer.priceDenominator,
-        offerId: offer.offerId,
-      });
-      const unsignedXdr = await buildUnsignedEnvelope(publicKey, [operation]);
-      const result = await submitEnvelopeWithFreighter(unsignedXdr, publicKey);
-      showToast(
-        `Offer ${offer.offerId} cancelled · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-      startTxWatch(result.hash);
-      try {
-        await refreshOfferData();
-      } catch (refreshError) {
-        showToast(
-          `Offer cancelled, but balances and offers could not refresh: ${refreshError.message}`,
-          "error",
-          explorerTxUrl(result.hash)
-        );
-      }
-    } catch (err) {
-      trackFailedSubmit("manageSellOffer", err);
-      showToast(err.message || "Could not cancel offer.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleLiquidity = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-
-    const poolId = liquidityForm.poolId.trim();
-    if (!/^[0-9a-f]{64}$/i.test(poolId)) {
-      return showToast("Pool ID must be 64 hexadecimal characters.", "error");
-    }
-
-    const operationType =
-      liquidityForm.mode === "withdraw"
-        ? "liquidityPoolWithdraw"
-        : "liquidityPoolDeposit";
-    setLoading("liquidity");
-    try {
-      const pool = await getLiquidityPool(poolId);
-      if (!Array.isArray(pool.reserves) || pool.reserves.length !== 2) {
-        throw new Error("Horizon did not return both pool reserves.");
-      }
-      if (pool.reserves[0].asset === pool.reserves[1].asset) {
-        throw new Error("A pair of the same asset is not supported.");
-      }
-
-      let operation;
-      if (liquidityForm.mode === "deposit") {
-        const minPrice = validatePositivePrice(
-          liquidityForm.minPrice,
-          "Minimum price"
-        );
-        const maxPrice = validatePositivePrice(
-          liquidityForm.maxPrice,
-          "Maximum price"
-        );
-        if (Number(minPrice) > Number(maxPrice)) {
-          throw new Error("Minimum price cannot exceed maximum price.");
-        }
-
-        operation = liquidityPoolDeposit(
-          poolId,
-          validatePaymentAmount(liquidityForm.maxAmountA, "Maximum amount A"),
-          validatePaymentAmount(liquidityForm.maxAmountB, "Maximum amount B"),
-          minPrice,
-          maxPrice
-        );
-      } else if (liquidityForm.mode === "withdraw") {
-        operation = liquidityPoolWithdraw(
-          poolId,
-          validatePaymentAmount(liquidityForm.amount, "Share amount"),
-          validatePaymentAmount(liquidityForm.minAmountA, "Minimum amount A"),
-          validatePaymentAmount(liquidityForm.minAmountB, "Minimum amount B")
-        );
-      } else {
-        throw new Error("Choose deposit or withdraw.");
-      }
-
-      const unsignedXdr = await buildUnsignedEnvelope(publicKey, [operation]);
-      const result = await submitEnvelopeWithFreighter(unsignedXdr, publicKey);
-      showToast(
-        `Liquidity ${liquidityForm.mode} submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-      startTxWatch(result.hash);
-
-      try {
-        setBalances(await getAccountBalances(publicKey));
-      } catch (refreshError) {
-        showToast(
-          `Transaction submitted, but balances could not refresh: ${refreshError.message}`,
-          "error",
-          explorerTxUrl(result.hash)
-        );
-      }
-    } catch (err) {
-      trackFailedSubmit(operationType, err);
-      showToast(err.message || "Liquidity operation failed.", "error");
-    } finally {
-      setLoading("");
-    }
+  const selectBookPrice = (row) => {
+    const price = row.price ?? (Number(row.priceR?.n) / Number(row.priceR?.d)).toString();
+    updateOfferForm({ price });
   };
 
   const handleHistory = async () => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setHistoryError(null);
     setLoading("history");
     const signal = beginHorizonRead();
     try {
-      const page = await getTransactions(publicKey, 15, null, { signal });
-      if (signal.aborted) return;
+      const page = await getTransactions(publicKey, 15, undefined, { signal });
       setTransactions(page.records);
       setNextCursor(page.nextCursor);
-      setPageCursors([null]);
       setHorizonNotice(null);
       if (page.records.length === 0) showToast("No payments yet.", "info");
     } catch (error) {
       if (error?.name === "AbortError") return;
-      setHistoryError(error.message || "Could not load payment history.");
       if (isHorizonSlowdownError(error)) {
         setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
         showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
@@ -1893,57 +1195,25 @@ export default function App() {
     }
   };
 
-  const handleLoadNext = async () => {
+  const handleLoadMore = async () => {
     if (!publicKey || !nextCursor) return;
-    setHistoryError(null);
-    setLoading("history-next");
+    setLoading("history-more");
     const signal = beginHorizonRead();
     try {
+      // Same page size as the first page; `undefined` keeps the default limit.
       const page = await getTransactions(publicKey, undefined, nextCursor, {
         signal,
       });
-      if (signal.aborted) return;
-      setTransactions(page.records);
-      setPageCursors((previous) => [...previous, nextCursor]);
+      setTransactions((previous) => [...previous, ...page.records]);
       setNextCursor(page.nextCursor);
       setHorizonNotice(null);
     } catch (error) {
       if (error?.name === "AbortError") return;
-      setHistoryError(error.message || "Could not load older payments.");
       if (isHorizonSlowdownError(error)) {
         setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
         showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
       } else {
         showToast("Could not load older payments.", "error");
-      }
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleLoadPrevious = async () => {
-    if (!publicKey || pageCursors.length < 2) return;
-    const previousCursor = pageCursors[pageCursors.length - 2];
-    setHistoryError(null);
-    setLoading("history-previous");
-    const signal = beginHorizonRead();
-    try {
-      const page = await getTransactions(publicKey, undefined, previousCursor, {
-        signal,
-      });
-      if (signal.aborted) return;
-      setTransactions(page.records);
-      setPageCursors((previous) => previous.slice(0, -1));
-      setNextCursor(page.nextCursor);
-      setHorizonNotice(null);
-    } catch (error) {
-      if (error?.name === "AbortError") return;
-      setHistoryError(error.message || "Could not load newer payments.");
-      if (isHorizonSlowdownError(error)) {
-        setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
-        showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
-      } else {
-        showToast("Could not load newer payments.", "error");
       }
     } finally {
       setLoading("");
@@ -2008,39 +1278,15 @@ export default function App() {
 
   const requireWallet = !publicKey;
   const visibleTransactions = mergeStreamedPayments(streamedPayments, transactions);
-  const currentRegisterSimulationKey = JSON.stringify([
-    publicKey,
-    networkId,
-    labInfo?.network?.contract?.kitewell,
-    registerForm.name.trim(),
-  ]);
-  const registerSimulationReady =
-    Boolean(simulationFees) &&
-    !simulationFees.error &&
-    simulatedRegisterKey === currentRegisterSimulationKey;
-  const historyAssets = [
-    ...new Set(
-      visibleTransactions
-        .map((tx) => (tx.asset_type === "native" ? "XLM" : tx.asset_code))
-        .filter(Boolean)
-        .concat(historyFilters.asset ? [historyFilters.asset] : [])
-    ),
-  ].sort();
-  const filteredTransactions = filterTransactionHistory(visibleTransactions, {
-    asset: historyFilters.asset || null,
-    direction: publicKey ? historyFilters.direction || null : null,
-    publicKey,
-  });
-  const currentHistoryCursor = pageCursors[pageCursors.length - 1];
 
   const loadLabInfo = async () => {
     setLoading("lab");
     setLabError(null);
     try {
       const [health, network] = await Promise.all([fetchHealth(), fetchNetworkInfo()]);
-      setLabInfo({ health, network });
-      // Use the freshly fetched id rather than stale state from this render.
-      await readLabState(sessionContractId || network.contract?.kitewell);
+      const info = { health, network };
+      setLabInfo(info);
+      return info;
     } catch (e) {
       setLabInfo(null);
       setLabError(
@@ -2053,69 +1299,18 @@ export default function App() {
     }
   };
 
-  const checkRpc = useCallback(async () => {
-    setRpcHealth((prev) => ({ ...prev, description: "checking" }));
-    try {
-      const result = await checkSorobanRpcHealth();
-      setRpcHealth(result);
-    } catch (error) {
-      setRpcHealth((prev) => ({
-        ...prev,
-        ok: false,
-        description: "unreachable",
-        latestLedger: null,
-        error: error instanceof Error ? error.message : String(error),
-      }));
-    }
-  }, []);
-
-  // Recheck whenever the user switches networks: the new Horizon/Soroban RPC
-  // may be up while the old one is down.
-  useEffect(() => {
-    checkRpc();
-  }, [checkRpc, networkId]);
-
-  const refreshLabState = useCallback(async () => {
-    const contractId = labInfo?.network?.contract?.kitewell;
+  const refreshLabState = useCallback(async (explicitContractId) => {
+    const contractId = explicitContractId ?? labInfo?.network?.contract?.kitewell;
     if (!contractId) {
       setLabState(null);
       setLabStateError(null);
-      setAdminState(null);
       return;
     }
-
-    // The Soroban RPC must be reachable before the Lab tab simulates or
-    // deploys anything. The backend's Horizon requests are intentionally
-    // unaffected: classic payments only need the Horizon server, not the RPC.
-    if (!rpcHealth.ok) {
-      setLabState(null);
-      setAdminState(null);
-      setLabStateError(
-        rpcHealth.error ||
-          `Soroban RPC unreachable (${rpcHealth.description}). ` +
-          "Switch networks and refresh to recheck."
-      );
-      return;
-    }
-
     setLoading("labstate");
     setLabStateError(null);
-    setAdminState(null);
     try {
-      // Always read builder state
       const state = await readKitewellState(contractId, publicKey);
       setLabState(state);
-      
-      // Try to read admin state, but don't fail if the contract doesn't have
-      // get_pending_admin yet (it's new in this PR and may not be deployed)
-      try {
-        const admin = await readAdminState(contractId);
-        setAdminState(admin);
-      } catch {
-        // Admin read failed (probably because get_pending_admin doesn't exist
-        // on the deployed contract yet), but keep the builder state
-        setAdminState(null);
-      }
     } catch (e) {
       setLabState(null);
       setLabStateError(
@@ -2124,40 +1319,11 @@ export default function App() {
     } finally {
       setLoading("");
     }
-  }, [labInfo, publicKey, rpcHealth]);
-
-  const handleBuilderLookup = async (e) => {
-    e.preventDefault();
-    const contractId = labInfo?.network?.contract?.kitewell;
-    setBuilderLookupResult(null);
-    setBuilderLookupError(null);
-    if (!contractId) {
-      setBuilderLookupError(
-        "No contract id configured — deploy first (contracts/README.md)."
-      );
-      return;
-    }
-    setLoading("builder-lookup");
-    try {
-      setBuilderLookupResult(
-        await readKitewellBuilder(contractId, builderAddress)
-      );
-    } catch (err) {
-      setBuilderLookupError(err.message || "Builder lookup failed.");
-    } finally {
-      setLoading("");
-    }
-  };
+  }, [labInfo, publicKey]);
 
   const handleRegister = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!rpcHealth.ok) {
-      return showToast(
-        "Soroban RPC unreachable — the contract cannot be invoked until it recovers.",
-        "error"
-      );
-    }
     const contractId = labInfo?.network?.contract?.kitewell;
     if (!contractId) {
       return showToast(
@@ -2168,32 +1334,15 @@ export default function App() {
     if (!registerForm.name.trim()) {
       return showToast("Enter a builder name to register.", "error");
     }
-    const expectedSimulationKey = JSON.stringify([
-      publicKey,
-      networkId,
-      contractId,
-      registerForm.name.trim(),
-    ]);
-    if (
-      simulationFees?.error ||
-      simulatedRegisterKey !== expectedSimulationKey
-    ) {
-      return showToast("Simulate this registration successfully before signing.", "error");
-    }
     setLoading("register");
-    setTransactionFailure(null);
     try {
       const result = await registerBuilderWithFreighter(
         publicKey,
         contractId,
-        registerForm.name,
-        labInfo?.network?.passphrase
+        registerForm.name
       );
-      trackSubmission(result.hash, "register");
       setLastRegisterTx(result);
       setRegisterForm({ name: "" });
-      setSimulationFees(null);
-      setSimulatedRegisterKey(null);
       showToast(
         result.confirmed
           ? `Registered on-chain · ${result.hash.slice(0, 12)}…`
@@ -2207,90 +1356,79 @@ export default function App() {
       trackFailedSubmit("register", err);
       showToast(err.message || "Contract invoke failed.", "error");
     } finally {
-      submitGuardRef.current.end("register");
       setLoading("");
     }
   };
 
-  // Handle signer weight change
-  const handleSignerWeightChange = (index, weight) => {
-    const newWeights = [...signerWeights];
-    newWeights[index] = weight;
-    setSignerWeights(newWeights);
+  const refreshIssuerPanel = async () => {
+    if (!publicKey) return;
+    setLoading("issuer");
+    try {
+      const config = await getAccountAuthConfig(publicKey);
+      setIssuerConfig(config);
+      setIssuerConfigError(null);
+      setIssuerForm({
+        homeDomain: config.homeDomain || "",
+        authRequired: config.authRequired,
+        authRevocable: config.authRevocable,
+        authImmutable: config.authImmutable,
+        confirmation: "",
+      });
+    } catch (err) {
+      setIssuerConfig(null);
+      setIssuerConfigError(err.message || "Could not read account flags.");
+    }
+
+    try {
+      setIssuedTrustlines(await getIssuedAssetTrustlines(publicKey));
+      setIssuedTrustlinesError(null);
+    } catch (err) {
+      setIssuedTrustlines([]);
+      setIssuedTrustlinesError(err.message || "Could not read issued trustlines.");
+    }
+    setLoading("");
   };
 
-  // Handle remove signer
-  const handleRemoveSigner = (index) => {
-    // Check if removing this signer would lock out the high threshold
-    const currentSignerWeight = signerWeights[index] ?? 0;
-    const remainingWeight = signerWeights.filter((_, i) => i !== index).reduce((sum, w) => sum + (w ?? 0), 0);
-    if (remainingWeight < highThreshold && signers.length > 1) {
-      if (!window.confirm(
-        `Removing this signer would leave ${remainingWeight} total weight, which is below the high threshold of ${highThreshold}.\n\nAre you sure you want to remove this signer? This may lock you out of high-threshold operations.`
-      )) {
-        return;
-      }
-    }
-    setSigners(signers.filter((_, i) => i !== index));
-    setSignerWeights(signerWeights.filter((_, i) => i !== index));
-  };
-
-  // Handle add signer
-  const handleAddSigner = (newSignerKey) => {
-    if (!newSignerKey) return;
-    const trimmed = newSignerKey.trim();
-    if (!trimmed) return;
-    if (!StellarSdk.StrKey.isValidEd25519PublicKey(trimmed)) {
-      return showToast("Invalid signer public key format.", "error");
-    }
-    // Check if signer already exists
-    if (signers.includes(trimmed)) {
-      return showToast("This signer is already added.", "error");
-    }
-    setSigners([...signers, trimmed]);
-    setSignerWeights([...signerWeights, 0]);
-    showToast("Signer added with weight 0.");
-  };
-
-  // Handle setOptions transaction for signer weights and thresholds
-  const handleSetOptions = async (e) => {
+  const handleSetIssuerOptions = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-
-    // Build the setOptions operation with the edited values
-    const operations = [];
-
-    // Build the setOptions params
-    const setOptionsParams = {
-      lowThreshold: lowThreshold,
-      medThreshold: medThreshold,
-      highThreshold: highThreshold,
-      signer: signers.map((signer, index) => ({
-        address: signer,
-        weight: signerWeights[index] ?? 0,
-      })),
-    };
-
-    // Build the setOptions transaction
+    setLoading("issuer-update");
     try {
-      setLoading("setoptions");
-      const sourceAccount = await getServer().loadAccount(publicKey);
-      const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
-        fee: StellarSdk.BASE_FEE,
-        networkPassphrase: currentPassphrase(),
+      await setAccountOptionsWithFreighter(publicKey, {
+        current: issuerConfig || {},
+        homeDomain: issuerForm.homeDomain,
+        authRequired: issuerForm.authRequired,
+        authRevocable: issuerForm.authRevocable,
+        authImmutable: issuerForm.authImmutable,
+        immutableConfirmation: issuerForm.confirmation,
       });
-      txBuilder.setOptions(setOptionsParams);
-      const txXDR = txBuilder.setTimeout(180).build().toXDR();
-
-      // Show the envelope before Freighter opens
-      setUnsignedEnvelope(txXDR);
-      showToast(
-        "Review the unsigned setOptions envelope, then sign in Freighter.",
-        "info"
-      );
+      showToast("Account flags updated.");
+      // A successful update refreshes both the flags and the account balances.
+      await refreshIssuerPanel();
+      await refreshBalances();
     } catch (err) {
-      trackFailedSubmit("setoptions", err);
-      showToast(err.message || "Failed to build setOptions transaction.", "error");
+      showToast(err.message || "Could not update account flags.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleAllowTrust = async (entry, authorize) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`allow-${entry.key}`);
+    try {
+      await allowTrustWithFreighter(publicKey, {
+        holder: entry.holder,
+        assetCode: entry.assetCode,
+        assetIssuer: entry.assetIssuer,
+        authorize,
+      });
+      showToast(
+        `${authorize ? "Authorized" : "Revoked"} ${shortenAddress(entry.holder)} for ${entry.assetCode}.`
+      );
+      await refreshIssuerPanel();
+    } catch (err) {
+      showToast(err.message || "Could not update the trustline.", "error");
     } finally {
       setLoading("");
     }
@@ -2441,220 +1579,6 @@ export default function App() {
     return () => clearInterval(timer);
   }, [activeTab, configuredContractId, pollLabEvents]);
 
-  // Issue #570: a replay read is one shot from the user's start ledger. It
-  // never moves the live tail's cursor or opening ledger.
-  const handleReplayEvents = async (event) => {
-    event.preventDefault();
-    setReplayError(null);
-    setReplayEvents([]);
-
-    if (!configuredContractId) {
-      setReplayError("No contract id configured — nothing to replay.");
-      return;
-    }
-
-    setLoading("replay");
-    try {
-      const result = await readKitewellEvents(configuredContractId, {
-        startLedger: Number(replayForm),
-        limit: 200,
-      });
-      setReplayEvents(result.events);
-      if (result.events.length === 0) {
-        setReplayError("No register or pause events from that ledger yet.");
-      }
-    } catch (err) {
-      setReplayError(err.message || "Could not replay contract events.");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  // Issue #643: append fixed-size pages from the contract's builder index.
-  const loadBuilderPage = useCallback(
-    async (start = 0, explicitContractId, append = false) => {
-      const contractId = explicitContractId ?? configuredContractId;
-      if (!contractId) {
-        setBuilderList(null);
-        setBuilderListError(null);
-        return;
-      }
-      setLoading("builders");
-      setBuilderListError(null);
-      try {
-        const page = await listKitewellBuilders(contractId, { start });
-        setBuilderList((previous) =>
-          appendBuilderPage(previous, { ...page, start }, contractId)
-        );
-      } catch (err) {
-        if (!append) setBuilderList(null);
-        setBuilderListError(
-          err.message || "Could not read the builder index."
-        );
-      } finally {
-        setLoading("");
-      }
-    },
-    [configuredContractId]
-  );
-
-  // Issue #572: the draft is the unsigned three-op envelope that only the new
-  // account's owner can co-sign. Nothing is submitted until both signatures
-  // are present.
-  const handleBuildSponsorDraft = async () => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setSponsorDraft(null);
-    setSponsorResult(null);
-    setLoading("sponsor-draft");
-    try {
-      const draft = await createSponsoredAccountDraft(
-        publicKey,
-        sponsorForm.newAccount
-      );
-      setSponsorDraft(draft);
-      showToast(
-        "Unsigned sponsorship envelope ready. Have the new account sign it, then paste the signed XDR.",
-        "info"
-      );
-    } catch (err) {
-      showToast(err.message || "Could not build the sponsorship envelope.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleSponsorAccount = async (event) => {
-    event.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!sponsorForm.coSignedXdr.trim()) {
-      return showToast(
-        "The new account must co-sign before this is submitted.",
-        "error"
-      );
-    }
-
-    setLoading("sponsor");
-    setSponsorResult(null);
-    try {
-      const result = await sponsorAccountCreationWithFreighter(
-        publicKey,
-        sponsorForm.newAccount,
-        sponsorForm.coSignedXdr.trim()
-      );
-      setSponsorResult(result);
-      setSponsorForm({ newAccount: "", coSignedXdr: "" });
-      setSponsorDraft(null);
-      showToast(`Sponsored account created · ${result.hash.slice(0, 12)}…`);
-      startTxWatch(result.hash);
-    } catch (err) {
-      trackFailedSubmit("sponsorAccount", err);
-      showToast(err.message || "Sponsored account creation failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  // Issue #668: the confirmation names the sponsored account and the entry,
-  // and only then does Freighter open. Cancelling signs nothing.
-  const handleReviewEndSponsorship = (event) => {
-    event.preventDefault();
-    const row = { entryType: "trustline", ...endSponsorForm };
-    const confirmation = describeEndSponsorship(row);
-    setEndSponsorResult(null);
-    if (!confirmation) {
-      setEndSponsorConfirmation(null);
-      return showToast(
-        "This sponsorship entry cannot be identified, so it cannot be ended.",
-        "error"
-      );
-    }
-    setEndSponsorConfirmation({ ...confirmation, row });
-  };
-
-  const handleEndSponsorship = async () => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!endSponsorConfirmation) return;
-
-    setLoading("end-sponsorship");
-    try {
-      const result = await endSponsorshipWithFreighter(
-        publicKey,
-        endSponsorConfirmation.row
-      );
-      setEndSponsorResult(result);
-      setEndSponsorConfirmation(null);
-      setEndSponsorForm({
-        sponsoredAccount: "",
-        assetCode: "",
-        assetIssuer: "",
-      });
-      showToast(`Sponsorship ended · ${result.hash.slice(0, 12)}…`, "success");
-    } catch (err) {
-      trackFailedSubmit("endSponsorship", err);
-      showToast(err.message || "Ending the sponsorship failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  // Issue #541: stopping the watch aborts only the polling loop.
-  const stopOfferWatch = useCallback(() => {
-    offerWatchRef.current?.controller.abort();
-    offerWatchRef.current = null;
-  }, []);
-
-  const handleWatchOffer = async (event) => {
-    event.preventDefault();
-    setOfferWatchError(null);
-    stopOfferWatch();
-
-    const offerId = offerWatchId.trim();
-    const controller = new AbortController();
-    const token = offerWatchTokenRef.current + 1;
-    offerWatchTokenRef.current = token;
-    offerWatchRef.current = { controller, token };
-    setOfferWatch({ offerId, status: "watching" });
-
-    try {
-      const result = await watchOfferUntilGone(offerId, {
-        publicKey,
-        signal: controller.signal,
-        onUpdate: (offer) => {
-          if (offerWatchTokenRef.current !== token) return;
-          setOfferWatch(
-            offer
-              ? { offerId, status: "open", ...offer }
-              : { offerId, status: "watching" }
-          );
-        },
-      });
-
-      if (offerWatchTokenRef.current !== token) return;
-      if (result.status === "gone") {
-        setOfferWatch({
-          offerId,
-          status: "gone",
-          stillListed: result.stillListed,
-        });
-      } else {
-        setOfferWatch({ offerId, status: "still-open" });
-      }
-    } catch (err) {
-      if (controller.signal.aborted) {
-        setOfferWatch({ offerId, status: "stopped" });
-        return;
-      }
-      setOfferWatch(null);
-      setOfferWatchError(err.message || "Could not watch this offer.");
-    } finally {
-      if (offerWatchRef.current?.token === token) {
-        offerWatchRef.current = null;
-      }
-    }
-  };
-
-  useEffect(() => () => stopOfferWatch(), [stopOfferWatch]);
-
   const handleInspect = (event) => {
     event.preventDefault();
     setInspectError(null);
@@ -2668,229 +1592,62 @@ export default function App() {
     }
   };
 
-  const copyContractId = async (contractId) => {
-    const result = await copyToClipboardResult(contractId);
-    showToast(
-      result.ok ? "Contract id copied." : "Could not copy — select the id manually.",
-      result.ok ? "success" : "error"
-    );
-  };
-
-  const handleDeploy = async () => {
-    if (activeNetwork.id !== "TESTNET") {
-      return showToast("Contract deploy is Testnet-only.", "error");
-    }
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!wasmFile) return showToast("Choose the built kitewell.wasm first.", "error");
-
-    // A second deploy needs an explicit confirmation; the first id stays listed.
-    if (sessionContractId && !confirmRedeploy) {
-      setConfirmRedeploy(true);
-      return;
-    }
-
-    setDeployError(null);
-    setLoading("deploy");
-    try {
-      const wasmBytes = await wasmFile.arrayBuffer();
-      const result = await deployKitewellContract(publicKey, wasmBytes);
-      setSessionContractId(result.contractId);
-      setDeployedContracts((previous) => [...previous, result]);
-      setConfirmRedeploy(false);
-      await readLabState(result.contractId);
-      const copied = await copyToClipboardResult(result.contractId);
-      showToast(
-        copied.ok
-          ? `Deployed · ${result.contractId.slice(0, 8)}… copied.`
-          : `Deployed · ${result.contractId.slice(0, 8)}…`,
-        "success"
-      );
-    } catch (err) {
-      setDeployError({
-        message: err.message || "Contract deploy failed.",
-        // An init failure still has an installed contract; a failed install does not.
-        contractId: err.contractId || null,
-      });
-      showToast("Contract deploy failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleComposeAdd = (event) => {
+  const handleDecodeEnvelope = (event) => {
     event.preventDefault();
-    if (composeOps.length >= MAX_COMPOSED_OPERATIONS) {
-      return showToast(
-        `A transaction can contain at most ${MAX_COMPOSED_OPERATIONS} operations.`,
-        "error"
-      );
-    }
-
-    const entry = { type: composeForm.type };
-    if (composeForm.type === "payment") {
-      const selected = balances.find((b) => b.key === composeForm.assetKey);
-      entry.destination = composeForm.destination.trim();
-      entry.amount = composeForm.amount;
-      entry.asset =
-        selected && !selected.isNative
-          ? { isNative: false, code: selected.code, issuer: selected.issuer }
-          : { isNative: true };
-    } else if (composeForm.type === "changeTrust") {
-      entry.code = composeForm.code.trim();
-      entry.issuer = composeForm.issuer.trim();
-      entry.limit = composeForm.limit;
-    } else {
-      entry.name = composeForm.name.trim();
-      entry.value = composeForm.value;
-    }
-
+    setDecodeError(null);
+    setDecodedEnvelope(null);
     try {
-      buildComposedOperation(entry);
-    } catch (err) {
-      return showToast(err.message, "error");
-    }
-
-    composeId.current += 1;
-    setComposeOps((previous) => [...previous, { ...entry, id: composeId.current }]);
-    setComposeForm((previous) => ({
-      ...previous,
-      destination: "",
-      amount: "",
-      code: "",
-      issuer: "",
-      limit: "1000000",
-      name: "",
-      value: "",
-    }));
-    setComposeResult(null);
-    setComposeError(null);
-  };
-
-  const moveComposeOperation = (index, offset) => {
-    setComposeOps((previous) => {
-      const target = index + offset;
-      if (target < 0 || target >= previous.length) return previous;
-      const next = [...previous];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-    setComposeResult(null);
-    setComposeError(null);
-  };
-
-  const removeComposeOperation = (index) => {
-    setComposeOps((previous) => previous.filter((_, i) => i !== index));
-    setComposeResult(null);
-    setComposeError(null);
-  };
-
-  const handleComposeSubmit = async () => {
-    if (composeOps.length === 0) {
-      setComposeError("Add at least one operation before signing.");
-      return;
-    }
-    if (!publicKey) {
-      return showToast("Connect Freighter first.", "error");
-    }
-
-    setLoading("compose");
-    setComposeError(null);
-    setComposeResult(null);
-    try {
-      const result = await submitComposedOperations(publicKey, composeOps);
-      setComposeResult({
-        hash: result.hash,
-        explorerUrl: explorerTxUrl(result.hash),
-      });
-      setComposeOps([]);
-      showToast(`Composed transaction submitted · ${result.hash.slice(0, 12)}…`);
-      try {
-        const next = await getAccountBalances(publicKey);
-        setBalances(next);
-      } catch {
-        /* balance refresh is best-effort */
-      }
-    } catch (err) {
-      setComposeError(err.message || "Composed transaction failed.");
-      showToast(err.message || "Composed transaction failed.", "error");
-    } finally {
-      setLoading("");
+      setDecodedEnvelope(decodeEnvelope(envelopeXdr, activeNetwork.passphrase));
+    } catch (error) {
+      setDecodedEnvelope(null);
+      setDecodeError(error.message || "Could not decode the envelope.");
     }
   };
 
-  const loadFeeStats = async () => {
-    setLoading("feestats");
-    setFeeStatsError(null);
-    setFeeStats(null);
-    try {
-      setFeeStats(await getFeeStats());
-    } catch {
-      setFeeStatsError("Fee stats could not be loaded.");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const applyFeePreset = (source) => {
-    const stroops = feeStats?.[source];
-    if (!stroops) {
-      return showToast("Load fee stats before choosing a percentile.", "error");
-    }
-
-    try {
-      setFeeSetting(saveFeeSetting({ source, stroops }));
-      showToast(`Fee set to ${stroops} stroops per operation.`);
-    } catch (err) {
-      showToast(err.message || "Could not save the fee.", "error");
-    }
-  };
-
-  const handleCustomFee = (event) => {
+  const handleBuildMuxed = (event) => {
     event.preventDefault();
+    setMuxedError(null);
+    setMuxedBuildResult(null);
     try {
-      const saved = saveFeeSetting({ source: "custom", stroops: customFee });
-      setFeeSetting(saved);
-      showToast(`Fee set to ${saved.stroops} stroops per operation.`);
+      setMuxedBuildResult(
+        buildMuxedAddress(
+          muxedBuildForm.gAddress.trim(),
+          muxedBuildForm.id.trim()
+        )
+      );
     } catch (err) {
-      showToast(err.message || "Could not save the fee.", "error");
+      setMuxedError(err.message || "Could not build the muxed address.");
     }
   };
 
-  const refreshClawbackAssets = async () => {
-    if (!publicKey) {
-      setClawbackAssets([]);
-      return;
-    }
+  const handleSplitMuxed = (event) => {
+    event.preventDefault();
+    setMuxedError(null);
+    setMuxedSplitResult(null);
     try {
-      const next = await getAccountBalances(publicKey);
-      setClawbackAssets(
-        next.filter((balance) => !balance.isNative && balance.issuer === publicKey)
+      const { gAddress, id } = splitMuxedAddress(
+        muxedSplitForm.mAddress.trim()
       );
-    } catch {
-      setClawbackAssets([]);
+      setMuxedSplitResult({ gAddress, id: id.toString() });
+    } catch (err) {
+      setMuxedError(err.message || "Could not split the muxed address.");
     }
   };
 
   const activateTab = (tab) => {
     setActiveTab(tab);
-    if (tab === "Fees") loadFeeStats();
     if (tab === "History") handleHistory();
-    if (tab === "Trades") handleTrades();
     if (tab === "Lab") {
       loadLabInfo().then((info) => {
         const contractId = info?.network?.contract?.kitewell;
         refreshLabState(contractId);
         refreshTtlInfo(contractId);
-        loadBuilderPage(0, contractId);
       });
     }
-    if (tab === "Assets") {
-      if (publicKey) refreshBalances();
-      else refreshReserve();
-    } else if ((tab === "Wallet" || tab === "Send") && publicKey) {
+    if (tab === "Issuer") refreshIssuerPanel();
+    if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
       refreshBalances();
     }
-    if (tab === "Assets") refreshClawbackAssets();
   };
 
   const handleSimulateRegister = async () => {
@@ -2902,9 +1659,12 @@ export default function App() {
         "error"
       );
     }
+    if (!registerForm.name.trim()) {
+      return showToast("Enter a builder name to register.", "error");
+    }
+
     setLoading("simulate");
     setSimulationFees(null);
-    setSimulatedRegisterKey(null);
     try {
       const fees = await simulateRegisterBuilder(
         publicKey,
@@ -2914,52 +1674,11 @@ export default function App() {
       setSimulationFees(fees);
       if (fees.error) {
         showToast(`Simulation failed: ${fees.error}`, "error");
-      } else {
-        setSimulatedRegisterKey(
-          JSON.stringify([
-            publicKey,
-            networkId,
-            contractId,
-            registerForm.name.trim(),
-          ])
-        );
       }
     } catch (err) {
-      const error = err.message || "Simulation failed.";
-      setSimulationFees({
-        error,
-        inclusionFee: null,
-        resourceFee: null,
-        totalFee: null,
-        returnValue: null,
-      });
-      showToast(error, "error");
+      showToast(err.message || "Simulation failed.", "error");
     } finally {
       setLoading("");
-    }
-  };
-
-  const handleSep7UriChange = (value) => {
-    setSep7Uri(value);
-    if (!value.trim()) {
-      setSep7Request(null);
-      return;
-    }
-
-    try {
-      const request = parseSep7PayUri(value);
-      setSep7Request(request);
-      setSendForm((previous) => ({
-        ...previous,
-        destination: request.destination,
-        amount: request.amount,
-        assetKey: request.assetKey,
-        memoType: request.memoType,
-        memo: request.memo,
-      }));
-    } catch (error) {
-      setSep7Request(null);
-      showToast(error.message || "Invalid SEP-7 pay URI.", "error");
     }
   };
 
@@ -2977,31 +1696,76 @@ export default function App() {
     tabRefs.current[nextIndex]?.focus();
   };
 
-  useEffect(() => {
-    const destination = sendForm.destination.trim();
-    if (!destination || !destination.includes("*")) {
-      setResolvedFederation(null);
-      return;
-    }
+  // Issue #513: one element reused by every tab that submits, because only one
+  // watch runs at a time and it must be visible right where the hash appeared.
+  const txWatchPanel = (
+    <div className="section">
+      <h2>Transaction status</h2>
+      <p className="muted">
+        A transaction submitted here is followed until it reaches the ledger, fails, or passes
+        its max time.
+      </p>
 
-    let cancelled = false;
-    setLoading("resolve");
-    setResolvedFederation(null);
-    resolveFederationAddress(destination)
-      .then((account) => {
-        if (!cancelled) setResolvedFederation(account);
-      })
-      .catch((err) => {
-        if (!cancelled) showToast(err.message || "Federation lookup failed.", "error");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading("");
-      });
+      {txWatch && (
+        <div
+          className={
+            txWatch.status === "failed" || txWatch.status === "expired"
+              ? "info-box info-box--warning"
+              : "info-box"
+          }
+          role="status"
+          aria-live="polite"
+        >
+          <span className="eyebrow">
+            <code>{txWatch.hash}</code> · {txWatch.status}
+          </span>
+          <p className="muted">{txWatch.text}</p>
+          <a
+            className="text-link"
+            href={txWatch.explorerUrl}
+            target="_blank"
+            rel="noreferrer"
+            style={{ marginTop: 6, display: "inline-block" }}
+          >
+            Explorer ↗
+          </a>
+        </div>
+      )}
+      {txWatchError && (
+        <div className="info-box info-box--warning">
+          <span className="eyebrow">Transaction watch</span>
+          <p className="muted">{txWatchError}</p>
+        </div>
+      )}
 
-    return () => {
-      cancelled = true;
-    };
-  }, [sendForm.destination]);
+      <form className="form" onSubmit={handleWatchHash}>
+        <label className="label" htmlFor="watch-tx-hash">
+          Watch a transaction hash
+        </label>
+        <input
+          id="watch-tx-hash"
+          className="input"
+          type="text"
+          placeholder="64 hexadecimal characters"
+          maxLength={64}
+          value={hashForm}
+          onChange={(e) => setHashForm(e.target.value)}
+          aria-describedby="watch-tx-hash-help"
+          required
+        />
+        <p className="muted" id="watch-tx-hash-help" role={hashError ? "alert" : undefined}>
+          {hashError || "Paste any transaction hash from this network to follow it."}
+        </p>
+        <button
+          className="btn btn--primary"
+          type="submit"
+          disabled={loading === "issue"}
+        >
+          Watch status
+        </button>
+      </form>
+    </div>
+  );
 
   return (
     <div className="app">
@@ -3036,7 +1800,7 @@ export default function App() {
             <span className="header__tag">Stellar {activeNetwork.label} lab</span>
           </div>
         </div>
-        <div className="network">
+        <label className="network" htmlFor="network-select">
           <span className="eyebrow">Network</span>
           <select
             id="network-select"
@@ -3045,76 +1809,13 @@ export default function App() {
             onChange={(e) => handleNetworkChange(e.target.value)}
             aria-label="Stellar network"
           >
-            {getAvailableNetworks().map((network) => (
+            {Object.values(NETWORKS).map((network) => (
               <option key={network.id} value={network.id}>
                 {network.label}
               </option>
             ))}
           </select>
-          <details className="network__custom">
-            <summary>Custom network</summary>
-            <form className="form" onSubmit={handleSaveCustomNetwork}>
-              <input
-                className="input input--compact"
-                aria-label="Custom network name"
-                placeholder="Network name"
-                value={customNetworkForm.name}
-                onChange={(event) => setCustomNetworkForm((current) => ({
-                  ...current,
-                  name: event.target.value,
-                }))}
-                required
-              />
-              <input
-                className="input input--compact"
-                aria-label="Custom Horizon URL"
-                placeholder="https://horizon.example"
-                value={customNetworkForm.horizonUrl}
-                onChange={(event) => setCustomNetworkForm((current) => ({
-                  ...current,
-                  horizonUrl: event.target.value,
-                }))}
-                required
-              />
-              <input
-                className="input input--compact"
-                aria-label="Custom RPC URL"
-                placeholder="https://rpc.example"
-                value={customNetworkForm.rpcUrl}
-                onChange={(event) => setCustomNetworkForm((current) => ({
-                  ...current,
-                  rpcUrl: event.target.value,
-                }))}
-                required
-              />
-              <input
-                className="input input--compact"
-                aria-label="Custom network passphrase"
-                placeholder="Network passphrase"
-                value={customNetworkForm.passphrase}
-                onChange={(event) => setCustomNetworkForm((current) => ({
-                  ...current,
-                  passphrase: event.target.value,
-                }))}
-                required
-              />
-              <div className="section__row">
-                <button className="btn btn--secondary btn--sm" type="submit">
-                  Save custom network
-                </button>
-                {getAvailableNetworks().some((network) => network.id === "CUSTOM") && (
-                  <button
-                    className="btn btn--secondary btn--sm"
-                    type="button"
-                    onClick={handleRemoveCustomNetwork}
-                  >
-                    Remove
-                  </button>
-                )}
-              </div>
-            </form>
-          </details>
-        </div>
+        </label>
       </header>
 
       <main className="main">
@@ -3172,18 +1873,6 @@ export default function App() {
                   Explorer ↗
                 </a>
               </div>
-              {qrCodeDataUrl && (
-                <div className="qr-code-panel">
-                  <img
-                    className="qr-code-panel__image"
-                    src={qrCodeDataUrl}
-                    alt="QR code for the connected public address"
-                  />
-                  <p className="muted qr-code-panel__hint">
-                    Scan to copy the connected public address.
-                  </p>
-                </div>
-              )}
               {balances.filter((b) => !b.isNative).length > 0 && (
                 <div className="asset-chips">
                   {balances
@@ -3209,8 +1898,6 @@ export default function App() {
             </div>
           )}
         </section>
-
-        <TransactionFailureNotice failure={transactionFailure} />
 
         <nav className="tabs" aria-label="Lab sections" role="tablist">
           {TABS.map((t, index) => {
@@ -3302,18 +1989,6 @@ export default function App() {
                           <span className="metadata-value">{accountDetails.subentryCount}</span>
                         </div>
                         <div>
-                          <span className="metadata-label">Last modified ledger</span>
-                          <span className="metadata-value">
-                            {accountDetails.ledgerStatus?.lastModifiedLedger ?? "Unknown"}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="metadata-label">Latest Horizon ledger</span>
-                          <span className="metadata-value">
-                            {accountDetails.ledgerStatus?.latestLedger ?? "Unknown"}
-                          </span>
-                        </div>
-                        <div>
                           <span className="metadata-label">Thresholds</span>
                           <span className="metadata-value">
                             {accountDetails.thresholds?.low_threshold ?? "—"},{" "}
@@ -3322,9 +1997,6 @@ export default function App() {
                           </span>
                         </div>
                       </div>
-                      <p className="muted" role="status" style={{ marginTop: 8 }}>
-                        {accountDetails.ledgerStatus?.message ?? "Ledger age unknown."}
-                      </p>
                       <a
                         href={explorerAccountUrl(publicKey)}
                         className="text-link"
@@ -3336,26 +2008,119 @@ export default function App() {
                       </a>
                     </div>
                   )}
-                  <div className="section__row">
-                    <button className="btn btn--secondary" type="button" onClick={handleDisconnect}>
-                      Disconnect
-                    </button>
-                    <button
-                      className="btn btn--secondary"
-                      type="button"
-                      onClick={handleDownloadAccountSnapshot}
-                      disabled={loading === "snapshot"}
-                      title="Download a JSON snapshot of this account"
-                    >
-                      {loading === "snapshot" ? (
-                        <>
-                          <Spinner /> Exporting…
-                        </>
-                      ) : (
-                        "Download account JSON"
-                      )}
-                    </button>
-                  </div>
+                  {accountDetails?.signers && accountDetails.signers.length > 0 && (
+                    <div className="info-box">
+                      <span className="eyebrow">Signers & thresholds</span>
+                      <p className="muted" style={{ marginBottom: 12 }}>
+                        Tick signers to check if they meet the low, medium, and high thresholds.
+                      </p>
+                      <div style={{ marginBottom: 12 }}>
+                        {accountDetails.signers
+                          .filter((s) => s.weight > 0)
+                          .map((signer) => (
+                            <label
+                              key={signer.key}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                marginBottom: 8,
+                                cursor: "pointer",
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={selectedSigners.includes(signer.key)}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedSigners([...selectedSigners, signer.key]);
+                                  } else {
+                                    setSelectedSigners(
+                                      selectedSigners.filter((k) => k !== signer.key)
+                                    );
+                                  }
+                                }}
+                                style={{ cursor: "pointer" }}
+                              />
+                              <code style={{ flex: 1 }}>{shortenAddress(signer.key)}</code>
+                              <span className="muted">
+                                weight: {signer.weight}
+                                {signer.key === publicKey && " (master)"}
+                              </span>
+                            </label>
+                          ))}
+                      </div>
+                      {(() => {
+                        const thresholds = {
+                          low: accountDetails.thresholds?.low_threshold || 0,
+                          medium: accountDetails.thresholds?.med_threshold || 0,
+                          high: accountDetails.thresholds?.high_threshold || 0,
+                        };
+                        const result = checkThresholds(
+                          accountDetails.signers,
+                          selectedSigners,
+                          thresholds
+                        );
+                        return (
+                          <>
+                            <div style={{ marginBottom: 12 }}>
+                              <div className="metadata-grid">
+                                <div>
+                                  <span className="metadata-label">
+                                    Low ({thresholds.low})
+                                  </span>
+                                  <span
+                                    className="metadata-value"
+                                    style={{ color: result.low ? "#4ade80" : "#f87171" }}
+                                  >
+                                    {result.low ? "✓ Pass" : "✗ Fail"}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="metadata-label">
+                                    Medium ({thresholds.medium})
+                                  </span>
+                                  <span
+                                    className="metadata-value"
+                                    style={{ color: result.medium ? "#4ade80" : "#f87171" }}
+                                  >
+                                    {result.medium ? "✓ Pass" : "✗ Fail"}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="metadata-label">
+                                    High ({thresholds.high})
+                                  </span>
+                                  <span
+                                    className="metadata-value"
+                                    style={{ color: result.high ? "#4ade80" : "#f87171" }}
+                                  >
+                                    {result.high ? "✓ Pass" : "✗ Fail"}
+                                  </span>
+                                </div>
+                              </div>
+                              <div style={{ marginTop: 8 }}>
+                                <span className="metadata-label">Selected weight total</span>
+                                <span className="metadata-value"> {result.totalWeight}</span>
+                              </div>
+                            </div>
+                            {!result.canMeetHigh && (
+                              <div className="info-box info-box--warning" style={{ marginTop: 0 }}>
+                                <span className="eyebrow">⚠ Account locked out</span>
+                                <p className="muted">
+                                  No combination of existing signers can meet the high threshold.
+                                  The account cannot perform high-threshold operations.
+                                </p>
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </div>
+                  )}
+                  <button className="btn btn--secondary" type="button" onClick={handleDisconnect}>
+                    Disconnect
+                  </button>
                 </>
               )}
             </div>
@@ -3396,73 +2161,73 @@ export default function App() {
                   "Request Friendbot XLM"
                 )}
               </button>
-              <form className="form" onSubmit={handleCreateAccount}>
-                <h3 className="subhead">Create account from this wallet</h3>
-                <p className="muted">
-                  Create and fund a new Stellar account using XLM from the connected wallet.
-                </p>
-                <label className="label" htmlFor="create-account-key">
-                  New account public key
-                </label>
-                <input
-                  id="create-account-key"
-                  className="input"
-                  value={createAccountForm.destination}
-                  onChange={(e) =>
-                    setCreateAccountForm((prev) => ({
-                      ...prev,
-                      destination: e.target.value,
-                    }))
-                  }
-                  placeholder="G..."
-                  required
-                />
-                <label className="label" htmlFor="create-account-balance">
-                  Starting XLM balance
-                </label>
-                <input
-                  id="create-account-balance"
-                  className="input"
-                  type="number"
-                  min="1"
-                  step="0.0000001"
-                  value={createAccountForm.startingBalance}
-                  onChange={(e) =>
-                    setCreateAccountForm((prev) => ({
-                      ...prev,
-                      startingBalance: e.target.value,
-                    }))
-                  }
-                  required
-                />
+            </div>
+          )}
+
+          {activeTab === "Offers" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Open offers</h2>
                 <button
-                  className="btn btn--primary"
-                  type="submit"
-                  disabled={loading === "create-account" || requireWallet}
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={() => setOfferRefresh((count) => count + 1)}
+                  disabled={offerLoading || loading === "offer" || requireWallet}
                 >
-                  {loading === "create-account" ? (
-                    <>
-                      <Spinner /> Creating…
-                    </>
-                  ) : (
-                    "Create and fund account"
-                  )}
+                  Refresh
                 </button>
-              </form>
-              {createAccountResult && (
-                <div className="info-box">
-                  <span className="eyebrow">Funding submitted</span>
-                  <code>{createAccountResult.hash}</code>
-                  <a
-                    className="text-link"
-                    href={explorerAccountUrl(createAccountResult.destination)}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    View new account on StellarExpert ↗
+              </div>
+              <p className="muted">
+                Change the price of one offer. Its remaining amount and offer ID stay the same.
+              </p>
+              {requireWallet ? (
+                <p className="muted">Connect Freighter to view your offers.</p>
+              ) : offerLoading ? (
+                <p className="muted" role="status">Loading open offers…</p>
+              ) : offerError ? (
+                <p className="muted" role="alert">{offerError}</p>
+              ) : openOffers.length === 0 ? (
+                <p className="muted">No open offers on this network.</p>
+              ) : (
+                <ul className="balance-list">
+                  {openOffers.map((offer) => (
+                    <li key={offer.id} className="balance-row offer-row">
+                      <strong>
+                        {offer.selling.asset_code || "XLM"} → {offer.buying.asset_code || "XLM"}
+                      </strong>
+                      <span className="muted">Offer #{offer.id} · Remaining {offer.amount} {offer.selling.asset_code || "XLM"}</span>
+                      <form className="form" onSubmit={(event) => handleOfferPriceChange(event, offer)}>
+                        <label className="label" htmlFor={`offer-price-${offer.id}`}>
+                          New price ({offer.buying.asset_code || "XLM"} per {offer.selling.asset_code || "XLM"})
+                        </label>
+                        <input
+                          id={`offer-price-${offer.id}`}
+                          className="input"
+                          type="text"
+                          inputMode="decimal"
+                          required
+                          value={offerPrices[offer.id] || ""}
+                          onChange={(event) => setOfferPrices((previous) => ({ ...previous, [offer.id]: event.target.value }))}
+                        />
+                        <span className="muted">Current price: {offer.price} → New price: {offerPrices[offer.id] || "—"}</span>
+                        <button className="btn btn--primary" type="submit" disabled={loading === "offer" || offerLoading}>
+                          {loading === "offer" ? "Signing…" : "Sign price change"}
+                        </button>
+                      </form>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {offerResult && (
+                <div className="info-box" role="status">
+                  <span className="eyebrow">Offer #{offerResult.id} price change submitted</span>
+                  <p>Old price: {offerResult.oldPrice} → New price: {offerResult.newPrice}</p>
+                  <a className="text-link" href={explorerTxUrl(offerResult.hash)} target="_blank" rel="noreferrer">
+                    View transaction ↗
                   </a>
                 </div>
               )}
+              {txWatchPanel}
             </div>
           )}
 
@@ -3470,67 +2235,13 @@ export default function App() {
             <div className="section">
               <h2>Balances & trustlines</h2>
               <p className="muted">
-                View holdings, open a trustline, or remove an empty one with Freighter{" "}
-                <code>signTransaction</code>. Removing sets the limit to 0.
+                View holdings, open a trustline, remove an empty one, or revoke a sponsored
+                trustline with Freighter <code>signTransaction</code>.
               </p>
-              <div className="info-box">
-                <span className="eyebrow">Minimum XLM calculator</span>
-                <label className="label" htmlFor="reserve-subentries">
-                  Subentry count
-                </label>
-                <input
-                  id="reserve-subentries"
-                  className="input"
-                  type="number"
-                  min="0"
-                  step="1"
-                  value={reserveSubentryCount}
-                  onChange={(event) =>
-                    setReserveSubentryCount(event.target.value)
-                  }
-                />
-                {baseReserveInStroops == null ? (
-                  <p className="muted">
-                    {reserveError ||
-                      "Connect a wallet and load the latest ledger to calculate the minimum."}
-                  </p>
-                ) : !/^\d+$/.test(reserveSubentryCount) ? (
-                  <p className="muted">
-                    Enter a non-negative whole number of subentries.
-                  </p>
-                ) : (
-                  <p className="muted">
-                    Base reserve from the latest Horizon ledger:{" "}
-                    {formatStroops(baseReserveInStroops)} XLM. Minimum balance:{" "}
-                    {calculateMinimumBalance(baseReserveInStroops, reserveSubentryCount)}{" "}
-                    XLM.
-                  </p>
-                )}
-              </div>
 
-              <label className="label">
-                <input
-                  type="checkbox"
-                  checked={hideZeroCreditAssets}
-                  onChange={(event) => {
-                    const checked = event.target.checked;
-                    setHideZeroCreditAssets(checked);
-                    try {
-                      globalThis.localStorage?.setItem(
-                        HIDE_ZERO_ASSETS_STORAGE_KEY,
-                        String(checked)
-                      );
-                    } catch {
-                      /* The preference remains active for this session. */
-                    }
-                  }}
-                />{" "}
-                Hide zero-balance credit assets (trustlines remain)
-              </label>
-
-              {visibleAssetBalances.length > 0 ? (
+              {assetBalances.length > 0 ? (
                 <ul className="balance-list">
-                  {visibleAssetBalances.map((b) => (
+                  {assetBalances.map((b) => (
                     <li key={b.key} className="balance-row">
                       <div>
                         <strong>{b.code}</strong>
@@ -3539,14 +2250,13 @@ export default function App() {
                             {shortenAddress(b.issuer)}
                           </span>
                         )}
-                        <div className="balance-row__liabilities">
-                          <span className="liability selling" title="Selling liabilities (offers selling this asset)">
-                            ▼ {parseFloat(b.sellingLiabilities || "0").toLocaleString(undefined, { maximumFractionDigits: 7 })}
-                          </span>
-                          <span className="liability buying" title="Buying liabilities (offers buying this asset)">
-                            ▲ {parseFloat(b.buyingLiabilities || "0").toLocaleString(undefined, { maximumFractionDigits: 7 })}
-                          </span>
-                        </div>
+                        {!b.isNative && (
+                          <div className="muted balance-row__flags">
+                            Authorization: {b.isAuthorized === true ? "Authorized" : b.isAuthorized === false ? "Unauthorized" : "Unknown"}
+                            {" · "}Liabilities: {b.isAuthorizedToMaintainLiabilities === true ? "Authorized" : b.isAuthorizedToMaintainLiabilities === false ? "Unauthorized" : "Unknown"}
+                            {" · "}Clawback: {b.clawbackEnabled === true ? "Enabled" : b.clawbackEnabled === false ? "Disabled" : "Unknown"}
+                          </div>
+                        )}
                       </div>
                       <div className="balance-row__actions">
                         <span>
@@ -3556,21 +2266,21 @@ export default function App() {
                           })}
                         </span>
                         {!b.isNative && (
-                          <button
-                            className="btn btn--secondary btn--sm"
-                            type="button"
-                            onClick={() => handleRemoveTrust(b)}
-                            disabled={loading === `remove-${b.key}`}
-                            title={
-                              parseFloat(b.balance) > 0
-                                ? "Balance must be 0 before removing this trustline"
-                                : `Remove the ${b.code} trustline`
-                            }
-                          >
-                            {loading === `remove-${b.key}`
-                              ? "Removing…"
-                              : "Remove"}
-                          </button>
+                          <>
+                            <button
+                              className="btn btn--secondary btn--sm"
+                              type="button"
+                              onClick={() => handleRemoveTrust(b)}
+                              disabled={loading === `remove-${b.key}`}
+                              title={
+                                parseFloat(b.balance) > 0
+                                  ? "Balance must be 0 before removing this trustline"
+                                  : `Remove the ${b.code} trustline`
+                              }
+                            >
+                              {loading === `remove-${b.key}` ? "Removing…" : "Remove"}
+                            </button>
+                          </>
                         )}
                       </div>
                       {!b.isNative && (
@@ -3618,6 +2328,45 @@ export default function App() {
                     : "No balances yet — fund the account first."}
                 </p>
               )}
+
+              <div className="section">
+                <h3 className="subhead">Trustlines you sponsor</h3>
+                {sponsoredTrustlinesLoading ? (
+                  <p className="muted">Loading sponsored trustlines…</p>
+                ) : sponsoredTrustlinesError ? (
+                  <p className="muted">{sponsoredTrustlinesError}</p>
+                ) : sponsoredTrustlines.length === 0 ? (
+                  <p className="muted">You are not sponsoring any trustlines.</p>
+                ) : (
+                  <ul className="balance-list">
+                    {sponsoredTrustlines.map((asset) => (
+                      <li key={asset.key} className="balance-row">
+                        <div>
+                          <strong>{asset.code}</strong>
+                          <span className="muted balance-row__issuer">
+                            {shortenAddress(asset.issuer)}
+                          </span>
+                          <span className="muted balance-row__issuer">
+                            {asset.holder === publicKey
+                              ? "Held by connected account"
+                              : `Held by ${shortenAddress(asset.holder)}`}
+                          </span>
+                        </div>
+                        <button
+                          className="btn btn--secondary btn--sm"
+                          type="button"
+                          onClick={() => handleRevokeSponsorship(asset)}
+                          disabled={loading === `revoke-${asset.key}`}
+                        >
+                          {loading === `revoke-${asset.key}`
+                            ? "Revoking…"
+                            : "Revoke sponsorship"}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
 
               {poolShares.length > 0 && (
                 <div className="section">
@@ -3717,7 +2466,7 @@ export default function App() {
                           <button
                             className="btn btn--secondary btn--sm"
                             type="button"
-                            onClick={() => handleClawbackClaimable(balance)}
+                            onClick={() => handleClawback(balance)}
                             disabled={loading === `clawback-${balance.id}`}
                           >
                             {loading === `clawback-${balance.id}` ? "Clawing back…" : "Claw back"}
@@ -3768,53 +2517,10 @@ export default function App() {
                   value={trustForm.limit}
                   onChange={(e) => setTrustForm({ ...trustForm, limit: e.target.value })}
                 />
-                <div className="info-box" aria-live="polite">
-                  <span className="eyebrow">Trustline reserve check</span>
-                  {baseReserveInStroops == null ? (
-                    <p className="muted">
-                      {reserveError ||
-                        "Load the latest ledger before checking this trustline."}
-                    </p>
-                  ) : !accountDetails || trustlineMinimum == null ? (
-                    <p className="muted">
-                      Connect and load the source account, including its subentry count, to check its reserve.
-                    </p>
-                  ) : trustlineCheckError ? (
-                    <p className="muted">{trustlineCheckError}</p>
-                  ) : (
-                    <>
-                      <span>
-                        Extra reserve:{" "}
-                        {trustlineAlreadyExists
-                          ? "0.0000000"
-                          : formatStroops(baseReserveInStroops)}{" "}
-                        XLM
-                      </span>
-                      <span>
-                        Required after trustline and fee:{" "}
-                        {formatStroops(
-                          trustlineMinimum + BigInt(TRANSACTION_FEE_STROOPS)
-                        )}{" "}
-                        XLM
-                      </span>
-                      <strong>
-                        {trustlineAffordable
-                          ? "Source can cover the reserve and fee."
-                          : "Source balance is below the required reserve and fee."}
-                      </strong>
-                    </>
-                  )}
-                </div>
                 <button
                   className="btn btn--primary"
                   type="submit"
-                  disabled={
-                    loading === "trust" ||
-                    requireWallet ||
-                    !accountDetails ||
-                    baseReserveInStroops == null ||
-                    !trustlineAffordable
-                  }
+                  disabled={loading === "trust" || requireWallet}
                 >
                   {loading === "trust" ? (
                     <>
@@ -4083,28 +2789,6 @@ export default function App() {
                 envelope XDR, then sign in Freighter to submit it to Horizon Testnet.
               </p>
               <form onSubmit={handleSend} className="form">
-                <label className="label" htmlFor="sep7-uri">
-                  SEP-7 payment URI
-                </label>
-                <input
-                  id="sep7-uri"
-                  className="input"
-                  type="text"
-                  placeholder="web+stellar:pay?destination=G..."
-                  value={sep7Uri}
-                  onChange={(e) => handleSep7UriChange(e.target.value)}
-                />
-                {sep7Request && (
-                  <div className="muted">
-                    <p>Payment details imported from SEP-7.</p>
-                    <p>
-                      Origin domain: {sep7Request.originDomain || "Not provided"}
-                    </p>
-                    <p>
-                      Signature: {sep7Request.signature || "Not provided"}
-                    </p>
-                  </div>
-                )}
                 <label className="label" htmlFor="send-destination">
                   Destination (G… or M…)
                 </label>
@@ -4133,25 +2817,17 @@ export default function App() {
                   onChange={(e) => updateSendForm({ assetKey: e.target.value })}
                 >
                   <option value="native">XLM (native)</option>
-                  {sep7Request?.assetKey && sep7Request.assetKey !== "native" &&
-                    !balances.some((b) => b.key === sep7Request.assetKey) && (
-                      <option value={sep7Request.assetKey}>
-                        {sep7Request.assetCode} · requested by SEP-7
-                      </option>
-                    )}
                   {balances
-                    .filter((b) => !b.isNative)
-                    .map((b) => {
-                      const available = parseFloat(b.balance) - parseFloat(b.sellingLiabilities || "0");
-                      return (
-                        <option key={b.key} value={b.key}>
-                          {b.code} ·{" "}
-                          {available.toLocaleString(undefined, {
-                            maximumFractionDigits: 4,
-                          })}
-                        </option>
-                      );
-                    })}
+                    .filter((b) => !b.isNative && !b.isPoolShare)
+                    .map((b) => (
+                      <option key={b.key} value={b.key} disabled={b.isAuthorized === false}>
+                        {b.code} ·{" "}
+                        {parseFloat(b.balance).toLocaleString(undefined, {
+                          maximumFractionDigits: 4,
+                        })}
+                        {b.isAuthorized === false ? " · unauthorized (cannot send)" : ""}
+                      </option>
+                    ))}
                 </select>
                 {selectedSendAsset?.isAuthorized === false && (
                   <p className="muted" role="alert">
@@ -4159,7 +2835,7 @@ export default function App() {
                   </p>
                 )}
                 <label className="label" htmlFor="send-amount">
-                  Amount ({selectedSendAsset?.code ?? "XLM"}){selectedSendAssetAvailable !== null ? ` · Available: ${selectedSendAssetAvailable.toFixed(7)}` : ""}
+                  Amount ({selectedSendAsset?.code ?? "XLM"})
                 </label>
                 <input
                   id="send-amount"
@@ -4180,10 +2856,7 @@ export default function App() {
                   className="input"
                   value={sendForm.memoType}
                   onChange={(e) =>
-                    updateSendForm({
-                      memoType: e.target.value,
-                      memo: "",
-                    })
+                    updateSendForm({ memoType: e.target.value, memo: "" })
                   }
                 >
                   <option value="text">Text</option>
@@ -4229,16 +2902,6 @@ export default function App() {
                     </button>
                   </div>
                 )}
-                {signingConfirmationOpen && (
-                  <SigningPassphraseConfirmation
-                    network={activeNetwork}
-                    onConfirm={handleConfirmedSend}
-                    onCancel={() => {
-                      setSigningConfirmationOpen(false);
-                      showToast("Signing cancelled. Nothing was signed.", "info");
-                    }}
-                  />
-                )}
                 <div className="section__row">
                   <button
                     className="btn btn--secondary"
@@ -4257,12 +2920,7 @@ export default function App() {
                   <button
                     className="btn btn--primary"
                     type="submit"
-                    disabled={
-                      loading === "send" ||
-                      loading === "preview" ||
-                      signingConfirmationOpen ||
-                      requireWallet
-                    }
+                    disabled={loading === "send" || loading === "preview" || requireWallet}
                   >
                     {loading === "send" ? (
                       <>
@@ -4275,67 +2933,7 @@ export default function App() {
                 </div>
               </form>
 
-              {sendPrepared && (
-                <div className="info-box">
-                  <span className="eyebrow">Review payment</span>
-
-                  <p>
-                    <strong>Destination:</strong>
-                    <br />
-                    {sendPrepared.summary.destination}
-                  </p>
-
-                  <p>
-                    <strong>Amount:</strong>
-                    <br />
-                    {sendPrepared.summary.amount}
-                  </p>
-
-                  <p>
-                    <strong>Asset:</strong>
-                    <br />
-                    {sendPrepared.summary.asset}
-                  </p>
-
-                  <p>
-                    <strong>Memo:</strong>
-                    <br />
-                    {sendPrepared.summary.memo}
-                  </p>
-
-                  <p>
-                    <strong>Network fee:</strong>
-                    <br />
-                    {sendPrepared.summary.fee} stroops
-                  </p>
-
-                  <div className="info-box__actions">
-                    <button
-                      className="btn btn--primary"
-                      type="button"
-                      onClick={handleConfirmSend}
-                      disabled={loading === "send"}
-                    >
-                      {loading === "send" ? (
-                        <>
-                          <Spinner /> Waiting for Freighter…
-                        </>
-                      ) : (
-                        "Confirm in Freighter"
-                      )}
-                    </button>
-
-                    <button
-                      className="btn btn--secondary"
-                      type="button"
-                      disabled={loading === "send"}
-                      onClick={() => setSendPrepared(null)}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              )}
+              {txWatchPanel}
             </div>
           )}
 
@@ -4490,65 +3088,6 @@ export default function App() {
                 </p>
 
                 <button
-                  className="btn btn--secondary"
-                  type="button"
-                  onClick={handlePathQuote}
-                  disabled={loading === "pathquote"}
-                >
-                  {loading === "pathquote" ? (
-                    <>
-                      <Spinner /> Asking Horizon…
-                    </>
-                  ) : (
-                    "Get a Horizon path quote"
-                  )}
-                </button>
-
-                {pathQuote && (
-                  <div className="info-box">
-                    <span className="eyebrow">Horizon paths</span>
-                    {pathQuote.error ? (
-                      <p className="muted">{pathQuote.error}</p>
-                    ) : (
-                      <div className="tx-list">
-                        {pathQuote.paths.map((quote, index) => {
-                          const hops = formatPathHops(quote.path);
-                          const destLabel =
-                            pathForm.destAssetType === "native"
-                              ? "XLM"
-                              : pathForm.destCode;
-                          const sendLabel =
-                            pathForm.sendAssetType === "native"
-                              ? "XLM"
-                              : pathForm.sendCode;
-                          const estimate =
-                            pathForm.mode === "strictSend"
-                              ? `${quote.destinationAmount} ${destLabel} received`
-                              : `${quote.sourceAmount} ${sendLabel} spent`;
-                          return (
-                            <div key={`${hops}-${index}`} className="tx-item">
-                              <div className="tx-item__amount">
-                                {hops || "Direct path"}
-                              </div>
-                              <div className="tx-item__addr muted">
-                                {estimate}
-                              </div>
-                              <button
-                                className="btn btn--secondary"
-                                type="button"
-                                onClick={() => handleUsePath(quote.path)}
-                              >
-                                Use this path
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                <button
                   className="btn btn--primary"
                   type="submit"
                   disabled={loading === "path" || requireWallet}
@@ -4583,185 +3122,124 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === "Order" && (
+          {activeTab === "Offer" && (
+            <div className="section">
+              <h2>Price an offer</h2>
+              <p className="muted">
+                Read the live order book before pricing an offer. Selecting a row only fills the
+                price; nothing is signed or submitted.
+              </p>
+              <form onSubmit={handleOrderBook} className="form">
+                <label className="label" htmlFor="offer-selling-type">Selling asset</label>
+                <select id="offer-selling-type" className="input" value={offerForm.sellingType}
+                  onChange={(e) => updateOfferForm({ sellingType: e.target.value })}>
+                  <option value="native">XLM (native)</option>
+                  <option value="credit">Credit asset</option>
+                </select>
+                {offerForm.sellingType === "credit" && <>
+                  <input className="input" placeholder="Selling asset code, e.g. USDC" maxLength={12}
+                    value={offerForm.sellingCode} onChange={(e) => updateOfferForm({ sellingCode: e.target.value })} required />
+                  <input className="input" placeholder="Selling asset issuer G…"
+                    value={offerForm.sellingIssuer} onChange={(e) => updateOfferForm({ sellingIssuer: e.target.value })} required />
+                </>}
+                <label className="label" htmlFor="offer-buying-type">Buying asset</label>
+                <select id="offer-buying-type" className="input" value={offerForm.buyingType}
+                  onChange={(e) => updateOfferForm({ buyingType: e.target.value })}>
+                  <option value="native">XLM (native)</option>
+                  <option value="credit">Credit asset</option>
+                </select>
+                {offerForm.buyingType === "credit" && <>
+                  <input className="input" placeholder="Buying asset code, e.g. USDC" maxLength={12}
+                    value={offerForm.buyingCode} onChange={(e) => updateOfferForm({ buyingCode: e.target.value })} required />
+                  <input className="input" placeholder="Buying asset issuer G…"
+                    value={offerForm.buyingIssuer} onChange={(e) => updateOfferForm({ buyingIssuer: e.target.value })} required />
+                </>}
+                <label className="label" htmlFor="offer-price">Offer price (buying per selling)</label>
+                <input id="offer-price" className="input" type="number" min="0" step="any"
+                  value={offerForm.price} onChange={(e) => updateOfferForm({ price: e.target.value })}
+                  placeholder="Choose a bid or ask below" />
+                <button className="btn btn--primary" type="submit" disabled={loading === "order-book"}>
+                  {loading === "order-book" ? <><Spinner /> Loading book…</> : "Load order book"}
+                </button>
+              </form>
+              {orderBookError && <div className="info-box info-box--warning" role="alert">
+                <span className="eyebrow">Order book</span><p className="muted">{orderBookError}</p>
+              </div>}
+              {orderBook && <div className="order-book" aria-label="Order book">
+                {[['Bids', orderBook.bids], ['Asks', orderBook.asks]].map(([label, rows]) => (
+                  <div key={label} className="order-book__side">
+                    <h3 className="subhead">{label}</h3>
+                    {rows.length === 0 ? <p className="muted">No {label.toLowerCase()} available.</p> : (
+                      <div className="order-book__rows">
+                        {rows.map((row, index) => <button key={`${label}-${index}`} type="button"
+                          className="order-book__row" onClick={() => selectBookPrice(row)}>
+                          <span>{row.price}</span><span>{row.amount}</span>
+                        </button>)}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                <div className="order-book__header"><span>Price</span><span>Amount</span></div>
+              </div>}
+            </div>
+          )}
+          {activeTab === "Book" && (
             <div className="section">
               <div className="section__row">
-                <h2>Order Book</h2>
-                <p className="muted">
-                  Place, list, and cancel offers using your account assets.
-                </p>
+                <h2>Order book</h2>
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={() => {
+                    bookClearGenerationRef.current += 1;
+                    clearStoredOrderBookPair();
+                    setBookPair({ selling: "", buying: "" });
+                  }}
+                >
+                  Clear pair
+                </button>
               </div>
-              {publicKey ? (
-                <>
-                  <form className="form" onSubmit={handlePlaceOffer}>
-                    <label className="label" htmlFor="offer-selling-asset">
-                      Selling asset
-                    </label>
-                    <select
-                      id="offer-selling-asset"
-                      className="input"
-                      value={offerForm.sellingAssetKey}
-                      onChange={(e) =>
-                        setOfferForm({
-                          ...offerForm,
-                          sellingAssetKey: e.target.value,
-                        })
-                      }
-                      required
-                    >
-                      <option value="" disabled>
-                        Choose a held asset
-                      </option>
-                      {sellableAssets.map((asset) => (
-                        <option key={asset.key} value={asset.key}>
-                          {asset.isNative
-                            ? "XLM (native)"
-                            : `${asset.code} · ${shortenAddress(asset.issuer)}`}
-                        </option>
-                      ))}
-                    </select>
-                    <label className="label" htmlFor="offer-buying-asset">
-                      Buying asset
-                    </label>
-                    <select
-                      id="offer-buying-asset"
-                      className="input"
-                      value={offerForm.buyingAssetKey}
-                      onChange={(e) =>
-                        setOfferForm({
-                          ...offerForm,
-                          buyingAssetKey: e.target.value,
-                        })
-                      }
-                      required
-                    >
-                      <option value="" disabled>
-                        Choose an asset you can receive
-                      </option>
-                      {assetBalances.map((asset) => (
-                        <option key={asset.key} value={asset.key}>
-                          {asset.isNative
-                            ? "XLM (native)"
-                            : `${asset.code} · ${shortenAddress(asset.issuer)}`}
-                        </option>
-                      ))}
-                    </select>
-                    <p className="muted">
-                      Price is the buying-asset amount per one selling-asset unit.
-                    </p>
-                    <label className="label" htmlFor="offer-price-numerator">
-                      Price numerator
-                    </label>
-                    <input
-                      id="offer-price-numerator"
-                      className="input"
-                      type="number"
-                      min="1"
-                      step="1"
-                      value={offerForm.priceNumerator}
-                      onChange={(e) =>
-                        setOfferForm({
-                          ...offerForm,
-                          priceNumerator: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                    <label className="label" htmlFor="offer-price-denominator">
-                      Price denominator
-                    </label>
-                    <input
-                      id="offer-price-denominator"
-                      className="input"
-                      type="number"
-                      min="1"
-                      step="1"
-                      value={offerForm.priceDenominator}
-                      onChange={(e) =>
-                        setOfferForm({
-                          ...offerForm,
-                          priceDenominator: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                    <label className="label" htmlFor="offer-amount">
-                      Amount to sell
-                    </label>
-                    <input
-                      id="offer-amount"
-                      className="input"
-                      type="number"
-                      min="0.0000001"
-                      step="0.0000001"
-                      value={offerForm.amount}
-                      onChange={(e) =>
-                        setOfferForm({
-                          ...offerForm,
-                          amount: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                    <button
-                      className="btn btn--primary"
-                      type="submit"
-                      disabled={loading === "offer-place"}
-                    >
-                      {loading === "offer-place" ? "Submitting…" : "Place offer"}
-                    </button>
-                  </form>
-
-                  <div className="section__row">
-                    <h3 className="subhead">Active offers</h3>
-                    <button
-                      className="btn btn--secondary"
-                      type="button"
-                      onClick={handleListOffers}
-                      disabled={loadingOffers}
-                    >
-                      {loadingOffers ? "Loading…" : "Refresh offers"}
-                    </button>
-                  </div>
-                  {offerList.length > 0 ? (
-                    <ul className="balance-list">
-                      {offerList.map((offer) => {
-                        const assetLabel = (asset) =>
-                          asset.isNative
-                            ? "XLM"
-                            : `${asset.code} · ${shortenAddress(asset.issuer)}`;
-                        return (
-                          <li key={offer.offerId} className="balance-row">
-                            <div>
-                              <strong>Offer {offer.offerId}</strong>
-                              <p className="muted">
-                                Sell {offer.amount} {assetLabel(offer.selling)} for{" "}
-                                {assetLabel(offer.buying)} at{" "}
-                                {offer.priceNumerator}/{offer.priceDenominator}
-                              </p>
-                            </div>
-                            <button
-                              className="btn btn--secondary btn--sm"
-                              type="button"
-                              onClick={() => handleCancelOffer(offer)}
-                              disabled={
-                                loading === `offer-cancel-${offer.offerId}`
-                              }
-                            >
-                              {loading === `offer-cancel-${offer.offerId}`
-                                ? "Cancelling…"
-                                : "Cancel"}
-                            </button>
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  ) : (
-                    <p className="muted">No active offers loaded.</p>
-                  )}
-                </>
-              ) : (
-                <p className="muted">Connect Freighter to manage offers.</p>
+              <p className="muted">Enter XLM or CODE:ISSUER for each asset.</p>
+              <div className="form">
+                <label className="label" htmlFor="book-selling">Selling asset</label>
+                <input
+                  id="book-selling"
+                  className="input"
+                  type="text"
+                  placeholder="XLM"
+                  value={bookPair.selling}
+                  onChange={(event) => setBookPair((pair) => ({ ...pair, selling: event.target.value }))}
+                />
+                <label className="label" htmlFor="book-buying">Buying asset</label>
+                <input
+                  id="book-buying"
+                  className="input"
+                  type="text"
+                  placeholder="USDC:G…"
+                  value={bookPair.buying}
+                  onChange={(event) => setBookPair((pair) => ({ ...pair, buying: event.target.value }))}
+                />
+              </div>
+              {!parsedBookPair && (
+                <p className="muted">Choose two different valid assets to load the book.</p>
+              )}
+              {parsedBookPair && !currentBookResult && (
+                <p className="muted" role="status">Loading order book…</p>
+              )}
+              {currentBookResult?.error && (
+                <p className="muted" role="alert">{currentBookResult.error}</p>
+              )}
+              {currentBookResult?.data && (
+                <div className="info-box">
+                  <strong>Asks</strong>
+                  {currentBookResult.data.asks?.length ? currentBookResult.data.asks.slice(0, 10).map((offer, index) => (
+                    <span key={index}>Price {offer.price} · Amount {offer.amount}</span>
+                  )) : <span className="muted">No asks</span>}
+                  <strong>Bids</strong>
+                  {currentBookResult.data.bids?.length ? currentBookResult.data.bids.slice(0, 10).map((offer, index) => (
+                    <span key={index}>Price {offer.price} · Amount {offer.amount}</span>
+                  )) : <span className="muted">No bids</span>}
+                </div>
               )}
             </div>
           )}
@@ -4919,212 +3397,6 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === "Fees" && (
-            <div className="section">
-              <div className="section__row">
-                <h2>Network fee</h2>
-                <button
-                  className="btn btn--secondary"
-                  type="button"
-                  onClick={loadFeeStats}
-                  disabled={loading === "feestats"}
-                >
-                  {loading === "feestats" ? (
-                    <>
-                      <Spinner /> Loading…
-                    </>
-                  ) : (
-                    "Refresh stats"
-                  )}
-                </button>
-              </div>
-              <p className="muted">
-                Horizon reports the fees charged in the last ledger. Pick one of its
-                percentiles or type your own; the next payment, trustline, or path
-                payment uses that fee per operation.
-              </p>
-
-              <div className="info-box">
-                <span className="eyebrow">Current fee</span>
-                <code>
-                  {feeSetting
-                    ? `${feeSetting.stroops} stroops per operation`
-                    : "SDK default (100 stroops per operation)"}
-                </code>
-                {feeSetting && (
-                  <p className="muted" style={{ marginTop: 6 }}>
-                    Source:{" "}
-                    {feeSetting.source === "custom"
-                      ? "custom"
-                      : `Horizon ${feeSetting.source}`}
-                  </p>
-                )}
-              </div>
-
-              {feeStatsError && (
-                <div className="info-box info-box--warning" role="alert">
-                  <span className="eyebrow">Fee stats</span>
-                  <p className="muted">{feeStatsError}</p>
-                </div>
-              )}
-
-              {feeStats && (
-                <div className="info-box">
-                  <span className="eyebrow">
-                    Last ledger
-                    {feeStats.lastLedger ? ` · ${feeStats.lastLedger}` : ""}
-                  </span>
-                  <div className="metadata-grid">
-                    {FEE_PERCENTILES.map(({ key, label }) => (
-                      <div key={key}>
-                        <span className="metadata-label">{label}</span>
-                        <span className="metadata-value">
-                          {feeStats[key]} stroops
-                        </span>
-                        <button
-                          className="btn btn--secondary"
-                          type="button"
-                          onClick={() => applyFeePreset(key)}
-                        >
-                          Use {label}
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <form className="form" onSubmit={handleCustomFee}>
-                <label className="label" htmlFor="custom-fee">
-                  Custom fee (stroops per operation)
-                </label>
-                <input
-                  id="custom-fee"
-                  className="input"
-                  type="number"
-                  min="1"
-                  step="1"
-                  placeholder="e.g. 500"
-                  value={customFee}
-                  onChange={(e) => setCustomFee(e.target.value)}
-                />
-                <button className="btn btn--secondary" type="submit">
-                  Use custom fee
-                </button>
-              </form>
-            </div>
-          )}
-
-          {activeTab === "Offers" && (
-            <div className="section">
-              <h2>Watch an offer</h2>
-              <p className="muted">
-                Paste the id returned when an offer was placed. The panel polls the
-                remaining amount and price until the offer leaves the book or you stop
-                watching. Stopping the watch does not cancel the offer.
-              </p>
-
-              <form className="form" onSubmit={handleWatchOffer}>
-                <label className="label" htmlFor="offer-id">
-                  Offer id
-                </label>
-                <input
-                  id="offer-id"
-                  className="input"
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9]+"
-                  placeholder="e.g. 123456789"
-                  value={offerWatchId}
-                  onChange={(e) => setOfferWatchId(e.target.value)}
-                  required
-                />
-                <p className="muted">
-                  Watching only reads the order book. Offer placement and cancellation
-                  stay outside this panel.
-                </p>
-                <div className="section__row">
-                  <button className="btn btn--primary" type="submit">
-                    Watch offer
-                  </button>
-                  {offerWatch &&
-                    (offerWatch.status === "watching" ||
-                      offerWatch.status === "open") && (
-                      <button
-                        className="btn btn--secondary"
-                        type="button"
-                        onClick={stopOfferWatch}
-                      >
-                        Stop watching
-                      </button>
-                    )}
-                </div>
-              </form>
-
-              {offerWatchError && (
-                <div className="info-box info-box--warning" role="alert">
-                  <span className="eyebrow">Offer watch</span>
-                  <p className="muted">{offerWatchError}</p>
-                </div>
-              )}
-
-              {offerWatch && (
-                <div className="info-box" role="status" aria-live="polite">
-                  <span className="eyebrow">Offer {offerWatch.offerId}</span>
-                  {offerWatch.status === "watching" && (
-                    <p className="muted">Waiting for the first poll…</p>
-                  )}
-                  {offerWatch.status === "open" && (
-                    <div className="metadata-grid">
-                      <div>
-                        <span className="metadata-label">Remaining</span>
-                        <span className="metadata-value">{offerWatch.amount}</span>
-                      </div>
-                      <div>
-                        <span className="metadata-label">Price</span>
-                        <span className="metadata-value">{offerWatch.price ?? "—"}</span>
-                      </div>
-                      <div>
-                        <span className="metadata-label">Selling / buying</span>
-                        <span className="metadata-value">
-                          {offerWatch.selling ?? "—"} / {offerWatch.buying ?? "—"}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-                  {offerWatch.status === "gone" && (
-                    <>
-                      <p className="muted">
-                        The offer is no longer in the book.
-                        {" "}
-                        {offerWatch.stillListed === true
-                          ? "This account still lists it."
-                          : offerWatch.stillListed === false
-                            ? "This account no longer lists it."
-                            : publicKey
-                              ? "Whether the account still lists it could not be read."
-                              : "Connect Freighter to check whether the account still lists it."}
-                      </p>
-                      <p className="muted">
-                        The panel does not guess whether it filled or was cancelled.
-                      </p>
-                    </>
-                  )}
-                  {offerWatch.status === "stopped" && (
-                    <p className="muted">
-                      Watch stopped. The offer was not cancelled.
-                    </p>
-                  )}
-                  {offerWatch.status === "still-open" && (
-                    <p className="muted">
-                      The watch window ended while the offer was still in the book.
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-
           {activeTab === "Lab" && (
             <div className="section">
               <div className="section__row">
@@ -5170,163 +3442,20 @@ export default function App() {
                   <div className="info-box">
                     <span className="eyebrow">Soroban · kitewell</span>
                     <code>
-                      {activeContractId ||
-                        "Not deployed yet — deploy below or see contracts/README.md"}
+                      {labInfo.network.contract?.kitewell ||
+                        "Not deployed yet — see contracts/README.md"}
                     </code>
                     <p className="muted" style={{ marginTop: 6 }}>
-                      Status:{" "}
-                      {sessionContractId
-                        ? "deployed this session"
-                        : labInfo.network.contract?.status}
+                      Status: {labInfo.network.contract?.status}
                     </p>
                   </div>
-                  {!configuredContractId && (
-                    <div className="info-box">
-                      <span className="eyebrow">Deploy from Wasm</span>
-                      <p className="muted">
-                        No contract id is configured on the backend. Install the registry
-                        Wasm, then run <code>init</code> with your connected account as
-                        admin.
-                      </p>
-                      <label className="label" htmlFor="kitewell-wasm">
-                        kitewell.wasm
-                      </label>
-                      <input
-                        id="kitewell-wasm"
-                        className="input"
-                        type="file"
-                        accept=".wasm,application/wasm"
-                        onChange={(e) => {
-                          setWasmFile(e.target.files?.[0] ?? null);
-                          setConfirmRedeploy(false);
-                          setDeployError(null);
-                        }}
-                      />
-                      <p className="muted">
-                        Build with <code>npm run build:contracts</code> (output:{" "}
-                        <code>contracts/target/wasm32v1-none/release/kitewell.wasm</code>).
-                      </p>
-                      {!confirmRedeploy && (
-                        <button
-                          className="btn btn--secondary"
-                          type="button"
-                          onClick={handleDeploy}
-                          disabled={
-                            loading === "deploy" || requireWallet || !wasmFile
-                          }
-                        >
-                          {loading === "deploy" ? (
-                            <>
-                              <Spinner /> Installing &amp; initialising…
-                            </>
-                          ) : sessionContractId ? (
-                            "Deploy another…"
-                          ) : (
-                            "Install & init"
-                          )}
-                        </button>
-                      )}
-                      {!publicKey && (
-                        <p className="muted">
-                          Connect Freighter to sign the install and init transactions.
-                        </p>
-                      )}
-                      {sessionContractId && !confirmRedeploy && (
-                        <p className="muted">
-                          First id stays visible below; deploying again creates a new one
-                          and asks for confirmation first.
-                        </p>
-                      )}
-                      {confirmRedeploy && (
-                        <div className="info-box info-box--warning" style={{ marginTop: 8 }}>
-                          <span className="eyebrow">Confirm re-deploy</span>
-                          <p className="muted">
-                            A contract was already deployed this session:{" "}
-                            <code>{sessionContractId}</code>. A new deploy creates another
-                            id; the first stays listed below.
-                          </p>
-                          <div className="section__row">
-                            <button
-                              className="btn btn--secondary"
-                              type="button"
-                              onClick={() => setConfirmRedeploy(false)}
-                            >
-                              Cancel
-                            </button>
-                            <button
-                              className="btn btn--primary"
-                              type="button"
-                              onClick={handleDeploy}
-                              disabled={loading === "deploy" || !wasmFile}
-                            >
-                              {loading === "deploy" ? (
-                                <>
-                                  <Spinner /> Deploying…
-                                </>
-                              ) : (
-                                "Confirm deploy"
-                              )}
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  {deployError && (
-                    <div className="info-box info-box--warning">
-                      <span className="eyebrow">Deploy failed</span>
-                      <p className="muted">{deployError.message}</p>
-                      {deployError.contractId && (
-                        <p className="muted">
-                          Install succeeded with id <code>{deployError.contractId}</code>,
-                          but <code>init</code> did not complete.
-                        </p>
-                      )}
-                    </div>
-                  )}
-                  {sessionContractId && (
-                    <div className="info-box">
-                      <span className="eyebrow">Deployed this session</span>
-                      <code>{sessionContractId}</code>
-                      <div className="section__row">
-                        <button
-                          className="btn btn--secondary btn--sm"
-                          type="button"
-                          onClick={() => copyContractId(sessionContractId)}
-                        >
-                          Copy id
-                        </button>
-                        <span className="muted">Active for Lab reads &amp; register</span>
-                      </div>
-                      <p className="muted">
-                        Set{" "}
-                        <code>KITEWELL_CONTRACT_ID={sessionContractId}</code> on the
-                        backend to persist it. This panel does not write backend env vars.
-                      </p>
-                      {deployedContracts.length > 1 && (
-                        <div className="metadata-grid">
-                          {deployedContracts.map((entry, index) => (
-                            <div key={`${entry.contractId}-${index}`}>
-                              <span className="metadata-label">
-                                Deploy #{index + 1}
-                                {entry.contractId === sessionContractId
-                                  ? " · active"
-                                  : ""}
-                              </span>
-                              <code>{entry.contractId}</code>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
                   <div className="section__row">
                     <div className="subhead">On-chain registry</div>
                     <button
                       className="btn btn--secondary"
                       type="button"
                       onClick={refreshLabState}
-                      disabled={loading === "labstate" || !rpcHealth.ok}
+                      disabled={loading === "labstate"}
                     >
                       {loading === "labstate" ? (
                         <>
@@ -5337,14 +3466,6 @@ export default function App() {
                       )}
                     </button>
                   </div>
-                  <p className="muted" role="status">
-                    Contract instance: {contractStatusLabel(contractStatus)}
-                  </p>
-                  {contractCallBlock && (
-                    <div className="info-box info-box--warning">
-                      <p className="muted">{contractCallBlock}</p>
-                    </div>
-                  )}
                   {labState ? (
                     <div className="info-box">
                       <span className="eyebrow">Contract state</span>
@@ -5363,18 +3484,6 @@ export default function App() {
                             {publicKey ? labState.builder ?? "Not registered" : "Connect to check"}
                           </span>
                         </div>
-                        <div>
-                          <span className="metadata-label">paused</span>
-                          <span className="metadata-value">
-                            {labState.paused ? "Yes — registration paused" : "No"}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="metadata-label">get_admin</span>
-                          <span className="metadata-value">
-                            {labState.admin ? shortenAddress(labState.admin) : "Not set"}
-                          </span>
-                        </div>
                       </div>
                     </div>
                   ) : (
@@ -5382,172 +3491,12 @@ export default function App() {
                       Reads lab_name, builder_count, and get_builder via Soroban RPC.
                     </p>
                   )}
-                  <LabAdminPanel
-                    adminState={adminState}
-                    publicKey={publicKey}
-                    proposeAdminForm={proposeAdminForm}
-                    setProposeAdminForm={setProposeAdminForm}
-                    onProposeAdmin={handleProposeAdmin}
-                    onAcceptAdmin={handleAcceptAdmin}
-                    loading={loading}
-                    Spinner={Spinner}
-                  />
                   {labStateError && (
                     <div className="info-box info-box--warning">
-                      <span className="eyebrow">Contract state</span>
+                      <span className="eyebrow">Soroban RPC</span>
                       <p className="muted">{labStateError}</p>
                     </div>
                   )}
-
-                  <div className="section__row">
-                    <div className="subhead">Registered builders</div>
-                    <button
-                      className="btn btn--secondary"
-                      type="button"
-                      onClick={() => loadBuilderPage(0)}
-                      disabled={!configuredContractId || loading === "builders"}
-                    >
-                      {loading === "builders" ? (
-                        <>
-                          <Spinner /> Reading…
-                        </>
-                      ) : (
-                        "Refresh"
-                      )}
-                    </button>
-                    <button
-                      className="btn btn--secondary"
-                      type="button"
-                      disabled={!builderList}
-                      onClick={() =>
-                        downloadCsv(buildersToCsv(builderList?.rows), "builders.csv")
-                      }
-                      title="Download the builder page currently loaded"
-                    >
-                      Download CSV
-                    </button>
-                  </div>
-                  {!builderList && (
-                    <p className="muted">Load the builder registry to export it.</p>
-                  )}
-                  {builderList && builderList.rows.length === 0 && (
-                    <p className="muted">
-                      No builders on this page — the export will contain only the header.
-                    </p>
-                  )}
-                  {!configuredContractId && (
-                    <p className="muted">
-                      No contract id configured — no builders to list.
-                    </p>
-                  )}
-                  {builderListError && (
-                    <div className="info-box info-box--warning">
-                      <p className="muted">{builderListError}</p>
-                    </div>
-                  )}
-                  {builderList && configuredContractId && (
-                    <>
-                      <p className="muted">
-                        Loaded {builderList.rows.length} / builder_count{" "}
-                        {labState?.builderCount ?? "unavailable"}
-                      </p>
-                      {isBuilderCountMismatch(
-                        builderList.rows.length,
-                        labState?.builderCount,
-                        builderList.nextStart
-                      ) && (
-                        <div className="info-box info-box--warning">
-                          <p className="muted">
-                            Count mismatch: loaded {builderList.rows.length} builders,
-                            but the contract reports {labState.builderCount}.
-                          </p>
-                        </div>
-                      )}
-                      {builderList.rows.length > 0 ? (
-                        <ul className="balance-list">
-                          {builderList.rows.map((row) => (
-                            <li key={row.address} className="balance-row">
-                              <div>
-                                <strong>{row.name ?? "—"}</strong>
-                                <span className="muted balance-row__issuer">
-                                  {shortenAddress(row.address)}
-                                </span>
-                              </div>
-                            </li>
-                          ))}
-                        </ul>
-                      ) : (
-                        <p className="muted">
-                          {builderList.start > 0
-                            ? "Empty page — no more builders."
-                            : "No builders registered yet."}
-                        </p>
-                      )}
-                      {builderList.nextStart !== null && (
-                        <div className="section__row">
-                          <button
-                            className="btn btn--secondary btn--sm"
-                            type="button"
-                            disabled={loading === "builders"}
-                            onClick={() =>
-                              loadBuilderPage(
-                                builderList.nextStart,
-                                undefined,
-                                true
-                              )
-                            }
-                          >
-                            Load next page
-                          </button>
-                        </div>
-                      )}
-                    </>
-                  )}
-
-                  <form className="form" onSubmit={handleBuilderLookup}>
-                    <div className="subhead">Builder lookup</div>
-                    <label className="label" htmlFor="builder-lookup-address">
-                      Stellar address
-                    </label>
-                    <input
-                      id="builder-lookup-address"
-                      className="input"
-                      type="text"
-                      maxLength={56}
-                      placeholder="G…"
-                      value={builderAddress}
-                      onChange={(e) => setBuilderAddress(e.target.value)}
-                    />
-                    <button
-                      className="btn btn--secondary"
-                      type="submit"
-                      disabled={loading === "builder-lookup"}
-                    >
-                      {loading === "builder-lookup" ? (
-                        <>
-                          <Spinner /> Looking up…
-                        </>
-                      ) : (
-                        "Look up builder"
-                      )}
-                    </button>
-                  </form>
-                  {builderLookupError && (
-                    <div className="info-box info-box--warning">
-                      <p className="muted">{builderLookupError}</p>
-                    </div>
-                  )}
-                  {builderLookupResult && (
-                    <div className="info-box">
-                      <span className="eyebrow">Builder</span>
-                      {builderLookupResult.registered ? (
-                        <code>{builderLookupResult.name}</code>
-                      ) : (
-                        <span className="muted">Not registered</span>
-                      )}
-                    </div>
-                  )}
-
                   <form className="form" onSubmit={handleRegister}>
                     <label className="label" htmlFor="builder-name">
                       Builder name
@@ -5558,22 +3507,14 @@ export default function App() {
                       maxLength={64}
                       placeholder="e.g. stellar-alice"
                       value={registerForm.name}
-                      onChange={(e) => {
-                        setRegisterForm({ ...registerForm, name: e.target.value });
-                        setSimulationFees(null);
-                        setSimulatedRegisterKey(null);
-                      }}
+                      onChange={(e) =>
+                        setRegisterForm({ ...registerForm, name: e.target.value })
+                      }
                     />
                     <button
                       className="btn btn--primary"
                       type="submit"
-                      disabled={
-                        loading === "register" ||
-                        loading === "simulate" ||
-                        requireWallet ||
-                        !registerSimulationReady ||
-                        !canCallContract(contractStatus)
-                      }
+                      disabled={loading === "register" || requireWallet}
                     >
                       {loading === "register" ? (
                         <>
@@ -5587,19 +3528,14 @@ export default function App() {
                       className="btn btn--secondary"
                       type="button"
                       onClick={handleSimulateRegister}
-                      disabled={
-                        loading === "simulate" ||
-                        loading === "register" ||
-                        requireWallet ||
-                        !canCallContract(contractStatus)
-                      }
+                      disabled={loading === "simulate" || requireWallet}
                     >
                       {loading === "simulate" ? (
                         <>
                           <Spinner /> Simulating…
                         </>
                       ) : (
-                        "Simulate register"
+                        "Simulate fees"
                       )}
                     </button>
                     {!publicKey && <p className="muted">Connect Freighter to sign.</p>}
@@ -5609,42 +3545,34 @@ export default function App() {
                       <span className="eyebrow">Simulated fees (stroops)</span>
                       {simulationFees.error ? (
                         <p className="muted">
-                          Simulation failed: {simulationFees.error}
+                          Simulation failed: fees are unavailable.
                         </p>
                       ) : (
-                        <>
-                          <div className="metadata-grid">
-                            <div>
-                              <span className="metadata-label">Return value</span>
-                              <span className="metadata-value">
-                                {formatArgumentValue(simulationFees.returnValue)}
-                              </span>
-                            </div>
-                            <div>
-                              <span className="metadata-label">Inclusion fee</span>
-                              <span className="metadata-value">
-                                {formatSimulationFee(simulationFees.inclusionFee)}
-                              </span>
-                            </div>
-                            <div>
-                              <span className="metadata-label">Resource fee</span>
-                              <span className="metadata-value">
-                                {formatSimulationFee(simulationFees.resourceFee)}
-                              </span>
-                            </div>
-                            <div>
-                              <span className="metadata-label">Total fee</span>
-                              <span className="metadata-value">
-                                {formatSimulationFee(simulationFees.totalFee)}
-                              </span>
-                            </div>
+                        <div className="metadata-grid">
+                          <div>
+                            <span className="metadata-label">Inclusion fee</span>
+                            <span className="metadata-value">
+                              {formatSimulationFee(simulationFees.inclusionFee)}
+                            </span>
                           </div>
-                          <p className="muted">
-                            Simulation does not submit. Press Sign &amp; register to sign
-                            and submit this invocation.
-                          </p>
-                        </>
+                          <div>
+                            <span className="metadata-label">Resource fee</span>
+                            <span className="metadata-value">
+                              {formatSimulationFee(simulationFees.resourceFee)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="metadata-label">Total fee</span>
+                            <span className="metadata-value">
+                              {formatSimulationFee(simulationFees.totalFee)}
+                            </span>
+                          </div>
+                        </div>
                       )}
+                      <p className="muted">
+                        Simulation does not submit. Press Sign &amp; register to sign
+                        with these fees.
+                      </p>
                     </div>
                   )}
                   {lastRegisterTx && (
@@ -5653,261 +3581,6 @@ export default function App() {
                       <code>{lastRegisterTx.hash}</code>
                       <a
                         href={explorerTxUrl(lastRegisterTx.hash)}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-link"
-                      >
-                        Explorer ↗
-                      </a>
-                    </div>
-                  )}
-
-                  <div className="subhead">Sponsor a new account</div>
-                  <p className="muted">
-                    Creates the account and its reserve in one transaction:
-                    begin sponsoring, create the account with a starting balance of 0,
-                    then end sponsoring. The new key signs too, so both signatures are
-                    collected before submit.
-                  </p>
-                  <form className="form" onSubmit={handleSponsorAccount}>
-                    <label className="label" htmlFor="sponsor-new-account">
-                      New account public key
-                    </label>
-                    <input
-                      id="sponsor-new-account"
-                      className="input"
-                      type="text"
-                      placeholder="G…"
-                      value={sponsorForm.newAccount}
-                      onChange={(e) => {
-                        setSponsorForm({
-                          ...sponsorForm,
-                          newAccount: e.target.value,
-                        });
-                        setSponsorDraft(null);
-                      }}
-                      required
-                    />
-                    <button
-                      className="btn btn--secondary"
-                      type="button"
-                      onClick={handleBuildSponsorDraft}
-                      disabled={loading === "sponsor-draft" || requireWallet}
-                    >
-                      {loading === "sponsor-draft" ? (
-                        <>
-                          <Spinner /> Building…
-                        </>
-                      ) : (
-                        "Build unsigned envelope"
-                      )}
-                    </button>
-                    {sponsorDraft && (
-                      <div className="info-box">
-                        <span className="eyebrow">Unsigned envelope</span>
-                        <p className="muted">
-                          Have the new account sign this exact XDR, then paste the
-                          signed XDR below. Nothing has been submitted yet.
-                        </p>
-                        <textarea
-                          className="input"
-                          rows={4}
-                          readOnly
-                          spellCheck={false}
-                          value={sponsorDraft.xdr}
-                          onFocus={(e) => e.target.select()}
-                        />
-                        <p className="muted">Hash {sponsorDraft.hash}</p>
-                      </div>
-                    )}
-                    <label className="label" htmlFor="sponsor-cosigned-xdr">
-                      Co-signed envelope (base64 XDR)
-                    </label>
-                    <textarea
-                      id="sponsor-cosigned-xdr"
-                      className="input"
-                      rows={4}
-                      spellCheck={false}
-                      placeholder="Paste the XDR signed by the new account"
-                      value={sponsorForm.coSignedXdr}
-                      onChange={(e) =>
-                        setSponsorForm({
-                          ...sponsorForm,
-                          coSignedXdr: e.target.value,
-                        })
-                      }
-                    />
-                    <p className="muted">
-                      {sponsorForm.coSignedXdr.trim()
-                        ? "The sponsor signs this co-signed envelope in Freighter before it is sent."
-                        : "A missing second signature is never submitted."}
-                    </p>
-                    <button
-                      className="btn btn--primary"
-                      type="submit"
-                      disabled={
-                        loading === "sponsor" ||
-                        requireWallet ||
-                        !sponsorForm.newAccount.trim() ||
-                        !sponsorForm.coSignedXdr.trim()
-                      }
-                    >
-                      {loading === "sponsor" ? (
-                        <>
-                          <Spinner /> Signing in Freighter…
-                        </>
-                      ) : (
-                        "Sign as sponsor & submit"
-                      )}
-                    </button>
-                  </form>
-                  {sponsorResult && (
-                    <div className="info-box">
-                      <span className="eyebrow">Sponsored account</span>
-                      <p className="muted">
-                        New account id: {sponsorResult.newAccount}
-                      </p>
-                      <code>{sponsorResult.hash}</code>
-                      <a
-                        href={explorerTxUrl(sponsorResult.hash)}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-link"
-                      >
-                        Explorer ↗
-                      </a>
-                    </div>
-                  )}
-
-                  <div className="subhead">End a sponsorship</div>
-                  <p className="muted">
-                    Ends one entry from the sponsorship list with a single
-                    revoke-sponsorship operation. Nothing is signed until the
-                    confirmation below is accepted.
-                  </p>
-                  <form className="form" onSubmit={handleReviewEndSponsorship}>
-                    <label className="label" htmlFor="end-sponsor-account">
-                      Sponsored account
-                    </label>
-                    <input
-                      id="end-sponsor-account"
-                      className="input"
-                      type="text"
-                      placeholder="G…"
-                      value={endSponsorForm.sponsoredAccount}
-                      onChange={(e) => {
-                        setEndSponsorForm({
-                          ...endSponsorForm,
-                          sponsoredAccount: e.target.value,
-                        });
-                        setEndSponsorConfirmation(null);
-                      }}
-                    />
-                    <label className="label" htmlFor="end-sponsor-code">
-                      Asset code
-                    </label>
-                    <input
-                      id="end-sponsor-code"
-                      className="input"
-                      type="text"
-                      placeholder="USDC"
-                      maxLength={12}
-                      value={endSponsorForm.assetCode}
-                      onChange={(e) => {
-                        setEndSponsorForm({
-                          ...endSponsorForm,
-                          assetCode: e.target.value,
-                        });
-                        setEndSponsorConfirmation(null);
-                      }}
-                    />
-                    <label className="label" htmlFor="end-sponsor-issuer">
-                      Asset issuer
-                    </label>
-                    <input
-                      id="end-sponsor-issuer"
-                      className="input"
-                      type="text"
-                      placeholder="G…"
-                      value={endSponsorForm.assetIssuer}
-                      onChange={(e) => {
-                        setEndSponsorForm({
-                          ...endSponsorForm,
-                          assetIssuer: e.target.value,
-                        });
-                        setEndSponsorConfirmation(null);
-                      }}
-                    />
-                    <button
-                      className="btn btn--secondary"
-                      type="submit"
-                      disabled={
-                        loading === "end-sponsorship" ||
-                        requireWallet ||
-                        !hasEndSponsorshipAction({
-                          entryType: "trustline",
-                          ...endSponsorForm,
-                        })
-                      }
-                    >
-                      Review
-                    </button>
-                  </form>
-                  {endSponsorConfirmation && (
-                    <div className="info-box info-box--warning">
-                      <span className="eyebrow">Confirm end sponsorship</span>
-                      <p className="muted">{endSponsorConfirmation.message}</p>
-                      <div className="metadata-grid">
-                        <div>
-                          <span className="metadata-label">
-                            Sponsored account
-                          </span>
-                          <span className="metadata-value">
-                            {endSponsorConfirmation.sponsoredAccount}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="metadata-label">Entry</span>
-                          <span className="metadata-value">
-                            {endSponsorConfirmation.entryLabel}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="section__row">
-                        <button
-                          className="btn btn--secondary"
-                          type="button"
-                          onClick={() => setEndSponsorConfirmation(null)}
-                        >
-                          Cancel
-                        </button>
-                        <button
-                          className="btn btn--primary"
-                          type="button"
-                          onClick={handleEndSponsorship}
-                          disabled={loading === "end-sponsorship"}
-                        >
-                          {loading === "end-sponsorship" ? (
-                            <>
-                              <Spinner /> Signing in Freighter…
-                            </>
-                          ) : (
-                            "Sign & end sponsorship"
-                          )}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                  {endSponsorResult && (
-                    <div className="info-box">
-                      <span className="eyebrow">Sponsorship ended</span>
-                      <p className="muted">
-                        {endSponsorResult.entryLabel} held by{" "}
-                        {endSponsorResult.sponsoredAccount}
-                      </p>
-                      <code>{endSponsorResult.hash}</code>
-                      <a
-                        href={explorerTxUrl(endSponsorResult.hash)}
                         target="_blank"
                         rel="noreferrer"
                         className="text-link"
@@ -6129,213 +3802,8 @@ export default function App() {
                       </p>
                     )
                   )}
-
-                  <div className="subhead">Replay from a ledger</div>
-                  <p className="muted">
-                    A one-shot read of register and pause events from a start ledger,
-                    up to 200 at a time. The live tail above is left alone.
-                  </p>
-                  <form className="form" onSubmit={handleReplayEvents}>
-                    <label className="label" htmlFor="replay-start-ledger">
-                      Start ledger
-                    </label>
-                    <input
-                      id="replay-start-ledger"
-                      className="input"
-                      type="number"
-                      min="1"
-                      step="1"
-                      placeholder="e.g. 1234567"
-                      value={replayForm}
-                      onChange={(e) => setReplayForm(e.target.value)}
-                      required
-                    />
-                    <button
-                      className="btn btn--primary"
-                      type="submit"
-                      disabled={loading === "replay" || !configuredContractId}
-                    >
-                      {loading === "replay" ? (
-                        <>
-                          <Spinner /> Reading…
-                        </>
-                      ) : (
-                        "Replay events"
-                      )}
-                    </button>
-                  </form>
-                  {replayError && (
-                    <div className="info-box info-box--warning">
-                      <p className="muted">{replayError}</p>
-                    </div>
-                  )}
-                  {replayEvents.length > 0 && (
-                    <ul className="balance-list">
-                      {replayEvents.map((event) => (
-                        <li key={event.id} className="balance-row">
-                          <div>
-                            <strong>{event.type}</strong>
-                            <span className="muted balance-row__issuer">
-                              ledger {event.ledger}
-                            </span>
-                          </div>
-                          <div className="muted">
-                            {event.type === "register"
-                              ? `${event.name ?? "—"} · ${shortenAddress(event.caller)} · ${
-                                  event.isNew ? "new builder" : "existing"
-                                }`
-                              : `paused = ${String(event.paused)}`}
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
                 </>
               )}
-              {/* Signers, weights, and thresholds management */}
-              <div className="section" id="signers-thresholds-section">
-                <div className="section__row">
-                  <h2>Signer weights & thresholds</h2>
-                  <p className="muted">
-                    Manage account thresholds and signer weights. Weights are 0–255.
-                    A weight of 0 removes a signer.
-                  </p>
-                </div>
-                {accountDetails ? (
-                  <div className="metadata-grid">
-                    <div>
-                      <span className="metadata-label">Current low threshold</span>
-                      <span className="metadata-value">{accountDetails.thresholds?.low ?? 0}</span>
-                    </div>
-                    <div>
-                      <span className="metadata-label">Current medium threshold</span>
-                      <span className="metadata-value">{accountDetails.thresholds?.medium ?? 0}</span>
-                    </div>
-                    <div>
-                      <span className="metadata-label">Current high threshold</span>
-                      <span className="metadata-value">{accountDetails.thresholds?.high ?? 0}</span>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="muted">Connect Freighter to view current thresholds.</p>
-                )}
-                {!accountDetails && !publicKey && (
-                  <p className="muted">Connect Freighter to manage signers and thresholds.</p>
-                )}
-                {accountDetails && (
-                  <form className="form" onSubmit={handleSetOptions}>
-                    <div className="metadata-grid">
-                      <div>
-                        <span className="metadata-label">Low threshold</span>
-                        <input
-                          type="number"
-                          min="0"
-                          max="255"
-                          step="1"
-                          value={lowThreshold}
-                          onChange={(e) => setLowThreshold(Number(e.target.value))}
-                        />
-                      </div>
-                      <div>
-                        <span className="metadata-label">Medium threshold</span>
-                        <input
-                          type="number"
-                          min="0"
-                          max="255"
-                          step="1"
-                          value={medThreshold}
-                          onChange={(e) => setMedThreshold(Number(e.target.value))}
-                        />
-                      </div>
-                      <div>
-                        <span className="metadata-label">High threshold</span>
-                        <input
-                          type="number"
-                          min="0"
-                          max="255"
-                          step="1"
-                          value={highThreshold}
-                          onChange={(e) => setHighThreshold(Number(e.target.value))}
-                        />
-                      </div>
-                    </div>
-                    <div className="section__row">
-                      <span className="metadata-label">Signers</span>
-                      <span className="metadata-value">{signers.length}</span>
-                    </div>
-                    {signers.length > 0 && (
-                      <ul className="signer-list">
-                        {signers.map((signer, index) => (
-                          <li key={signer} className="signer-row">
-                            <span className="signer-address">{signer}</span>
-                            <span className="signer-weight">
-                              <input
-                                type="number"
-                                min="0"
-                                max="255"
-                                step="1"
-                                value={signerWeights[index] ?? 0}
-                                onChange={(e) => handleSignerWeightChange(index, Number(e.target.value))}
-                              />
-                            </span>
-                            <button
-                              className="btn btn--secondary btn--sm"
-                              type="button"
-                              onClick={() => handleRemoveSigner(index)}
-                            >
-                              Remove
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                    {signers.length < 4 && (
-                      <div className="section__row">
-                        <span className="metadata-label">Add signer</span>
-                        <input
-                          type="text"
-                          placeholder="Signer public key (G...)"
-                          onChange={(e) => handleAddSigner(e.target.value)}
-                        />
-                        <button
-                          className="btn btn--primary"
-                          type="button"
-                          onClick={() => handleAddSigner(signerInput)}
-                          disabled={!signerInput}
-                        >
-                          Add
-                        </button>
-                      </div>
-                    )}
-                    <div className="section__row">
-                      <button
-                        className="btn btn--primary"
-                        type="submit"
-                        disabled={loading === "setoptions" || requireWallet}
-                      >
-                        {loading === "setoptions" ? (
-                          <>
-                            <Spinner /> Signing in Freighter…
-                          </>
-                        ) : (
-                          "Submit setOptions"
-                        )}
-                      </button>
-                    </div>
-                  </form>
-                )}
-                {accountDetails && (
-                  <div className="warning-box">
-                    <span className="eyebrow">Warning</span>
-                    <p className="muted">
-                      {medThreshold > (signers.reduce((sum, signer) => sum + (signerWeights[signers.indexOf(signer)] ?? 0), 0) || 0)
-                        ? "Medium threshold exceeds total signer weights."
-                        : "Thresholds are covered by the current signer weights."}
-                    </p>
-                  </div>
-                )}
-              </div>
-              <MultisigCosignPanel publicKey={publicKey} onToast={showToast} />
               {!labInfo && !labError && (
                 <p className="muted">Open this tab to probe the backend.</p>
               )}
@@ -6357,6 +3825,76 @@ export default function App() {
                   Download failed JSON
                 </button>
               </div>
+
+              {txWatchPanel}
+            </div>
+          )}
+
+          {activeTab === "Issue" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Issue Credit Asset</h2>
+                <p className="muted">
+                  Send a new credit asset from your issuer account to a holder.
+                </p>
+              </div>
+              {publicKey ? (
+                <form className="form" onSubmit={handleIssue}>
+                  <label className="label" htmlFor="issue-asset-code">
+                    Asset code
+                  </label>
+                  <input
+                    id="issue-asset-code"
+                    className="input"
+                    value={issueForm.code}
+                    onChange={(e) =>
+                      setIssueForm({ ...issueForm, code: e.target.value })
+                    }
+                    placeholder="e.g. MYASSET"
+                    maxLength={12}
+                    required
+                  />
+                  <label className="label" htmlFor="issue-destination">
+                    Holder account
+                  </label>
+                  <input
+                    id="issue-destination"
+                    className="input"
+                    type="text"
+                    placeholder="G…"
+                    value={issueForm.destination}
+                    onChange={(e) =>
+                      setIssueForm({ ...issueForm, destination: e.target.value })
+                    }
+                    required
+                  />
+                  <label className="label" htmlFor="issue-amount">
+                    Amount to issue
+                  </label>
+                  <input
+                    id="issue-amount"
+                    className="input"
+                    type="number"
+                    min="0.0000001"
+                    step="0.0000001"
+                    placeholder="e.g. 1000000"
+                    value={issueForm.amount}
+                    onChange={(e) =>
+                      setIssueForm({ ...issueForm, amount: e.target.value })
+                    }
+                    required
+                  />
+                  <p className="muted">
+                    The holder must already have a trustline for this asset.
+                    Connected issuer: <code>{publicKey}</code>
+                  </p>
+                  <button className="btn btn--primary" type="submit">
+                    {loading === "issue" ? "Issuing…" : "Issue to holder"}
+                  </button>
+                </form>
+              ) : (
+                <p className="muted">Connect Freighter to issue an asset.</p>
+              )}
             </div>
           )}
 
@@ -6370,223 +3908,6 @@ export default function App() {
                   onClick={handleHistory}
                   disabled={loading === "history" || requireWallet}
                 >
-                  {loading === "history" ? "Loading…" : "Refresh"}
-                </button>
-              </div>
-
-              {txWatchPanel}
-            </div>
-          )}
-
-          {activeTab === "Liquidity" && (
-            <div className="section">
-              <div className="section__row">
-                <h2>Liquidity Pool</h2>
-                <p className="muted">
-                  Deposit into or withdraw from a constant-product pool.
-                </p>
-              </div>
-              <form className="form" onSubmit={handleLiquidity}>
-                <label className="label" htmlFor="liquidity-pool-id">
-                  Pool ID
-                </label>
-                <input
-                  id="liquidity-pool-id"
-                  className="input"
-                  type="text"
-                  maxLength={64}
-                  pattern="[0-9a-fA-F]{64}"
-                  placeholder="64 hexadecimal characters"
-                  value={liquidityForm.poolId}
-                  onChange={(e) =>
-                    setLiquidityForm({
-                      ...liquidityForm,
-                      poolId: e.target.value,
-                    })
-                  }
-                  required
-                />
-                <label className="label" htmlFor="liquidity-mode">
-                  Operation
-                </label>
-                <select
-                  id="liquidity-mode"
-                  className="input"
-                  value={liquidityForm.mode}
-                  onChange={(e) =>
-                    setLiquidityForm({
-                      ...liquidityForm,
-                      mode: e.target.value,
-                    })
-                  }
-                >
-                  <option value="deposit">Deposit</option>
-                  <option value="withdraw">Withdraw</option>
-                </select>
-
-                {liquidityForm.mode === "deposit" ? (
-                  <>
-                    <p className="muted">
-                      Reserve A/B amounts follow the order returned by Horizon.
-                    </p>
-                    <label className="label" htmlFor="liquidity-max-amount-a">
-                      Maximum amount A
-                    </label>
-                    <input
-                      id="liquidity-max-amount-a"
-                      className="input"
-                      type="number"
-                      min="0.0000001"
-                      step="0.0000001"
-                      value={liquidityForm.maxAmountA}
-                      onChange={(e) =>
-                        setLiquidityForm({
-                          ...liquidityForm,
-                          maxAmountA: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                    <label className="label" htmlFor="liquidity-max-amount-b">
-                      Maximum amount B
-                    </label>
-                    <input
-                      id="liquidity-max-amount-b"
-                      className="input"
-                      type="number"
-                      min="0.0000001"
-                      step="0.0000001"
-                      value={liquidityForm.maxAmountB}
-                      onChange={(e) =>
-                        setLiquidityForm({
-                          ...liquidityForm,
-                          maxAmountB: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                    <label className="label" htmlFor="liquidity-min-price">
-                      Minimum price
-                    </label>
-                    <input
-                      id="liquidity-min-price"
-                      className="input"
-                      type="number"
-                      min="0"
-                      step="any"
-                      value={liquidityForm.minPrice}
-                      onChange={(e) =>
-                        setLiquidityForm({
-                          ...liquidityForm,
-                          minPrice: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                    <label className="label" htmlFor="liquidity-max-price">
-                      Maximum price
-                    </label>
-                    <input
-                      id="liquidity-max-price"
-                      className="input"
-                      type="number"
-                      min="0"
-                      step="any"
-                      value={liquidityForm.maxPrice}
-                      onChange={(e) =>
-                        setLiquidityForm({
-                          ...liquidityForm,
-                          maxPrice: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                  </>
-                ) : (
-                  <>
-                    <label className="label" htmlFor="liquidity-share-amount">
-                      Pool shares to withdraw
-                    </label>
-                    <input
-                      id="liquidity-share-amount"
-                      className="input"
-                      type="number"
-                      min="0.0000001"
-                      step="0.0000001"
-                      value={liquidityForm.amount}
-                      onChange={(e) =>
-                        setLiquidityForm({
-                          ...liquidityForm,
-                          amount: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                    <label className="label" htmlFor="liquidity-min-amount-a">
-                      Minimum amount A out
-                    </label>
-                    <input
-                      id="liquidity-min-amount-a"
-                      className="input"
-                      type="number"
-                      min="0.0000001"
-                      step="0.0000001"
-                      value={liquidityForm.minAmountA}
-                      onChange={(e) =>
-                        setLiquidityForm({
-                          ...liquidityForm,
-                          minAmountA: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                    <label className="label" htmlFor="liquidity-min-amount-b">
-                      Minimum amount B out
-                    </label>
-                    <input
-                      id="liquidity-min-amount-b"
-                      className="input"
-                      type="number"
-                      min="0.0000001"
-                      step="0.0000001"
-                      value={liquidityForm.minAmountB}
-                      onChange={(e) =>
-                        setLiquidityForm({
-                          ...liquidityForm,
-                          minAmountB: e.target.value,
-                        })
-                      }
-                      required
-                    />
-                  </>
-                )}
-                <button
-                  className="btn btn--primary"
-                  type="submit"
-                  disabled={loading === "liquidity"}
-                >
-                  {loading === "liquidity" ? (
-                    <>
-                      <Spinner /> Submitting…
-                    </>
-                  ) : (
-                    "Sign and submit"
-                  )}
-                </button>
-              </form>
-            </div>
-          )}
-
-          {activeTab === "History" && (
-            <div className="section">
-              <div className="section__row">
-                <h2>Payment history</h2>
-                <button
-                  className="btn btn--secondary"
-                  type="button"
-                  onClick={handleHistory}
-                  disabled={loading.startsWith("history") || requireWallet}
-                >
                   {loading === "history" ? (
                     <>
                       <Spinner /> Loading…
@@ -6599,76 +3920,18 @@ export default function App() {
               <p className="muted" aria-live="polite">
                 {streamStatusLabel(streamState)}
               </p>
-              {historyError && (
-                <div className="info-box info-box--warning" role="alert">
-                  <p className="muted">{historyError}</p>
-                </div>
-              )}
-              <div className="section__row">
-                <label className="label">
-                  Asset
-                  <select
-                    className="input"
-                    aria-label="Filter payment history by asset"
-                    value={historyFilters.asset}
-                    onChange={(event) =>
-                      setHistoryFilters((previous) => ({
-                        ...previous,
-                        asset: event.target.value,
-                      }))
-                    }
-                  >
-                    <option value="">All assets</option>
-                    {historyAssets.map((asset) => (
-                      <option key={asset} value={asset}>
-                        {asset}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="label">
-                  Direction
-                  <select
-                    className="input"
-                    aria-label="Filter payment history by direction"
-                    value={historyFilters.direction}
-                    onChange={(event) =>
-                      setHistoryFilters((previous) => ({
-                        ...previous,
-                        direction: event.target.value,
-                      }))
-                    }
-                  >
-                    <option value="">Sent and received</option>
-                    <option value="sent">Sent</option>
-                    <option value="received">Received</option>
-                  </select>
-                </label>
-              </div>
-              <p className="muted">
-                Current cursor: <code>{currentHistoryCursor || "first page"}</code>
-              </p>
-              {filteredTransactions.length > 0 ? (
+              {visibleTransactions.length > 0 ? (
                 <div className="tx-list">
-                  {filteredTransactions.map((tx) => {
+                  {visibleTransactions.map((tx) => {
                     const isOutgoing = tx.from === publicKey;
                     const createdAt = formatCreatedAt(tx.created_at);
-                    const memo = mapPaymentMemo(tx);
                     return (
                       <div
                         key={tx.id}
-                        className={`tx-item tx-item--selectable ${isOutgoing ? "tx-item--out" : "tx-item--in"}`}
-                        onClick={() => setSelectedTxHash(tx.transaction_hash)}
+                        className={`tx-item ${isOutgoing ? "tx-item--out" : "tx-item--in"}`}
                       >
                         <div className="tx-item__direction">
                           {isOutgoing ? "Sent" : "Received"}
-                          <button
-                            className="tx-item__details-btn"
-                            type="button"
-                            aria-pressed={selectedTxHash === tx.transaction_hash}
-                          >
-                            Details
-                          </button>
                         </div>
                         <div className="tx-item__amount">
                           {parseFloat(tx.amount).toLocaleString()} {tx.asset_code || "XLM"}
@@ -6683,17 +3946,9 @@ export default function App() {
                           target="_blank"
                           rel="noreferrer"
                           className="tx-item__link"
-                          onClick={(event) => event.stopPropagation()}
                         >
                           Explorer ↗
                         </a>
-                        <div className="tx-item__fee muted">
-                          {formatHistoryFee(tx)}
-                        </div>
-                        <div className="tx-item__memo">
-                          <span className="metadata-label">{memo.label}</span>
-                          <span className="tx-item__memo-value">{memo.value}</span>
-                        </div>
                         {createdAt && (
                           <time
                             className="tx-item__time"
@@ -6707,44 +3962,26 @@ export default function App() {
                   })}
                 </div>
               ) : (
-                !loading && (
-                  <p className="muted">
-                    {visibleTransactions.length > 0
-                      ? "No payments match these filters."
-                      : "No payments yet."}
-                  </p>
-                )
+                !loading && <p className="muted">No payments yet.</p>
               )}
-              <div className="section__row">
-                <button
-                  className="btn btn--secondary"
-                  type="button"
-                  onClick={handleLoadPrevious}
-                  disabled={pageCursors.length < 2 || loading.startsWith("history")}
-                >
-                  {loading === "history-previous" ? (
-                    <>
-                      <Spinner /> Loading…
-                    </>
-                  ) : (
-                    "Previous page"
-                  )}
-                </button>
-                <button
-                  className="btn btn--secondary"
-                  type="button"
-                  onClick={handleLoadNext}
-                  disabled={!nextCursor || loading.startsWith("history")}
-                >
-                  {loading === "history-next" ? (
-                    <>
-                      <Spinner /> Loading…
-                    </>
-                  ) : (
-                    "Next page"
-                  )}
-                </button>
-              </div>
+              {nextCursor && (
+                <div className="section__row">
+                  <button
+                    className="btn btn--secondary"
+                    type="button"
+                    onClick={handleLoadMore}
+                    disabled={loading === "history-more"}
+                  >
+                    {loading === "history-more" ? (
+                      <>
+                        <Spinner /> Loading…
+                      </>
+                    ) : (
+                      "Load more"
+                    )}
+                  </button>
+                </div>
+              )}
 
               {txWatchPanel}
             </div>
@@ -7139,90 +4376,52 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === "Trades" && (
+          {activeTab === "Pending" && (
             <div className="section">
               <div className="section__row">
-                <h2>Trade history</h2>
+                <h2>Pending transactions</h2>
                 <button
                   className="btn btn--secondary"
                   type="button"
-                  onClick={handleTrades}
-                  disabled={loading === "trades" || requireWallet}
+                  onClick={refreshPending}
+                  disabled={requireWallet}
                 >
-                  {loading === "trades" ? (
-                    <>
-                      <Spinner /> Loading…
-                    </>
-                  ) : (
-                    "Refresh"
-                  )}
+                  Refresh
                 </button>
               </div>
               <p className="muted">
-                Trades that filled offers on the decentralized exchange. This list is
-                separate from payment history.
+                Transactions Horizon has accepted but not applied yet for this
+                account. The list refreshes while this panel is open.
               </p>
-              {trades.length > 0 ? (
+              {requireWallet ? (
+                <p className="muted">Connect a wallet to load the pending queue.</p>
+              ) : pendingError ? (
+                <div className="info-box info-box--warning">
+                  <span className="eyebrow">Pending queue</span>
+                  <p className="muted">{pendingError}</p>
+                </div>
+              ) : pendingTransactions.length > 0 ? (
                 <div className="tx-list">
-                  {trades.map((trade) => {
-                    const isSeller = trade.base_account === publicKey;
-                    const soldAsset = isSeller
-                      ? trade.base_asset_code || "XLM"
-                      : trade.counter_asset_code || "XLM";
-                    const boughtAsset = isSeller
-                      ? trade.counter_asset_code || "XLM"
-                      : trade.base_asset_code || "XLM";
-                    const soldAmount = isSeller ? trade.base_amount : trade.counter_amount;
-                    const boughtAmount = isSeller ? trade.counter_amount : trade.base_amount;
-                    const price = trade.price?.n && trade.price?.d
-                      ? (parseFloat(trade.price.n) / parseFloat(trade.price.d)).toFixed(7)
-                      : "—";
-                    const tradeTime = formatCreatedAt(trade.ledger_close_time);
-
-                    return (
-                      <div key={trade.id} className="tx-item">
-                        <div className="tx-item__direction">Trade</div>
-                        <div className="tx-item__amount">
-                          Sold {parseFloat(soldAmount).toLocaleString()} {soldAsset}
-                        </div>
-                        <div className="tx-item__amount">
-                          Bought {parseFloat(boughtAmount).toLocaleString()} {boughtAsset}
-                        </div>
-                        <div className="tx-item__addr muted">
-                          Price: {price}
-                        </div>
-                        {tradeTime && (
-                          <time
-                            className="tx-item__time"
-                            dateTime={trade.ledger_close_time}
-                          >
-                            {tradeTime}
-                          </time>
-                        )}
+                  {pendingTransactions.map((tx) => (
+                    <div key={tx.hash} className="tx-item tx-item--out">
+                      <div className="tx-item__direction">Pending</div>
+                      <div className="tx-item__amount">
+                        <code>{tx.hash}</code>
                       </div>
-                    );
-                  })}
+                      <div className="tx-item__addr muted">
+                        Fee {tx.fee || "—"} · Seq {tx.sequence || "—"}
+                      </div>
+                      <a
+                        href={statusWatchHref(tx.hash)}
+                        className="tx-item__link"
+                      >
+                        Watch status ↗
+                      </a>
+                    </div>
+                  ))}
                 </div>
               ) : (
-                !loading && <p className="muted">No trades yet.</p>
-              )}
-              {tradesNextCursor && (
-                <div className="section__row">
-                  <button
-                    className="btn btn--secondary"
-                    type="button"
-                    onClick={handleLoadMoreTrades}
-                    disabled={loading === "trades-more"}
-                  >
-                    {loading === "trades-more" ? (
-                      <>
-                        <Spinner /> Loading…
-                      </>
-                    ) : (
-                      "Load more"
-                    )}
-                  </button>
-                </div>
+                <p className="muted">No pending transactions.</p>
               )}
             </div>
           )}
@@ -7351,24 +4550,6 @@ function streamStatusLabel(state) {
     return STREAM_CLOSED_LINES[state.reason] ?? "Payments stream closed.";
   }
   return "Payments stream not running.";
-}
-
-function describeComposeOperation(operation) {
-  if (operation.type === "payment") {
-    const asset = operation.asset?.isNative
-      ? "XLM"
-      : `${operation.asset?.code}:${shortenAddress(operation.asset?.issuer)}`;
-    return `Payment · ${operation.amount} ${asset} to ${shortenAddress(
-      operation.destination
-    )}`;
-  }
-
-  if (operation.type === "changeTrust") {
-    return `Change trust · ${operation.code} · limit ${operation.limit}`;
-  }
-
-  const value = operation.value ? ` = ${operation.value}` : " (delete)";
-  return `Manage data · ${operation.name}${value}`;
 }
 
 function formatCreatedAt(value) {
