@@ -598,6 +598,7 @@ body {
 .order-book__rows {
   display: grid;
   gap: 4px;
+  list-style: none;
 }
 
 .order-book__row {

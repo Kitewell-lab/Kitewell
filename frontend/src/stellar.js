@@ -9,6 +9,7 @@ import {
   isFriendbotAvailable,
   NETWORKS,
 } from "./network";
+import { ORDER_BOOK_LEVELS, orderBookView } from "./orderBook";
 import { calculateMinimumBalance } from "./accountReserve";
 import { paymentMemoFields } from "./paymentMemo";
 
@@ -818,12 +819,11 @@ export async function getOrderBook(selling, buying) {
   }
 
   const book = await withHorizon429Backoff(() =>
-    getServer().orderbook(selling, buying).limit(10).call()
+    getServer().orderbook(selling, buying).limit(ORDER_BOOK_LEVELS).call()
   );
-  return {
-    bids: mapOrderBookRows(book.bids),
-    asks: mapOrderBookRows(book.asks),
-  };
+  // `orderBookView` caps each side at ten levels, keeps price and amount, and
+  // reports an empty book as an empty state rather than an error.
+  return orderBookView(book);
 }
 
 /**

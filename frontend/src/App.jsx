@@ -53,6 +53,7 @@ import {
   getOpenOffers,
   getPendingTransactions,
   getSponsoredClaimableBalances,
+  getOrderBook,
   getAccountTrades,
   isHorizonSlowdownError,
   HORIZON_SLOWDOWN_MESSAGE,
@@ -81,6 +82,11 @@ import {
   readStoredOrderBookPair,
   saveOrderBookPair,
 } from "./orderBookPair";
+import {
+  assertTradablePair,
+  offerPriceFractionFromRow,
+  orderBookFailureMessage,
+} from "./orderBook";
 import { poolShareRows } from "./poolShare";
 import {
   clearSendFormMemory,
@@ -307,6 +313,8 @@ export default function App() {
     amount: "",
   });
   const [offerList, setOfferList] = useState([]);
+  const [orderBook, setOrderBook] = useState(null);
+  const [orderBookError, setOrderBookError] = useState(null);
   const [loadingOffers, setLoadingOffers] = useState(false);
   const [pathResult, setPathResult] = useState(null);
   const [pathQuote, setPathQuote] = useState(null);
@@ -545,13 +553,13 @@ export default function App() {
     return () => { cancelled = true; };
   }, [activeTab, bookPair, bookKey]);
 
-  const getOfferAsset = (side) => {
-    const type = offerForm[`${side}Type`];
-    return buildAsset({
-      isNative: type === "native",
-      code: offerForm[`${side}Code`],
-      issuer: offerForm[`${side}Issuer`],
-    });
+  /** The offer form's selected balance descriptor, or null when unset. */
+  const offerAsset = (side) =>
+    balances.find((b) => b.key === offerForm[`${side}AssetKey`]) ?? null;
+
+  const fillOfferPrice = (row) => {
+    const { numerator, denominator } = offerPriceFractionFromRow(row);
+    updateOfferForm({ priceNumerator: numerator, priceDenominator: denominator });
   };
 
   useEffect(() => {
@@ -1661,20 +1669,31 @@ export default function App() {
     }
   };
 
-  const handleOrderBook = async (e) => {
-    e.preventDefault();
-    setLoading("order-book");
+  const handleOrderBook = async () => {
     setOrderBookError(null);
     setOrderBook(null);
+
+    const selling = offerAsset("selling");
+    const buying = offerAsset("buying");
+    if (!selling || !buying) {
+      setOrderBookError("Choose both selling and buying assets first.");
+      return;
+    }
+
     try {
-      const book = await getOrderBook(getOfferAsset("selling"), getOfferAsset("buying"));
-      setOrderBook(book);
+      // A pair of the same asset has no book to read.
+      assertTradablePair(selling, buying);
     } catch (error) {
-      setOrderBookError(
-        error.message === "Selling and buying assets must be different."
-          ? error.message
-          : "The order book could not be read. Try again in a moment."
-      );
+      setOrderBookError(error.message);
+      return;
+    }
+
+    setLoading("order-book");
+    try {
+      setOrderBook(await getOrderBook(buildAsset(selling), buildAsset(buying)));
+    } catch (error) {
+      // Keep the offer form and say the book could not be read.
+      setOrderBookError(orderBookFailureMessage(error));
     } finally {
       setLoading("");
     }
@@ -4716,6 +4735,61 @@ export default function App() {
                       {loading === "offer-place" ? "Submitting…" : "Place offer"}
                     </button>
                   </form>
+
+                  <div className="section__row">
+                    <h3 className="subhead">Order book</h3>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={handleOrderBook}
+                      disabled={loading === "order-book"}
+                    >
+                      {loading === "order-book" ? "Loading…" : "Load order book"}
+                    </button>
+                  </div>
+                  <p className="muted">
+                    Best bids and asks for the offer pair, up to ten each. Choosing a row fills
+                    the offer price; it does not place an offer.
+                  </p>
+                  {orderBookError && (
+                    <p className="muted" role="alert">
+                      {orderBookError}
+                    </p>
+                  )}
+                  {orderBook && orderBook.isEmpty && (
+                    <p className="muted">No resting offers for this pair yet.</p>
+                  )}
+                  {orderBook && !orderBook.isEmpty && (
+                    <div className="order-book">
+                      {[
+                        { label: "Bids", rows: orderBook.bids },
+                        { label: "Asks", rows: orderBook.asks },
+                      ].map((side) => (
+                        <div key={side.label} className="order-book__side">
+                          <span className="eyebrow">{side.label}</span>
+                          {side.rows.length === 0 ? (
+                            <p className="muted">No {side.label.toLowerCase()}.</p>
+                          ) : (
+                            <ul className="order-book__rows">
+                              {side.rows.map((row, index) => (
+                                <li key={`${side.label}-${index}`}>
+                                  <button
+                                    className="order-book__row"
+                                    type="button"
+                                    onClick={() => fillOfferPrice(row)}
+                                    title="Fill the offer price from this row"
+                                  >
+                                    <span>{row.amount}</span>
+                                    <span>{row.price}</span>
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
                   <div className="section__row">
                     <h3 className="subhead">Active offers</h3>
