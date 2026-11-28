@@ -22,8 +22,16 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
           payments: () => ({
             forAccount: () => ({
               limit: () => ({
-                order: () => ({ join: () => ({ call: paymentsCallMock }) }),
+                order: () => ({
+                  cursor: () => ({ call: paymentsCallMock }),
+                  call: paymentsCallMock,
+                }),
               }),
+            }),
+          }),
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({ call: vi.fn().mockResolvedValue({ records: [{ base_reserve_in_stroops: "5000000" }] }) }),
             }),
           }),
         };

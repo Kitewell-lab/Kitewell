@@ -21,6 +21,10 @@ vi.mock("@stellar/freighter-api", () => ({
   setAllowed: vi.fn(),
   getAddress: vi.fn(),
   getNetwork: vi.fn().mockResolvedValue({}),
+  getNetworkDetails: vi.fn().mockResolvedValue({
+    network: "TESTNET",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  }),
   signTransaction: signTransactionMock,
 }));
 

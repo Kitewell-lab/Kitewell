@@ -30,10 +30,8 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
           loadAccount: loadAccountMock,
           submitTransaction: submitTransactionMock,
           claimableBalances: () => ({
-            claimant: () => ({
-              limit: () => ({
-                order: () => ({ call: claimableCallMock }),
-              }),
+            forSponsor: () => ({
+              limit: () => ({ call: claimableCallMock }),
             }),
           }),
         };
@@ -67,7 +65,8 @@ beforeEach(() => {
       {
         id: "0".repeat(72),
         amount: "5.0000000",
-        asset: "native",
+        asset: "",
+        sponsor: SOURCE,
         claimants: [],
       },
     ],
@@ -144,7 +143,7 @@ describe("claimable balance operations", () => {
     await expect(getClaimableBalances(SOURCE)).resolves.toEqual([
       expect.objectContaining({
         id: "0".repeat(72),
-        asset: "XLM",
+        code: "XLM",
         amount: "5.0000000",
       }),
     ]);
