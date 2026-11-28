@@ -1147,43 +1147,6 @@ export async function clawbackClaimableBalanceWithFreighter(publicKey, balanceId
   return signAndSubmit(transaction, publicKey);
 }
 
-/** Claw back a balance sitting on someone else's trustline of an asset this account issues. */
-export async function clawbackWithFreighter(publicKey, holder, assetCode, assetIssuer, amount) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
-  }
-  if (assetIssuer !== publicKey) {
-    throw new Error("Only the issuer can claw back this asset.");
-  }
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(holder)) {
-    throw new Error("Holder must be a valid Stellar public key (G…).");
-  }
-  const code = (assetCode || "").trim().toUpperCase();
-  if (!code || code.length > MAX_ASSET_CODE_LENGTH) {
-    throw new Error(`Asset code must be 1–${MAX_ASSET_CODE_LENGTH} characters.`);
-  }
-  const normalizedAmount = normalizeAmount(amount, "Clawback amount");
-  const sourceAccount = await getServer().loadAccount(publicKey);
-  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: selectedFeePerOperation(),
-    networkPassphrase: currentPassphrase(),
-  })
-    .addOperation(
-      StellarSdk.Operation.clawback({
-        asset: new StellarSdk.Asset(code, assetIssuer),
-        from: holder,
-        amount: normalizedAmount,
-      })
-    )
-    .setTimeout(180)
-    .build();
-  return signAndSubmit(transaction, publicKey);
-}
-
-/**
- * Validate a Stellar amount string (positive, max 7 decimal places) without
- * going through floating point, so values like 0.0000001 stay intact.
- */
 /** Hard cap on the number of operations in one composed transaction. */
 export const MAX_COMPOSED_OPERATIONS = 100;
 const MAX_MANAGE_DATA_NAME_BYTES = 64;

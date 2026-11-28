@@ -29,77 +29,6 @@ const HORIZON_429_MAX_WAIT_SEC = 30;
  */
 const horizon429BackoffByNetwork = new Map();
 
-function horizonStatus(error) {
-  return error?.response?.status ?? error?.status ?? null;
-}
-
-export function isHorizonSlowdownError(error) {
-  return horizonStatus(error) === 429;
-}
-
-function horizonRetryAfterSeconds(error, streak) {
-  const headers = error?.response?.headers;
-  const header = typeof headers?.get === "function"
-    ? headers.get("retry-after")
-    : headers?.["retry-after"];
-  const parsed = Number(header);
-  if (Number.isFinite(parsed) && parsed > 0) {
-    return Math.min(parsed, HORIZON_429_MAX_WAIT_SEC);
-  }
-  return Math.min(
-    HORIZON_429_BASE_WAIT_SEC * 2 ** Math.max(streak, 0),
-    HORIZON_429_MAX_WAIT_SEC
-  );
-}
-
-async function withHorizon429Backoff(task) {
-  const networkId = getActiveNetworkId();
-  const state = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
-  let attempt = 0;
-  for (;;) {
-    try {
-      const result = await task();
-      horizon429BackoffByNetwork.set(networkId, { streak: 0 });
-      return result;
-    } catch (error) {
-      if (!isHorizonSlowdownError(error) || attempt >= 2) throw error;
-      const wait = horizonRetryAfterSeconds(error, state.streak);
-      state.streak += 1;
-      horizon429BackoffByNetwork.set(networkId, state);
-      await new Promise((resolve) => setTimeout(resolve, wait * 1000));
-      attempt += 1;
-    }
-  }
-}
-
-export function resetHorizon429BackoffForTests() {
-  horizon429BackoffByNetwork.clear();
-}
-
-function abortError() {
-  const error = new Error("The request was aborted.");
-  error.name = "AbortError";
-  return error;
-}
-
-function defaultSleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(abortError());
-      return;
-    }
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(abortError());
-      },
-      { once: true }
-    );
-  });
-}
-
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
 }
@@ -1733,16 +1662,6 @@ export function mapPendingTransaction(record) {
     ),
     status,
   };
-}
-
-/**
- * Keep only transactions Horizon has not applied yet.
- * Applied rows from the pending endpoint are ignored.
- */
-export function selectPendingTransactions(records) {
-  return (records || [])
-    .map(mapPendingTransaction)
-    .filter((tx) => tx.hash && tx.status !== "applied");
 }
 
 /**
