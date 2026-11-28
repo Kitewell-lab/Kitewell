@@ -43,15 +43,6 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
-    Horizon: {
-      ...actual.Horizon,
-      Server: vi.fn(function () {
-        return {
-          loadAccount: horizonLoadAccountMock,
-          submitTransaction: horizonSubmitMock,
-        };
-      }),
-    },
     rpc: {
       ...actual.rpc,
       Server: vi.fn(function () {
@@ -83,8 +74,6 @@ const {
 
 const CONTRACT_ID =
   "CCWLNS5HECRJ2GM3Q6JZZDV334ZXYO6EKZLFPLQRXO6SUDAKMS4U3E3X";
-const CONTRACT_HASH =
-  "CST5BHQPSIWSFMYZUE5RZ7AXZBKTUY76HNISQ7GZYD7U7JKGJBMRQR52";
 const USER = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
 /** Build the same tx shape the helpers build, for XDR round-trip asserts. */
