@@ -18,10 +18,10 @@ const {
   loadAccountMock,
   paymentsCallMock,
   offersCallMock,
-  ledgerCallMock,
   orderBookCallMock,
   claimableCallMock,
   assetCallMock,
+  ledgerCallMock,
 } = vi.hoisted(() => ({
   loadAccountMock: vi.fn(),
   paymentsCallMock: vi.fn(),
