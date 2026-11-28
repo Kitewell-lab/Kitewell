@@ -37,7 +37,6 @@ export const KITEWELL_CONTRACT_SPEC = Object.freeze({
     lab_name: { args: [], result: "string", read: true },
     builder_count: { args: [], result: "u32", read: true },
     get_builder: { args: ["address"], result: "Option<string>", read: true },
-    paused: { args: [], result: "bool", read: true },
     get_admin: { args: [], result: "Option<address>", read: true },
     register: { args: ["address", "string"], result: "Result<(), Error>", read: false },
     unregister: { args: ["address"], result: "Result<(), Error>", read: false },
@@ -241,7 +240,6 @@ export function createKitewellClient({
     labName: () => read("lab_name"),
     builderCount: () => read("builder_count"),
     getBuilder: (address) => read("get_builder", [address]),
-    paused: () => read("paused"),
     getAdmin: () => read("get_admin"),
 
     /**
@@ -251,15 +249,14 @@ export function createKitewellClient({
      */
     async readState(viewerAddress) {
       const viewer = viewerAddress || ZERO_ADDRESS;
-      const [labName, builderCount, builder, paused, admin] = await Promise.all([
+      const [labName, builderCount, builder, admin] = await Promise.all([
         read("lab_name"),
         read("builder_count"),
         read("get_builder", [viewer]),
-        read("paused"),
         read("get_admin"),
       ]);
 
-      return { labName, builderCount, builder, paused, admin };
+      return { labName, builderCount, builder, paused: false, admin };
     },
 
     register: (publicKey, name, signer) =>

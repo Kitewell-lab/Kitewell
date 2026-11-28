@@ -24,8 +24,13 @@ export default function MultisigCosignPanel({ publicKey, onToast }) {
     }
   };
 
-  const inspect = (value = xdr) =>
-    run("inspect", async () => setSummary(await inspectMultisigEnvelope(value)));
+  const inspect = (value = xdr) => {
+    // A failed decode must never leave the previous envelope's signers on screen.
+    setSummary(null);
+    return run("inspect", async () =>
+      setSummary(await inspectMultisigEnvelope(value, publicKey))
+    );
+  };
 
   const me = summary?.signers.find((s) => s.key === publicKey);
   const canSign = Boolean(publicKey && me && !me.signed);
@@ -46,6 +51,13 @@ export default function MultisigCosignPanel({ publicKey, onToast }) {
           setXdr(e.target.value);
           setSummary(null);
         }}
+        onPaste={(e) => {
+          const pasted = e.clipboardData?.getData("text")?.trim();
+          if (!pasted) return;
+          e.preventDefault();
+          setXdr(pasted);
+          inspect(pasted);
+        }}
       />
       <div className="section__row">
         <button type="button" disabled={!xdr.trim() || busy} onClick={() => inspect()}>
@@ -55,7 +67,32 @@ export default function MultisigCosignPanel({ publicKey, onToast }) {
       {error && <p className="error">{error}</p>}
       {summary && (
         <>
-          <ul>
+          <h3 className="subhead">Signatures on this envelope</h3>
+          {summary.signatures.length > 0 ? (
+            <ul className="signature-list">
+              {summary.signatures.map((signature, index) => (
+                <li key={`${signature.hint}-${index}`}>
+                  <code>hint {signature.hint}</code> ·{" "}
+                  {signature.matched ? (
+                    <>
+                      <code>{signature.signer}</code>
+                      {signature.isConnected && " (connected wallet)"}
+                    </>
+                  ) : (
+                    <span>
+                      {signature.status === "invalid"
+                        ? "unmatched (does not verify on this network)"
+                        : "unmatched"}
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">This envelope has no signatures yet.</p>
+          )}
+          <h3 className="subhead">Signers on the source account</h3>
+          <ul className="signature-list">
             {summary.signers.map((s) => (
               <li key={s.key}>
                 <code>{s.key}</code> · weight {s.weight} ·{" "}
@@ -65,7 +102,10 @@ export default function MultisigCosignPanel({ publicKey, onToast }) {
             ))}
           </ul>
           {summary.unknown > 0 && (
-            <p className="muted">{summary.unknown} signature(s) from non-signers.</p>
+            <p className="muted">
+              {summary.unknown} signature(s) could not be matched to a signer on
+              the source account.
+            </p>
           )}
           <p>
             Weight {summary.totalWeight} — low ({summary.thresholds.low}):{" "}
