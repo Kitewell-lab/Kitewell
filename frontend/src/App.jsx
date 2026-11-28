@@ -36,6 +36,12 @@ import {checkFreighterInstalled,
   createSponsoredAccountDraft,
   sponsorAccountCreationWithFreighter,
   deployKitewellContract,
+  createAccountWithFreighter,
+  preparePaymentWithFreighter,
+  confirmPaymentWithFreighter,
+  checkSorobanRpcHealth,
+  parseSep7PayUri,
+  TRANSACTION_FEE_STROOPS,
 } from "./freighter";
 import {
   appendBuilderPage,
@@ -54,18 +60,17 @@ import {fundWithFriendbot,
   getAccountDetails,
   getOpenOffers,
   getPendingTransactions,
-  getClaimableBalances,
   getOutgoingSponsorships,
   getSponsoredClaimableBalances,
   getOrderBook,
   getAccountTrades,
+  buildAsset,
   isHorizonSlowdownError,
   HORIZON_SLOWDOWN_MESSAGE,
   getLiquidityPool,
   liquidityPoolDeposit,
   liquidityPoolWithdraw,
   getTransactions,
-  groupPaymentsByDay,
   resolveFederationAddress,
   explorerAccountUrl,
   explorerTxUrl,
@@ -76,7 +81,7 @@ import {fundWithFriendbot,
   IMMUTABLE_CONFIRMATION,
   
   
-  watchOfferUntilGone, filterVisibleBalances, resolveFederationAddress, getAccountOffers, buildManageSellOffer, getFeeStats, getOrderBook, getLatestBaseReserve } from "./stellar";
+  watchOfferUntilGone, filterVisibleBalances, getAccountOffers, buildManageSellOffer, getFeeStats, getLatestBaseReserve } from "./stellar";
 import { downloadCsv } from "./csvExport";
 import { buildersToCsv } from "./builderCsv";
 import {
@@ -305,6 +310,18 @@ export default function App() {
   });
   const [baseReserveInStroops, setBaseReserveInStroops] = useState(null);
   const [reserveError, setReserveError] = useState(null);
+  const refreshReserve = useCallback(async () => {
+    try {
+      const baseReserve = await getLatestBaseReserve();
+      setBaseReserveInStroops(baseReserve);
+      setReserveError(null);
+    } catch (error) {
+      setBaseReserveInStroops(null);
+      setReserveError(
+        error.message || "Could not load the latest ledger reserve from Horizon."
+      );
+    }
+  }, []);
   const [reserveSubentryCount, setReserveSubentryCount] = useState("0");
   const [pathForm, setPathForm] = useState({
     mode: "strictSend",
@@ -326,6 +343,8 @@ export default function App() {
     priceDenominator: "1",
     amount: "",
   });
+  const updateOfferForm = (changes) =>
+    setOfferForm((prev) => ({ ...prev, ...changes }));
   const [offerList, setOfferList] = useState([]);
   const [orderBook, setOrderBook] = useState(null);
   const [orderBookError, setOrderBookError] = useState(null);
@@ -1411,79 +1430,6 @@ export default function App() {
   };
 
 
-
-    const gate = submitGuardRef.current.begin(
-      "clawback",
-      `${asset.key}|${clawbackForm.holder}|${clawbackForm.amount}`
-    );
-    if (!gate.allowed) return;
-
-    setLoading("clawback");
-    try {
-      const result = await clawbackWithFreighter(
-        publicKey,
-        clawbackForm.holder,
-        asset.code,
-        asset.issuer,
-        clawbackForm.amount
-      );
-      trackSubmission(result.hash, "clawback");
-      setClawbackForm((previous) => ({
-        ...previous,
-        holder: "",
-        amount: "",
-      }));
-      showToast(
-        `Clawback submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Clawback failed.", "error");
-    } finally {
-      submitGuardRef.current.end("clawback");
-      setLoading("");
-    }
-  };
-
-  const handleSponsor = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!sponsorForm.sponsoredAccount) {
-      return showToast("Sponsored account is required.", "error");
-    }
-    if (!sponsorForm.code || !sponsorForm.issuer) {
-      return showToast("Asset code and issuer are required.", "error");
-    }
-
-    const gate = submitGuardRef.current.begin(
-      "sponsor",
-      `${sponsorForm.sponsoredAccount}|${sponsorForm.code}|${sponsorForm.issuer}`
-    );
-    if (!gate.allowed) return;
-
-    setLoading("sponsor");
-    try {
-      const result = await sponsorTrustlineWithFreighter({
-        publicKey,
-        sponsoredAccount: sponsorForm.sponsoredAccount,
-        assetCode: sponsorForm.code,
-        assetIssuer: sponsorForm.issuer,
-      });
-      trackSubmission(result.hash, "sponsorTrustline");
-      setSponsorForm({ sponsoredAccount: "", code: "", issuer: "" });
-      showToast(
-        `Sponsored trustline submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Sponsored trustline failed.", "error");
-    } finally {
-      submitGuardRef.current.end("sponsor");
-      setLoading("");
-    }
-  };
 
   const handleOrderBook = async () => {
     setOrderBookError(null);

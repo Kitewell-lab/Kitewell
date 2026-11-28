@@ -61,7 +61,6 @@ export async function fetchPaymentsViaApi(publicKey, limit = 15, cursor, network
   const network = networkParam(networkOrOptions);
 
   const params = new URLSearchParams({ limit: String(limit) });
-  if (networkId) params.set("network", networkId);
   if (cursor) params.set("cursor", cursor);
   if (network != null) params.set("network", network);
 
