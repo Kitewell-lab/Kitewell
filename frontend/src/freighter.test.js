@@ -75,10 +75,10 @@ const {
   SOROBAN_RPC_URL,
   readKitewellState,
   registerBuilderWithFreighter,
-  manageDataWithFreighter,
-  mergeAccountWithFreighter,
-  setPausedWithFreighter,
-  unregisterBuilderWithFreighter,
+  normalizeHashMemo,
+  isTxBadSeqFailure,
+  buildSacTransferTransaction,
+  inspectInnerEnvelope,
 } = await import("./freighter");
 
 const CONTRACT_ID =
@@ -302,86 +302,86 @@ describe("readKitewellState", () => {
   });
 });
 
-describe("mergeAccountWithFreighter", () => {
-  it("does not call Freighter for a mismatched retype", async () => {
-    const destination = StellarSdk.Keypair.random().publicKey();
-
-    await expect(
-      mergeAccountWithFreighter(USER, destination, "GWRONG")
-    ).rejects.toThrow("Retype the destination");
-    expect(signTransactionMock).not.toHaveBeenCalled();
+describe("hash memo helpers", () => {
+  it("accepts a 32-byte hex fixture and strips spaces", () => {
+    const hex = "ab".repeat(32);
+    expect(normalizeHashMemo(`${hex.slice(0, 20)} ${hex.slice(20)}`)).toBe(hex);
   });
 
-  it("refuses merging an account into itself before loading or signing", async () => {
-    await expect(
-      mergeAccountWithFreighter(USER, USER, USER)
-    ).rejects.toThrow("cannot be the connected account");
-    expect(horizonLoadAccountMock).not.toHaveBeenCalled();
-    expect(signTransactionMock).not.toHaveBeenCalled();
-  });
-
-  it("builds an account merge operation body", async () => {
-    const destination = StellarSdk.Keypair.random().publicKey();
-    horizonLoadAccountMock.mockResolvedValue(new StellarSdk.Account(USER, "7"));
-    signTransactionMock.mockResolvedValue({
-      signedTxXdr: null,
-      error: { message: "stop after building" },
-    });
-
-    await expect(
-      mergeAccountWithFreighter(USER, destination, destination)
-    ).rejects.toThrow("stop after building");
-
-    const unsignedXdr = signTransactionMock.mock.calls[0][0];
-    const transaction = StellarSdk.TransactionBuilder.fromXDR(
-      unsignedXdr,
-      StellarSdk.Networks.TESTNET
-    );
-    expect(transaction.operations[0].type).toBe("accountMerge");
-    expect(transaction.operations[0].destination).toBe(destination);
+  it("rejects 31-byte, 33-byte, empty, and non-hex values", () => {
+    expect(() => normalizeHashMemo("ab".repeat(31))).toThrow(/64 hexadecimal/);
+    expect(() => normalizeHashMemo("ab".repeat(33))).toThrow(/64 hexadecimal/);
+    expect(() => normalizeHashMemo(" ")).toThrow(/required/);
+    expect(() => normalizeHashMemo("z".repeat(64))).toThrow(/64 hexadecimal/);
   });
 });
 
-describe("manageDataWithFreighter", () => {
-  it("refuses names and values longer than 64 UTF-8 bytes before signing", async () => {
-    await expect(
-      manageDataWithFreighter(USER, "é".repeat(33), "value")
-    ).rejects.toThrow("64 UTF-8 bytes");
-    await expect(
-      manageDataWithFreighter(USER, "name", "é".repeat(33))
-    ).rejects.toThrow("64 UTF-8 bytes");
-    expect(signTransactionMock).not.toHaveBeenCalled();
+describe("stale sequence errors", () => {
+  it("offers reload only for tx_bad_seq failures", () => {
+    expect(isTxBadSeqFailure({ response: { data: { extras: { result_codes: { transaction: "tx_bad_seq" } } } } })).toBe(true);
+    expect(isTxBadSeqFailure({ response: { data: { extras: { result_codes: { transaction: "tx_failed" } } } } })).toBe(false);
+  });
+});
+
+describe("SAC asset transfers", () => {
+  it("builds invokeHostFunction instead of a payment operation", () => {
+    const issuer = StellarSdk.Keypair.random().publicKey();
+    const source = StellarSdk.Keypair.random().publicKey();
+    const destination = StellarSdk.Keypair.random().publicKey();
+    const tx = buildSacTransferTransaction(source, destination, "1.25", {
+      isNative: false,
+      code: "FOO",
+      issuer,
+    }, "7");
+
+    expect(tx.operations).toHaveLength(1);
+    expect(tx.operations[0].type).toBe("invokeHostFunction");
   });
 
-  it("builds set and clear manageData operations", async () => {
-    horizonLoadAccountMock.mockResolvedValue(new StellarSdk.Account(USER, "7"));
-    signTransactionMock.mockResolvedValue({
-      signedTxXdr: null,
-      error: { message: "stop after building" },
-    });
+  it("rejects the source as destination", () => {
+    const source = StellarSdk.Keypair.random().publicKey();
+    expect(() => buildSacTransferTransaction(source, source, "1", {
+      isNative: false,
+      code: "FOO",
+      issuer: StellarSdk.Keypair.random().publicKey(),
+    }, "7")).toThrow(/different/);
+  });
+});
 
-    await expect(
-      manageDataWithFreighter(USER, "profile", "hello")
-    ).rejects.toThrow("stop after building");
+describe("fee-bump envelopes", () => {
+  it("inspects inner transaction metadata and preserves inner XDR for wrapping", () => {
+    const source = StellarSdk.Keypair.random().publicKey();
+    const inner = new StellarSdk.TransactionBuilder(new StellarSdk.Account(source, "7"), {
+      fee: "200",
+      networkPassphrase: StellarSdk.Networks.TESTNET,
+    })
+      .addOperation(StellarSdk.Operation.bumpSequence({ bumpTo: "8" }))
+      .addOperation(StellarSdk.Operation.bumpSequence({ bumpTo: "9" }))
+      .setTimeout(30)
+      .build();
 
-    const setXdr = signTransactionMock.mock.calls[0][0];
-    const setTx = StellarSdk.TransactionBuilder.fromXDR(
-      setXdr,
+    const inspected = inspectInnerEnvelope(inner.toXDR());
+    expect(inspected.operationCount).toBe(2);
+    expect(inspected.source).toBe(source);
+    expect(inspected.fee).toBe("400");
+
+    const feeBump = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
+      source,
+      "200",
+      inspected.transaction,
       StellarSdk.Networks.TESTNET
     );
-    expect(setTx.operations[0].type).toBe("manageData");
-    expect(setTx.operations[0].name).toBe("profile");
-    expect(setTx.operations[0].value.toString("utf8")).toBe("hello");
+    expect(feeBump.innerTransaction.toXDR()).toBe(inner.toXDR());
+  });
 
-    await expect(manageDataWithFreighter(USER, "profile", null)).rejects.toThrow(
-      "stop after building"
-    );
-    const clearXdr = signTransactionMock.mock.calls[1][0];
-    const clearTx = StellarSdk.TransactionBuilder.fromXDR(
-      clearXdr,
-      StellarSdk.Networks.TESTNET
-    );
-    expect(clearTx.operations[0].value ?? null).toBeNull();
+  it("refuses already fee-bumped envelopes", () => {
+    const source = StellarSdk.Keypair.random().publicKey();
+    const inner = new StellarSdk.TransactionBuilder(new StellarSdk.Account(source, "7"), {
+      fee: "200",
+      networkPassphrase: StellarSdk.Networks.TESTNET,
+    }).addOperation(StellarSdk.Operation.bumpSequence({ bumpTo: "8" })).setTimeout(30).build();
+    const feeBump = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(source, "200", inner, StellarSdk.Networks.TESTNET);
+    expect(() => inspectInnerEnvelope(feeBump.toXDR())).toThrow(/already a fee-bump/i);
   });
 });
 

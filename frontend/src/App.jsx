@@ -19,24 +19,10 @@ import {
   clawbackWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
-  readAdminState,
-  proposeAdminWithFreighter,
-  acceptAdminWithFreighter,
-  setAccountOptionsWithFreighter,
-  allowTrustWithFreighter,
-  readContractInstanceTtl,
-  extendContractTtlWithFreighter,
-  readContractTTL,
-  extendCodeTTL,
-  readKitewellEvents,
-  submitFailureResult,
-  signChallengeWithFreighter,
-  simulateRegisterBuilder,
-  listKitewellBuilders,
-  readKitewellBuilder,
-  createSponsoredAccountDraft,
-  sponsorAccountCreationWithFreighter,
-  deployKitewellContract,
+  sendSacTransferWithFreighter,
+  inspectInnerEnvelope,
+  feeBumpInnerEnvelopeWithFreighter,
+  isTxBadSeqFailure,
 } from "./freighter";
 import {
   appendBuilderPage,
@@ -205,8 +191,7 @@ const MEMO_FIELDS = {
     inputMode: "numeric",
   },
   hash: {
-    maxLength: 64,
-    pattern: "[0-9a-fA-F]{64}",
+    maxLength: 128,
     placeholder: "64 hexadecimal characters",
   },
 };
@@ -348,15 +333,10 @@ export default function App() {
   const [proposeAdminForm, setProposeAdminForm] = useState({ address: "" });
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
-  const [renameForm, setRenameForm] = useState({ name: "" });
-  const [inspectForm, setInspectForm] = useState({ xdr: "" });
-  const [inspectResult, setInspectResult] = useState(null);
-  const [inspectError, setInspectError] = useState(null);
-  const [sessionContractId, setSessionContractId] = useState(null);
-  const [deployedContracts, setDeployedContracts] = useState([]);
-  const [wasmFile, setWasmFile] = useState(null);
-  const [confirmRedeploy, setConfirmRedeploy] = useState(false);
-  const [deployError, setDeployError] = useState(null);
+  const [sacForm, setSacForm] = useState({ assetKey: "", destination: "", amount: "" });
+  const [feeBumpForm, setFeeBumpForm] = useState({ innerXdr: "", feePerOperation: "" });
+  const [innerEnvelopeInfo, setInnerEnvelopeInfo] = useState(null);
+  const [feeBumpResult, setFeeBumpResult] = useState(null);
   const tabRefs = useRef([]);
   const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
@@ -804,11 +784,7 @@ export default function App() {
 
     setLoading("data-set");
     try {
-      await manageDataWithFreighter(
-        publicKey,
-        dataForm.name,
-        dataForm.hex ? parseHexDataValue(dataForm.value) : dataForm.value
-      );
+      await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
       setDataForm({ name: "", value: "" });
       await refreshAccountDetails();
       showToast("Account data submitted.");
@@ -873,84 +849,17 @@ export default function App() {
     }
   }, [publicKey]);
 
-  const handleCreateClaimable = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!claimableForm.claimant) {
-      return showToast("Claimant is required.", "error");
+  const handleSubmitFailure = async (error, existingMessage) => {
+    if (!isTxBadSeqFailure(error)) {
+      showToast(existingMessage || error.message || "Transaction failed.", "error");
+      return;
     }
-    const selected = balances.find((b) => b.key === claimableForm.assetKey);
-    if (!selected) return showToast("Choose an asset you hold.", "error");
-    if (parseFloat(claimableForm.amount) > parseFloat(selected.balance)) {
-      return showToast(
-        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
-        "error"
-      );
-    }
-    setLoading("claimable-create");
-    setClaimableResult(null);
     try {
-      const asset = selected.isNative
-        ? { isNative: true }
-        : { isNative: false, code: selected.code, issuer: selected.issuer };
-      const result = await createClaimableBalanceWithFreighter({
-        publicKey,
-        claimant: claimableForm.claimant,
-        amount: claimableForm.amount,
-        asset,
-        predicateMode: claimableForm.predicateMode,
-        ledgerTime: claimableForm.ledgerTime,
-      });
-      setClaimableResult({ type: "created", hash: result.hash });
-      setClaimableForm({
-        claimant: "",
-        amount: "",
-        assetKey: "native",
-        predicateMode: "unconditional",
-        ledgerTime: "",
-      });
-      try {
-        setBalances(await getAccountBalances(publicKey));
-      } catch {
-        /* balances refresh separately */
-      }
-      showToast(
-        `Claimable balance created · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Could not create claimable balance.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleClaimClaimable = async (balance) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading(`claimable-${balance.id}`);
-    try {
-      const result = await claimClaimableBalanceWithFreighter(publicKey, balance.id);
-      setClaimableResult({
-        type: "claimed",
-        hash: result.hash,
-        balanceId: balance.id,
-      });
-      await handleClaimableRefresh();
-      try {
-        setBalances(await getAccountBalances(publicKey));
-      } catch {
-        /* balances refresh separately */
-      }
-      showToast(
-        `Claimable balance claimed · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Could not claim balance.", "error");
-    } finally {
-      setLoading("");
+      const details = await getAccountDetails(publicKey);
+      setAccountDetails(details);
+      showToast(`Sequence was stale. Reloaded; next try will use sequence ${details.sequence}.`, "info");
+    } catch {
+      showToast("Sequence was stale, but the new sequence could not be read.", "error");
     }
   };
 
@@ -1234,9 +1143,7 @@ export default function App() {
       showToast(`Trustline for ${code} submitted.`);
       startTxWatch(result.hash);
     } catch (err) {
-      trackFailedSubmit("changeTrust", err);
-      setTransactionFailure(err.transactionFailure ?? null);
-      showToast(err.message || "Change trust failed.", "error");
+      await handleSubmitFailure(err, err.message || "Change trust failed.");
     } finally {
       submitGuardRef.current.end("trust");
       setLoading("");
@@ -1343,9 +1250,7 @@ export default function App() {
       showToast(`${asset.code} trustline removed.`);
       startTxWatch(result.hash);
     } catch (err) {
-      trackFailedSubmit("changeTrust", err);
-      setTransactionFailure(err.transactionFailure ?? null);
-      showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
+      await handleSubmitFailure(err, err.message || `Could not remove the ${asset.code} trustline.`);
     } finally {
       submitGuardRef.current.end(guardKey);
       setLoading("");
@@ -1406,6 +1311,15 @@ export default function App() {
     ) {
       showToast("Text memos must be 28 UTF-8 bytes or fewer.", "error");
       return null;
+    }
+    if (sendForm.memoType === "hash") {
+      const normalizedHash = sendForm.memo.replace(/\s/g, "");
+      if (!normalizedHash) {
+        return showToast("Hash memo is required.", "error");
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(normalizedHash)) {
+        return showToast("Hash memos must be exactly 64 hexadecimal characters.", "error");
+      }
     }
 
     const selected = balances.find((b) => b.key === sendForm.assetKey);
@@ -1571,8 +1485,7 @@ export default function App() {
       );
       startTxWatch(result.hash);
     } catch (err) {
-      // Preserve form values if the user refuses to sign or submission fails.
-      showToast(err.message || "Payment failed.", "error");
+      await handleSubmitFailure(err, err.message || "Payment failed.");
     } finally {
       submitGuardRef.current.end("send");
       setLoading("");
@@ -1715,9 +1628,7 @@ export default function App() {
       showToast(`Path payment submitted · ${result.hash.slice(0, 12)}…`);
       startTxWatch(result.hash);
     } catch (err) {
-      if (!err.preSign) trackFailedSubmit("pathPayment", err);
-      setTransactionFailure(err.transactionFailure ?? null);
-      showToast(err.message || "Path payment failed.", "error");
+      await handleSubmitFailure(err, err.message || "Path payment failed.");
     } finally {
       submitGuardRef.current.end("path");
       setLoading("");
@@ -1935,6 +1846,137 @@ export default function App() {
     } catch (err) {
       trackFailedSubmit("manageSellOffer", err);
       showToast(err.message || "Could not place offer.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleSacTransfer = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const asset = balances.find((b) => b.key === sacForm.assetKey && !b.isNative);
+    if (!asset) return showToast("Choose a credit asset you hold.", "error");
+    if (!sacForm.destination || !sacForm.amount) {
+      return showToast("Destination and amount are required.", "error");
+    }
+    setLoading("sac");
+    try {
+      const result = await sendSacTransferWithFreighter({
+        publicKey,
+        destination: sacForm.destination,
+        amount: sacForm.amount,
+        asset: { isNative: false, code: asset.code, issuer: asset.issuer },
+        availableBalance: asset.balance,
+      });
+      showToast(`SAC transfer submitted · ${result.hash.slice(0, 12)}…`, "success", explorerTxUrl(result.hash));
+      setSacForm({ assetKey: "", destination: "", amount: "" });
+      refreshBalances();
+    } catch (err) {
+      await handleSubmitFailure(err, err.message || "SAC transfer failed.");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleInspectInnerEnvelope = () => {
+    try {
+      const info = inspectInnerEnvelope(feeBumpForm.innerXdr);
+      setInnerEnvelopeInfo(info);
+      setFeeBumpResult(null);
+    } catch (err) {
+      setInnerEnvelopeInfo(null);
+      showToast(err.message || "Invalid inner envelope.", "error");
+    }
+  };
+
+  const handleFeeBump = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("fee-bump");
+    try {
+      const result = await feeBumpInnerEnvelopeWithFreighter(
+        publicKey,
+        feeBumpForm.innerXdr,
+        feeBumpForm.feePerOperation
+      );
+      setFeeBumpResult(result);
+      showToast(`Fee-bump submitted · ${result.hash.slice(0, 12)}…`, "success", explorerTxUrl(result.hash));
+    } catch (err) {
+      await handleSubmitFailure(err, err.message || "Fee-bump failed.");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    const sellingAsset = assetBalances.find(
+      (asset) => asset.key === offerForm.sellingAssetKey
+    );
+    const buyingAsset = assetBalances.find(
+      (asset) => asset.key === offerForm.buyingAssetKey
+    );
+    if (!sellingAsset || !buyingAsset) {
+      return showToast("Choose both selling and buying assets.", "error");
+    }
+    if (sellingAsset.key === buyingAsset.key) {
+      return showToast("Selling and buying assets must be different.", "error");
+    }
+
+    let amount;
+    try {
+      amount = validatePaymentAmount(offerForm.amount, "Offer amount");
+    } catch (err) {
+      return showToast(err.message, "error");
+    }
+
+    const available = Number.parseFloat(sellingAsset.available ?? sellingAsset.balance);
+    if (!Number.isFinite(available) || available <= 0) {
+      return showToast(`You do not hold any available ${sellingAsset.code}.`, "error");
+    }
+    if (Number(amount) > available) {
+      return showToast(
+        `Insufficient ${sellingAsset.code} balance. Available: ${available}.`,
+        "error"
+      );
+    }
+
+    const describeAsset = (asset) =>
+      asset.isNative
+        ? { isNative: true }
+        : { isNative: false, code: asset.code, issuer: asset.issuer };
+
+    setLoading("offer-place");
+    try {
+      const operation = buildManageSellOffer({
+        selling: describeAsset(sellingAsset),
+        buying: describeAsset(buyingAsset),
+        amount,
+        priceNumerator: offerForm.priceNumerator,
+        priceDenominator: offerForm.priceDenominator,
+      });
+      const unsignedXdr = await buildUnsignedEnvelope(publicKey, [operation]);
+      const result = await submitEnvelopeWithFreighter(unsignedXdr, publicKey);
+      setOfferForm((previous) => ({ ...previous, amount: "" }));
+      showToast(
+        `Offer placed · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+      startTxWatch(result.hash);
+      try {
+        await refreshOfferData();
+      } catch (refreshError) {
+        showToast(
+          `Offer submitted, but balances and offers could not refresh: ${refreshError.message}`,
+          "error",
+          explorerTxUrl(result.hash)
+        );
+      }
+    } catch (err) {
+      await handleSubmitFailure(err, err.message || "Contract invoke failed.");
     } finally {
       setLoading("");
     }
@@ -7397,6 +7439,63 @@ export default function App() {
                           </div>
                         </div>
                       )}
+                    </button>
+                    {!publicKey && <p className="muted">Connect Freighter to sign.</p>}
+                  </form>
+                  <div className="subhead">Send SAC asset balance</div>
+                  <form className="form" onSubmit={handleSacTransfer}>
+                    <label className="label" htmlFor="sac-asset">Credit asset</label>
+                    <select id="sac-asset" className="input" value={sacForm.assetKey} onChange={(e) => setSacForm({ ...sacForm, assetKey: e.target.value })}>
+                      <option value="">Choose held credit asset</option>
+                      {balances.filter((b) => !b.isNative).map((b) => (
+                        <option key={b.key} value={b.key}>{b.code} · {b.balance}</option>
+                      ))}
+                    </select>
+                    <label className="label" htmlFor="sac-destination">Destination</label>
+                    <input id="sac-destination" className="input" placeholder="G…" value={sacForm.destination} onChange={(e) => setSacForm({ ...sacForm, destination: e.target.value })} required />
+                    <label className="label" htmlFor="sac-amount">Amount</label>
+                    <input id="sac-amount" className="input" type="number" step="0.0000001" min="0.0000001" value={sacForm.amount} onChange={(e) => setSacForm({ ...sacForm, amount: e.target.value })} required />
+                    <button className="btn btn--primary" type="submit" disabled={loading === "sac" || requireWallet}>
+                      {loading === "sac" ? <><Spinner /> Signing in Freighter…</> : "Send SAC transfer"}
+                    </button>
+                  </form>
+
+                  <div className="subhead">Fee-bump a pasted envelope</div>
+                  <form className="form" onSubmit={handleFeeBump}>
+                    <label className="label" htmlFor="inner-xdr">Inner envelope XDR</label>
+                    <textarea id="inner-xdr" className="input" rows="5" value={feeBumpForm.innerXdr} onChange={(e) => { setFeeBumpForm({ ...feeBumpForm, innerXdr: e.target.value }); setInnerEnvelopeInfo(null); }} placeholder="Paste inner transaction envelope" />
+                    <button className="btn btn--secondary" type="button" onClick={handleInspectInnerEnvelope} disabled={!feeBumpForm.innerXdr.trim()}>Inspect envelope</button>
+                    {innerEnvelopeInfo && (
+                      <div className="info-box">
+                        <span className="eyebrow">Inner transaction</span>
+                        <code>Source: {innerEnvelopeInfo.source}</code>
+                        <code>Inner fee: {innerEnvelopeInfo.fee}</code>
+                        <code>Operations: {innerEnvelopeInfo.operationCount}</code>
+                      </div>
+                    )}
+                    <label className="label" htmlFor="fee-per-operation">Fee per operation (stroops)</label>
+                    <input id="fee-per-operation" className="input" type="number" min="1" step="1" value={feeBumpForm.feePerOperation} onChange={(e) => setFeeBumpForm({ ...feeBumpForm, feePerOperation: e.target.value })} required />
+                    <button className="btn btn--primary" type="submit" disabled={loading === "fee-bump" || requireWallet}>Build & submit fee-bump</button>
+                  </form>
+                  {feeBumpResult && (
+                    <div className="info-box">
+                      <span className="eyebrow">Fee-bump submitted</span>
+                      <code>{feeBumpResult.hash}</code>
+                    </div>
+                  )}
+
+                  {lastRegisterTx && (
+                    <div className="info-box">
+                      <span className="eyebrow">Register tx</span>
+                      <code>{lastRegisterTx.hash}</code>
+                      <a
+                        href={explorerTxUrl(lastRegisterTx.hash)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-link"
+                      >
+                        Explorer ↗
+                      </a>
                     </div>
                   ))}
                 </div>
