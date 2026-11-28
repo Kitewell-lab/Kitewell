@@ -1,5 +1,5 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { NETWORKS } from "./network";
+import { getAvailableNetworks } from "./network";
 
 /**
  * Read-only decoder for Stellar transaction envelopes.
@@ -202,7 +202,7 @@ function describeTransaction(transaction) {
 }
 
 function networkForPassphrase(passphrase) {
-  const match = Object.values(NETWORKS).find(
+  const match = getAvailableNetworks().find(
     (network) => network.passphrase === passphrase
   );
 
@@ -330,7 +330,7 @@ function passphraseVerdict(transaction, passphrase) {
     return true;
   }
 
-  for (const network of Object.values(NETWORKS)) {
+  for (const network of getAvailableNetworks()) {
     if (network.passphrase === passphrase) continue;
     if (
       signatureVerifies(transaction, signatures, signers, network.passphrase)

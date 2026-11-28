@@ -39,6 +39,13 @@ export function submitFailureResult(error) {
   if (!error) return "Submit failed.";
   if (error.code === FREIGHTER_CANCELLED_CODE) return CANCELLED_RESULT;
   if (error.code === HORIZON_FAILURE_CODE && error.message) {
+    const operationExplanation = error.transactionFailure?.operations?.find(
+      (operation) => operation.explanation
+    )?.explanation;
+    if (operationExplanation) return operationExplanation;
+    if (error.transactionFailure?.transactionExplanation) {
+      return error.transactionFailure.transactionExplanation;
+    }
     return error.message;
   }
 

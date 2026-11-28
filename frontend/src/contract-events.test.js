@@ -141,6 +141,7 @@ describe("mapKitewellEvents", () => {
 
 describe("readKitewellEvents", () => {
   it("starts the tail at the opening ledger and filters by contract id", async () => {
+    sorobanServerMock.getLatestLedger.mockResolvedValue({ sequence: 1300 });
     sorobanServerMock.getEvents.mockResolvedValue({
       latestLedger: 1300,
       cursor: "cursor-1235",
@@ -181,6 +182,33 @@ describe("readKitewellEvents", () => {
     const request = sorobanServerMock.getEvents.mock.calls[0][0];
     expect(request.cursor).toBe("cursor-1235");
     expect(request.startLedger).toBeUndefined();
+  });
+
+  it("refuses a start ledger in the future", async () => {
+    sorobanServerMock.getLatestLedger.mockResolvedValue({ sequence: 1500 });
+
+    await expect(
+      readKitewellEvents(CONTRACT_ID, { startLedger: 1501 })
+    ).rejects.toThrow(/ahead of the latest ledger/);
+    expect(sorobanServerMock.getEvents).not.toHaveBeenCalled();
+  });
+
+  it("replays at most 200 events in one read", async () => {
+    await expect(
+      readKitewellEvents(CONTRACT_ID, { startLedger: 1230, limit: 201 })
+    ).rejects.toThrow(/between 1 and 200/);
+    expect(sorobanServerMock.getEvents).not.toHaveBeenCalled();
+
+    sorobanServerMock.getLatestLedger.mockResolvedValue({ sequence: 1300 });
+    sorobanServerMock.getEvents.mockResolvedValue({
+      latestLedger: 1300,
+      events: [],
+    });
+
+    await readKitewellEvents(CONTRACT_ID, { startLedger: 1230, limit: 200 });
+
+    expect(sorobanServerMock.getEvents.mock.calls[0][0].limit).toBe(200);
+    expect(sorobanServerMock.getEvents.mock.calls[0][0].startLedger).toBe(1230);
   });
 
   it("starts at the latest ledger when no cursor is available", async () => {

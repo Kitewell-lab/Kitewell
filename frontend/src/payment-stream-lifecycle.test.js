@@ -44,7 +44,7 @@ describe("the payments stream lifecycle", () => {
 
     expect(run.openStream).toHaveBeenCalledTimes(1);
     expect(started.reused).toBe(false);
-    expect(started.url).toBe(`https://horizon-testnet.stellar.org/accounts/${ACCOUNT}/payments?limit=50&cursor=now`);
+    expect(started.url).toBe(`https://horizon-testnet.stellar.org/accounts/${ACCOUNT}/payments?limit=50&join=transactions&cursor=now`);
     expect(run.controller.isOpen()).toBe(true);
     expect(run.controller.getState()).toEqual({
       status: "open",
@@ -71,8 +71,8 @@ describe("the payments stream lifecycle", () => {
     expect(run.streams).toHaveLength(2);
     expect(run.streams[0].handle.close).toHaveBeenCalledTimes(1);
     expect(run.openStream.mock.calls.map(([config]) => config.url)).toEqual([
-      `https://horizon-testnet.stellar.org/accounts/${ACCOUNT}/payments?limit=50&cursor=now`,
-      `https://horizon-futurenet.stellar.org/accounts/${ACCOUNT}/payments?limit=50&cursor=now`,
+      `https://horizon-testnet.stellar.org/accounts/${ACCOUNT}/payments?limit=50&join=transactions&cursor=now`,
+      `https://horizon-futurenet.stellar.org/accounts/${ACCOUNT}/payments?limit=50&join=transactions&cursor=now`,
     ]);
     expect(run.controller.getState().networkId).toBe("FUTURENET");
   });
@@ -153,7 +153,7 @@ describe("the payments stream lifecycle", () => {
     const plain = createPaymentStreamController({ openStream: run.openStream });
     const started = plain.start({ publicKey: ACCOUNT, networkId: "TESTNET" });
     expect(started.url).toBe(
-      `https://horizon-testnet.stellar.org/accounts/${ACCOUNT}/payments?limit=50&cursor=now`
+      `https://horizon-testnet.stellar.org/accounts/${ACCOUNT}/payments?limit=50&join=transactions&cursor=now`
     );
 
     expect(() => plain.start({ publicKey: ACCOUNT, networkId: "PUBLIC" })).toThrow(

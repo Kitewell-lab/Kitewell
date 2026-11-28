@@ -25,7 +25,7 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
         return {
           payments: () => ({
             forAccount: () => ({
-              limit: () => ({ order: () => ({ call: paymentsCallMock }) }),
+              limit: () => ({ order: () => ({ join: () => ({ call: paymentsCallMock }) }) }),
             }),
           }),
         };
@@ -101,8 +101,11 @@ describe("mapStreamPayment", () => {
         "asset_code",
         "asset_type",
         "created_at",
+        "fee_bumped",
+        "fee_charged",
         "from",
         "id",
+        "operation_count",
         "to",
         "transaction_hash",
       ].sort()

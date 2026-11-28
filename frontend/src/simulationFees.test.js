@@ -21,6 +21,10 @@ vi.mock("@stellar/freighter-api", () => ({
   setAllowed: vi.fn(),
   getAddress: vi.fn(),
   getNetwork: vi.fn().mockResolvedValue({}),
+  getNetworkDetails: vi.fn().mockResolvedValue({
+    network: "TESTNET",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  }),
   signTransaction: signTransactionMock,
 }));
 
@@ -41,7 +45,10 @@ const StellarSdk = await import("@stellar/stellar-sdk");
 const { formatSimulationFee, parseSimulationFees } = await import(
   "./simulationFees"
 );
-const { simulateRegisterBuilder } = await import("./freighter");
+const {
+  registerBuilderWithFreighter,
+  simulateRegisterBuilder,
+} = await import("./freighter");
 
 const CONTRACT_ID =
   "CCWLNS5HECRJ2GM3Q6JZZDV334ZXYO6EKZLFPLQRXO6SUDAKMS4U3E3X";
@@ -108,7 +115,7 @@ describe("simulateRegisterBuilder", () => {
       minResourceFee: "4321",
       result: {
         auth: [],
-        retval: StellarSdk.nativeToScVal(undefined, { type: "void" }),
+        retval: StellarSdk.nativeToScVal("registered", { type: "string" }),
       },
     });
 
@@ -119,10 +126,57 @@ describe("simulateRegisterBuilder", () => {
       inclusionFee: "100",
       resourceFee: "4321",
       totalFee: "4421",
+      returnValue: "registered",
     });
     expect(sorobanServerMock.simulateTransaction).toHaveBeenCalledTimes(1);
     // Simulation is read-only: no Freighter prompt, no submission.
     expect(signTransactionMock).not.toHaveBeenCalled();
     expect(sorobanServerMock.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns a contract simulation error for an empty name", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(
+      new StellarSdk.Account(USER, "7")
+    );
+    sorobanServerMock.simulateTransaction.mockResolvedValue({
+      error: "Contract error: name cannot be empty",
+    });
+
+    await expect(
+      simulateRegisterBuilder(USER, CONTRACT_ID, " ")
+    ).resolves.toMatchObject({
+      error: "Contract error: name cannot be empty",
+      returnValue: null,
+    });
+    expect(sorobanServerMock.simulateTransaction).toHaveBeenCalledTimes(1);
+    expect(signTransactionMock).not.toHaveBeenCalled();
+  });
+
+  it("does not mark a response without a result as signable", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(
+      new StellarSdk.Account(USER, "7")
+    );
+    sorobanServerMock.simulateTransaction.mockResolvedValue({});
+
+    await expect(
+      simulateRegisterBuilder(USER, CONTRACT_ID, "alice")
+    ).resolves.toMatchObject({
+      error: "Simulation returned no result.",
+      returnValue: null,
+    });
+  });
+
+  it("does not ask Freighter to sign when transaction preparation fails", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(
+      new StellarSdk.Account(USER, "7")
+    );
+    sorobanServerMock.prepareTransaction.mockRejectedValue(
+      new Error("Contract simulation failed")
+    );
+
+    await expect(
+      registerBuilderWithFreighter(USER, CONTRACT_ID, "alice")
+    ).rejects.toThrow("Contract simulation failed");
+    expect(signTransactionMock).not.toHaveBeenCalled();
   });
 });

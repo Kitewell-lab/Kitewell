@@ -39,3 +39,14 @@ export function rowsToCsv(rows, columns) {
 
   return lines.map((line) => line.join(",")).join("\r\n") + "\r\n";
 }
+
+/** Download CSV text as a file. Browser-only: the file is built from a Blob and never uploaded. */
+export function downloadCsv(csv, filename) {
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}

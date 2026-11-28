@@ -10,11 +10,13 @@ const {
   submitTransactionMock,
   signTransactionMock,
   getNetworkMock,
+  ledgerCallMock,
 } = vi.hoisted(() => ({
   loadAccountMock: vi.fn(),
   submitTransactionMock: vi.fn(),
   signTransactionMock: vi.fn(),
   getNetworkMock: vi.fn(),
+  ledgerCallMock: vi.fn(),
 }));
 
 vi.mock("@stellar/freighter-api", () => ({
@@ -35,6 +37,11 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
         return {
           loadAccount: loadAccountMock,
           submitTransaction: submitTransactionMock,
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({ call: ledgerCallMock }),
+            }),
+          }),
         };
       }),
     },
@@ -51,8 +58,14 @@ const ISSUER = StellarSdk.Keypair.random().publicKey();
 beforeEach(() => {
   vi.clearAllMocks();
   setActiveNetwork(DEFAULT_NETWORK_ID);
-  loadAccountMock.mockResolvedValue(new StellarSdk.Account(SOURCE, "1"));
+  const account = new StellarSdk.Account(SOURCE, "1");
+  account.subentry_count = 0;
+  account.balances = [{ asset_type: "native", balance: "100.0000000" }];
+  loadAccountMock.mockResolvedValue(account);
   submitTransactionMock.mockResolvedValue({ hash: "ok", ledger: 1 });
+  ledgerCallMock.mockResolvedValue({
+    records: [{ base_reserve_in_stroops: "5000000" }],
+  });
   signTransactionMock.mockImplementation(async (xdr) => ({
     signedTxXdr: xdr,
   }));

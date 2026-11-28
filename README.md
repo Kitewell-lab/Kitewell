@@ -69,13 +69,15 @@ cargo build --manifest-path contracts/Cargo.toml --target wasm32v1-none --releas
 
 Deploy steps: [contracts/README.md](./contracts/README.md). After deploy, set `KITEWELL_CONTRACT_ID` for the backend.
 
+With no `KITEWELL_CONTRACT_ID` configured, the **Lab** tab can also deploy the existing `contracts/kitewell` Wasm directly: choose the locally built `kitewell.wasm`, sign upload → create → `init(connected account)`, then copy the new id. The id is used for Lab reads and registers for that session only — the panel never writes backend env vars; it shows the `KITEWELL_CONTRACT_ID=...` line to set yourself. A second deploy in the same session asks for confirmation and keeps the first id visible.
+
 ### Tests (JS)
 
 ```bash
 npm test
 ```
 
-Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explorer URLs, asset/path parsing, Friendbot funding, balance/payment mapping, backend → Horizon fallback) with mocked Horizon SDK and API calls — CI-friendly, no Freighter wallet or network access required. `frontend/src/path-payment.test.js` covers amount normalization and path-payment operation building. `frontend/src/freighter.test.js` covers the Lab-tab Soroban registry reads and `register` invoke. `frontend/src/txInspector.test.js` covers decoding a payment envelope, a truncated XDR, the wrong-network passphrase error, and fee-bump inner transactions.
+Vitest suite in `frontend/src/stellar.test.js` covers the stellar helpers (explorer URLs, asset/path parsing, Friendbot funding, balance/payment mapping, backend → Horizon fallback) with mocked Horizon SDK and API calls — CI-friendly, no Freighter wallet or network access required. `frontend/src/path-payment.test.js` covers amount normalization and path-payment operation building. `frontend/src/freighter.test.js` covers the Lab-tab Soroban registry reads and `register` invoke. `frontend/src/txInspector.test.js` covers decoding a payment envelope, a truncated XDR, the wrong-network passphrase error, and fee-bump inner transactions. `frontend/src/fee-setting.test.js` covers fee validation, persistence, and the per-operation fee used by payments, trustlines, and path payments; `frontend/src/fee-stats.test.js` covers the Horizon `/fee_stats` mapping.
 
 ## Screenshots
 
@@ -97,18 +99,27 @@ The Testnet lab UI, using the existing assets in [`screenshots/`](./screenshots)
 
 - Freighter connect / disconnect (`setAllowed`, `getAddress`, `signTransaction`)
 - Friendbot funding (Testnet only)
+- Source-funded account creation with live source-reserve and fee checks
 - Testnet / Futurenet network toggle (persisted in `localStorage`)
-- Balances + `changeTrust` (open a trustline or remove an empty one)
+- Balances + `changeTrust` (open a trustline or remove an empty one), with a
+  minimum-balance calculator and pre-sign reserve check
 - XLM + credit-asset payments (asset picked from balances) + history
 - Path payments (`pathPaymentStrictSend` / `pathPaymentStrictReceive`)
+- Network fee selector: reads Horizon fee stats (mode / p10 / p99), accepts a custom
+  stroop fee, and applies the saved choice per operation to the next payment,
+  trustline, or path payment
 - Read-only XDR inspector: paste a base64 transaction envelope to review its source, fee,
   sequence, memo, time bounds, and operations before signing (fee-bump aware). Nothing is
   submitted.
 - Backend-backed account/payment reads (Horizon fallback)
+- Latest-ledger header with sequence, UTC close time, base fee, and base reserve
 - Lab panel for API + contract status
 - Lab tab Soroban registry: Freighter-signed `register(caller, name)` check-in + `lab_name` / `builder_count` / `get_builder` reads
+- Lab tab deploy: install the built `kitewell.wasm`, run `init(connected account)`, and use the new id for the session
 
 Send supports optional text memos up to 28 UTF-8 bytes, uint64 ID memos, and 32-byte hash memos.
+The reserve calculator and transaction checks use the base reserve reported by the latest
+Horizon ledger; if that ledger cannot be loaded, reserve-dependent signing is disabled.
 
 ### Path payments (Testnet)
 
@@ -161,4 +172,6 @@ one place.
 - Friendbot is Testnet-only and is disabled on Futurenet.
 - The Kitewell backend is configured for Testnet, so account/payment reads go straight to Horizon
   when another network is selected.
+- Latest-ledger values come from the selected network's Horizon endpoint, refresh while the page
+  is visible, and retain the last successful values with a warning when a refresh fails.
 - No Mainnet funds are ever used.

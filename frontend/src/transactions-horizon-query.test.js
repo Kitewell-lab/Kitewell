@@ -12,7 +12,7 @@ const {
   paymentsCallMock,
 } = vi.hoisted(() => {
   const paymentsCallMock = vi.fn();
-  const orderMock = vi.fn(() => ({ call: paymentsCallMock }));
+  const orderMock = vi.fn(() => ({ join: () => ({ call: paymentsCallMock }) }));
   const limitMock = vi.fn(() => ({ order: orderMock }));
   const forAccountMock = vi.fn(() => ({ limit: limitMock }));
 

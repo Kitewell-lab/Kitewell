@@ -86,15 +86,50 @@ Every other field is derived from `NETWORK` — see [Network configuration](#net
 
 ---
 
+## Selecting a network
+
+`GET /api/account/:address` and `GET /api/payments/:address` read from the
+Horizon of the network the caller selects, so the frontend can follow the
+Testnet / Futurenet switch without a second backend process.
+
+Send either the `network` query parameter or the `x-kitewell-network` header:
+
+```
+GET /api/account/GABC…?network=FUTURENET
+GET /api/payments/GABC…
+X-Kitewell-Network: FUTURENET
+```
+
+| Value | Horizon used |
+|-------|--------------|
+| `TESTNET` | Testnet Horizon (`https://horizon-testnet.stellar.org` by default) |
+| `FUTURENET` | Futurenet Horizon (`https://horizon-futurenet.stellar.org` by default) |
+| omitted / blank | `TESTNET` (the default) |
+| anything else | `400` with `{ "error": "Unsupported network \"…\"…" }` |
+
+The value is case-insensitive and trimmed. The query parameter wins when both
+are sent. Explorer URLs in the response follow the selected network.
+
+`HORIZON_URL` / `EXPLORER_BASE` overrides apply to the server's own `NETWORK`;
+every other network uses its preset URLs. Friendbot stays Testnet-only.
+
+---
+
 ## GET /api/account/:address
 
-Loads an account from Horizon and returns balances.
+Loads an account from the selected network's Horizon and returns balances.
 
 **Path params**
 
 | Param | Description |
 |-------|-------------|
 | `address` | Stellar public key (Ed25519) |
+
+**Query params**
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `network` | `TESTNET` | `TESTNET` or `FUTURENET` (see [Selecting a network](#selecting-a-network)) |
 
 **Success — 200**
 
@@ -123,14 +158,15 @@ Loads an account from Horizon and returns balances.
 | Status | Body | When |
 |--------|------|------|
 | 400 | `{ "error": "Invalid Stellar public key" }` | Bad address format |
-| 404 | `{ "error": "Account not found on Testnet. Fund with Friendbot first." }` | Account doesn't exist |
+| 400 | `{ "error": "Unsupported network \"…\". Supported networks: TESTNET, FUTURENET." }` | Unknown `network` |
+| 404 | `{ "error": "Account not found on Testnet. Fund with Friendbot first." }` | Account doesn't exist on the selected network |
 | 502 | `{ "error": "Horizon request failed", "detail": "…" }` | Horizon unreachable |
 
 ---
 
 ## GET /api/payments/:address
 
-Returns recent payments for an account, newest first.
+Returns recent payments for an account on the selected network, newest first.
 
 **Path params**
 
@@ -144,6 +180,7 @@ Returns recent payments for an account, newest first.
 |-------|---------|-----|-------------|
 | `limit` | 15 | 50 | Number of payments to return |
 | `cursor` | _(none)_ | — | Paging token to continue from; pass the previous response's `nextCursor` |
+| `network` | `TESTNET` | — | `TESTNET` or `FUTURENET` (see [Selecting a network](#selecting-a-network)) |
 
 **Success — 200**
 
@@ -181,5 +218,6 @@ GET /api/payments/GABC…?limit=15&cursor=9876543210-0
 | Status | Body | When |
 |--------|------|------|
 | 400 | `{ "error": "Invalid Stellar public key" }` | Bad address format |
+| 400 | `{ "error": "Unsupported network \"…\". Supported networks: TESTNET, FUTURENET." }` | Unknown `network` |
 | 400 | `{ "error": "Invalid cursor" }` | Horizon rejected the `cursor` (HTTP 400) |
 | 502 | `{ "error": "Could not load payments", "detail": "…" }` | Horizon unreachable |

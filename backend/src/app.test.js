@@ -28,7 +28,7 @@ function testEnv(overrides = {}) {
 function stubHorizon({ account, accountError, payments, paymentsError } = {}) {
   const calls = {
     loadAccount: [],
-    payments: { forAccount: null, limit: null, order: null, cursor: null },
+    payments: { forAccount: null, limit: null, order: null, cursor: null, join: null },
   };
 
   return {
@@ -55,6 +55,10 @@ function stubHorizon({ account, accountError, payments, paymentsError } = {}) {
           },
           cursor(value) {
             calls.payments.cursor = value;
+            return builder;
+          },
+          join(value) {
+            calls.payments.join = value;
             return builder;
           },
           async call() {
@@ -115,6 +119,7 @@ function accountFixture(overrides = {}) {
     id: VALID_ADDRESS,
     sequenceNumber: () => "123456789012345678",
     subentry_count: 1,
+    last_modified_ledger: 987654,
     thresholds: {
       low_threshold: 1,
       med_threshold: 2,
@@ -191,6 +196,7 @@ test("GET /api/account/:address maps a Horizon account into the API body", async
         limit: "1000.0000000",
       },
     ],
+    data_attr: { z: "eg==", a: "aGVsbG8=" },
   });
   const { get, stub } = await boot(t, {
     horizon: stubHorizon({ account }),
@@ -204,7 +210,9 @@ test("GET /api/account/:address maps a Horizon account into the API body", async
     id: VALID_ADDRESS,
     sequence: "123456789012345678",
     subentryCount: 1,
+    lastModifiedLedger: 987654,
     thresholds: { low_threshold: 1, med_threshold: 2, high_threshold: 3 },
+    signers: [],
     balances: [
       {
         key: "native",
@@ -225,6 +233,10 @@ test("GET /api/account/:address maps a Horizon account into the API body", async
         isAuthorizedToMaintainLiabilities: null,
         clawbackEnabled: null,
       },
+    ],
+    dataEntries: [
+      { name: "a", value: "aGVsbG8=" },
+      { name: "z", value: "eg==" },
     ],
     explorerUrl: `https://explorer.test.invalid/account/${VALID_ADDRESS}`,
   });
@@ -288,6 +300,13 @@ test("GET /api/payments/:address filters out non-payment records", async (t) => 
           asset_code: "USDC",
           transaction_hash: "hash-payment",
           created_at: "2026-01-02T00:00:00Z",
+          transaction: {
+            fee_charged: "100",
+            operation_count: 1,
+            memo_type: "text",
+            memo: "invoice-42",
+            memo_bytes: "aW52b2ljZS00Mg==",
+          },
         },
         {
           id: "3",
@@ -317,6 +336,7 @@ test("GET /api/payments/:address filters out non-payment records", async (t) => 
   assert.equal(status, 200);
   assert.deepEqual(stub.calls.payments.forAccount, VALID_ADDRESS);
   assert.equal(stub.calls.payments.order, "desc");
+  assert.equal(stub.calls.payments.join, "transactions");
   assert.equal(body.records.length, 2);
   assert.equal(body.nextCursor, null, "a short page is the last page");
   assert.deepEqual(body.records, [
@@ -329,6 +349,12 @@ test("GET /api/payments/:address filters out non-payment records", async (t) => 
       asset_code: "USDC",
       transaction_hash: "hash-payment",
       created_at: "2026-01-02T00:00:00Z",
+      fee_charged: "100",
+      operation_count: 1,
+      fee_bumped: false,
+      memo_type: "text",
+      memo: "invoice-42",
+      memo_bytes: "aW52b2ljZS00Mg==",
       explorerUrl: "https://explorer.test.invalid/tx/hash-payment",
     },
     {
@@ -340,6 +366,9 @@ test("GET /api/payments/:address filters out non-payment records", async (t) => 
       asset_code: "XLM",
       transaction_hash: "hash-native",
       created_at: "2026-01-04T00:00:00Z",
+      fee_charged: null,
+      operation_count: null,
+      fee_bumped: false,
       explorerUrl: "https://explorer.test.invalid/tx/hash-native",
     },
   ]);

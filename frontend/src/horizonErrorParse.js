@@ -206,3 +206,75 @@ export function getTransactionResultCode(errorResponse) {
   const { result_codes = {} } = extras;
   return result_codes.transaction || null;
 }
+
+/**
+ * Extract failed operation results with their zero-based operation indexes.
+ *
+ * Accepts both a Horizon submit error (`extras.result_codes`) and a transaction
+ * record that exposes `result_codes` directly. Successful and unattempted
+ * operations are omitted so later operation indexes remain accurate.
+ */
+export function parseTransactionFailure(errorResponse) {
+  if (!errorResponse || typeof errorResponse !== "object" || Array.isArray(errorResponse)) {
+    return null;
+  }
+
+  const resultCodes =
+    errorResponse.extras?.result_codes ?? errorResponse.result_codes;
+  if (!resultCodes || typeof resultCodes !== "object") return null;
+
+  const operationResults = Array.isArray(resultCodes.operations)
+    ? resultCodes.operations
+    : [];
+  const operations = operationResults.flatMap((code, index) => {
+    if (
+      typeof code !== "string" ||
+      !code ||
+      code === "op_success" ||
+      code === "op_not_attempted"
+    ) {
+      return [];
+    }
+
+    return [
+      {
+        index,
+        code,
+        explanation: Object.prototype.hasOwnProperty.call(
+          OPERATION_RESULT_CODE_MESSAGES,
+          code
+        )
+          ? OPERATION_RESULT_CODE_MESSAGES[code]
+          : null,
+      },
+    ];
+  });
+  const transactionCode =
+    typeof resultCodes.transaction === "string" && resultCodes.transaction
+      ? resultCodes.transaction
+      : null;
+  const transactionExplanation =
+    transactionCode &&
+    Object.prototype.hasOwnProperty.call(
+      TRANSACTION_RESULT_CODE_MESSAGES,
+      transactionCode
+    )
+      ? TRANSACTION_RESULT_CODE_MESSAGES[transactionCode]
+      : null;
+
+  return {
+    operations,
+    transactionCode,
+    transactionExplanation,
+  };
+}
+
+/** Parse a Horizon SDK error or transaction response without exposing XDR. */
+export function getTransactionFailure(errorOrResponse) {
+  const responseBody =
+    errorOrResponse?.response?.data ??
+    errorOrResponse?.response?.body ??
+    errorOrResponse?.data ??
+    errorOrResponse;
+  return parseTransactionFailure(responseBody);
+}
