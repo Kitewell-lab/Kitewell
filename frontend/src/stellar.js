@@ -6,6 +6,11 @@ import {
   getActiveNetworkId,
   isFriendbotAvailable,
 } from "./network";
+import { mapTransactionFee } from "./historyFee";
+
+import { calculateMinimumBalance } from "./accountReserve";
+import { paymentMemoFields } from "./paymentMemo";
+
 
 /** Shown in the lab panel when Horizon asks the client to slow down. */
 export const HORIZON_SLOWDOWN_MESSAGE =
@@ -108,6 +113,143 @@ function defaultSleep(ms, signal) {
       reject(abortError());
       return;
     }
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(abortError());
+      },
+      { once: true }
+    );
+  });
+}
+
+function getServer() {
+  return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
+}
+
+/** @param {unknown} error */
+export function isHorizon429(error) {
+  const status = error?.response?.status ?? error?.status;
+  if (status === 429) return true;
+  return /too many requests/i.test(String(error?.message ?? ""));
+}
+
+export function isHorizonSlowdownError(error) {
+  return error instanceof Error && error.message === HORIZON_SLOWDOWN_MESSAGE;
+}
+
+function readRetryAfterSeconds(error) {
+  const headers = error?.response?.headers;
+  if (!headers) return null;
+  const raw =
+    typeof headers.get === "function"
+      ? headers.get("retry-after") ?? headers.get("Retry-After")
+      : headers["retry-after"] ?? headers["Retry-After"];
+  if (raw == null || raw === "") return null;
+  const asNumber = Number(raw);
+  if (Number.isFinite(asNumber) && asNumber >= 0) return asNumber;
+  const asDate = Date.parse(String(raw));
+  if (!Number.isNaN(asDate)) return Math.max(0, (asDate - Date.now()) / 1000);
+  return null;
+}
+
+export function computeHorizon429WaitSeconds(streak) {
+  const safeStreak = Math.max(1, streak);
+  return Math.min(HORIZON_429_BASE_WAIT_SEC * 2 ** (safeStreak - 1), HORIZON_429_MAX_WAIT_SEC);
+}
+
+function resetHorizon429Backoff(networkId = getActiveNetworkId()) {
+  horizon429BackoffByNetwork.delete(networkId);
+}
+
+export function recordHorizon429(error) {
+  const networkId = getActiveNetworkId();
+  const prior = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
+  const streak = prior.streak + 1;
+  horizon429BackoffByNetwork.set(networkId, { streak });
+  const retryAfter = readRetryAfterSeconds(error);
+  if (retryAfter != null) return retryAfter;
+  return computeHorizon429WaitSeconds(streak);
+}
+
+export function resetHorizon429BackoffForTests() {
+  horizon429BackoffByNetwork.clear();
+}
+
+function abortError() {
+  const error = new Error("Aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function defaultSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(abortError());
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export async function withHorizon429Backoff(fn, options = {}) {
+  const { signal, sleep = defaultSleep } = options;
+  if (signal?.aborted) throw abortError();
+  try {
+    const result = await fn();
+    resetHorizon429Backoff();
+    return result;
+  } catch (error) {
+    if (!isHorizon429(error)) throw error;
+    const waitSeconds = recordHorizon429(error);
+    await sleep(waitSeconds * 1000, signal);
+    throw new Error(HORIZON_SLOWDOWN_MESSAGE, { cause: error });
+  }
+}
+
+export async function getLatestLedger(networkId = getActiveNetworkId()) {
+  const network = NETWORKS[networkId];
+  if (!network) {
+    throw new Error(`Unsupported network: ${networkId}`);
+  }
+
+  const response = await new StellarSdk.Horizon.Server(network.horizonUrl)
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const ledger = response.records?.[0];
+  if (!ledger) {
+    throw new Error("Horizon returned no latest ledger.");
+  }
+
+  const sequence = Number(ledger.sequence);
+  const closedAt = Date.parse(ledger.closed_at);
+  const baseFee = String(ledger.base_fee_in_stroops ?? "");
+  const baseReserve = String(ledger.base_reserve_in_stroops ?? "");
+  if (!Number.isSafeInteger(sequence) || sequence < 1) {
+    throw new Error("Latest ledger has an invalid sequence.");
+  }
+  if (!Number.isFinite(closedAt)) {
+    throw new Error("Latest ledger has an invalid close time.");
+  }
+  if (!/^\d+$/.test(baseFee)) {
+    throw new Error("Latest ledger has an invalid base fee.");
+  }
+  if (!/^[1-9]\d*$/.test(baseReserve)) {
+    throw new Error("Latest ledger has an invalid base reserve.");
+  }
+
 
     const timer = setTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
@@ -140,10 +282,90 @@ function defaultSleep(ms, signal) {
  */
 export async function withHorizon429Backoff(fn, options = {}) {
   const { signal, sleep = defaultSleep } = options;
+  return {
+    mode: String(charged.mode ?? fallback),
+    p10: String(charged.p10 ?? fallback),
+    p99: String(charged.p99 ?? fallback),
+    lastLedger: stats?.last_ledger ? String(stats.last_ledger) : null,
+  };
+}
 
+export const MAX_ASSET_CODE_LENGTH = 12;
+function mapOrderBookRows(rows = []) {
+  return rows.slice(0, 10).map((row) => ({
+    amount: row.amount,
+    price: row.price,
+    priceR: row.price_r,
+  }));
+}
+
+export const MAX_DATA_NAME_BYTES = 64;
+export const MAX_DATA_VALUE_BYTES = 64;
+
+export function utf8ByteLength(value) {
+  return new TextEncoder().encode(value == null ? "" : String(value)).length;
+}
+
+export function validateDataName(name) {
+  const normalized = String(name ?? "");
+  if (!normalized) throw new Error("Data name is required.");
+  if (utf8ByteLength(normalized) > MAX_DATA_NAME_BYTES) {
+    throw new Error("Data name must be 64 UTF-8 bytes or fewer.");
+  }
+  return normalized;
+}
+
+export function validateDataValue(value) {
+  const normalized = value == null ? "" : String(value);
+  if (utf8ByteLength(normalized) > MAX_DATA_VALUE_BYTES) {
+    throw new Error("Data value must be 64 UTF-8 bytes or fewer.");
+  }
+  return normalized;
+}
+
+function dataValueBytes(value) {
+  if (value == null) return new Uint8Array();
+  if (typeof value === "string") {
+    try {
+      const binary = atob(value);
+      return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    } catch {
+      return new TextEncoder().encode(value);
+    }
+  }
+  if (value instanceof Uint8Array) return value;
+  return new TextEncoder().encode(String(value));
+}
+=======
   if (signal?.aborted) throw abortError();
 
+function decodeUtf8(bytes) {
   try {
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), isBinary: false };
+  } catch {
+    return {
+      text: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+      isBinary: true,
+    };
+  }
+}
+
+export function formatDataValue(value) {
+  return decodeUtf8(dataValueBytes(value)).text;
+}
+
+/** True when the value is not valid UTF-8 and is therefore shown as hex. */
+export function isBinaryDataValue(value) {
+  return decodeUtf8(dataValueBytes(value)).isBinary;
+}
+
+export function mapAccountDataEntries(account) {
+  if (Array.isArray(account?.dataEntries)) {
+    return account.dataEntries
+      .filter((entry) => entry && typeof entry.name === "string")
+      .map((entry) => ({ name: entry.name, value: entry.value }));
+  }
+
     const result = await fn();
     resetHorizon429Backoff();
     return result;
@@ -156,6 +378,26 @@ export async function withHorizon429Backoff(fn, options = {}) {
   }
 }
 
+export const getAccountDataEntries = mapAccountDataEntries;
+export const formatAccountDataValue = formatDataValue;
+export const isBinaryAccountDataValue = isBinaryDataValue;
+export const validateManageDataName = validateDataName;
+export const validateManageDataValue = validateDataValue;
+
+export function validateAccountMerge(source, destination, retypeDestination) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(source)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
+    throw new Error("Destination must be a valid Stellar public key (G…).");
+  }
+  if (destination === source) {
+    throw new Error("The destination account cannot be the connected account.");
+  }
+  if (retypeDestination !== destination) {
+    throw new Error("Retype the destination public key exactly as it appears.");
+  }
+  return destination;
 /** The Kitewell backend is configured for Testnet, so skip it elsewhere. */
 function backendIsUsable() {
   return getActiveNetworkId() === "TESTNET";
@@ -456,7 +698,22 @@ export function calculateAvailableBalance(
 
   return Math.max(0, total - sellingLiabilities).toFixed(7);
 }
+/**
+ * Hide only idle, zero-balance credit trustlines. Native XLM, pool shares and
+ * trustlines with either buying or selling liabilities always remain visible.
+ */
+export function filterVisibleBalances(balances, hideZeroCreditAssets = false) {
+  if (!Array.isArray(balances)) return [];
+  if (!hideZeroCreditAssets) return balances;
 
+  return balances.filter((balance) => {
+    if (balance?.isNative || balance?.isPoolShare) return true;
+    if (Number(balance?.balance || 0) !== 0) return true;
+    return (
+      Number(balance?.buyingLiabilities || 0) !== 0 ||
+      Number(balance?.sellingLiabilities || 0) !== 0
+    );
+  });
 function liabilityFields(balance, isNative, subentryCount, baseReserve) {
   const sellingLiabilities = parseFloat(balance.selling_liabilities || "0");
   const buyingLiabilities = parseFloat(balance.buying_liabilities || "0");
@@ -482,8 +739,7 @@ async function readBaseReserve() {
   return baseReserve;
 }
 
-function mapHorizonBalances(account, baseReserve = 0.5) {
-  const subentryCount = account.subentry_count || 0;
+function mapHorizonBalances(account) {
   return account.balances.map((b) => {
     if (b.asset_type === "liquidity_pool_shares") {
       return {
@@ -603,7 +859,19 @@ export async function getSponsoredTrustlines(publicKey, options = {}) {
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
     throw new Error("Connect a valid Freighter address first.");
   }
-
+  const account = await getServer().loadAccount(publicKey);
+  return {
+    id: account.id,
+    sequence: account.sequenceNumber(),
+    subentryCount: account.subentry_count,
+    lastModifiedLedger: account.last_modified_ledger ?? null,
+    thresholds: account.thresholds,
+    balances: mapHorizonBalances(account),
+    dataEntries: mapAccountDataEntries(account),
+    signers: account.signers || [],
+    explorerUrl: explorerAccountUrl(publicKey),
+  };
+}
   return withHorizon429Backoff(async () => {
     let page = await getServer()
       .accounts()
@@ -674,6 +942,34 @@ export async function getBalance(publicKey, options = {}) {
   const xlm = balances.find((b) => b.isNative);
   return xlm ? xlm.balance : "0";
 }
+export async function getClaimableBalancesForClaimant(publicKey) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  const page = await getServer()
+    .claimableBalances()
+    .claimant(publicKey)
+    .limit(200)
+    .order("desc")
+    .call();
+
+  return (page.records || []).map((balance) => ({
+    id: balance.id,
+    asset:
+      balance.asset === "native"
+        ? "XLM"
+        : `${balance.asset_code || balance.asset}`,
+    assetCode: balance.asset_code,
+    assetIssuer: balance.asset_issuer,
+    amount: balance.amount,
+    claimants: balance.claimants || [],
+    sponsor: balance.sponsor || null,
+  }));
+}
+
+export const listClaimableBalances = getClaimableBalancesForClaimant;
+
 
 /** Load all open offers owned by the connected account from Horizon. */
 export async function getOpenOffers(publicKey, options = {}) {
@@ -804,6 +1100,12 @@ export function mapPendingTransaction(record) {
     ),
     status,
   };
+}
+
+export function selectPendingTransactions(records) {
+  return (records || [])
+    .map(mapPendingTransaction)
+    .filter((tx) => tx.hash && tx.status !== "applied");
 }
 
 /**
@@ -950,7 +1252,14 @@ export async function getPendingTransactions(publicKey, options = {}) {
     const url = `${getActiveNetwork().horizonUrl}/accounts/${encodeURIComponent(
       publicKey
     )}/pending_transactions`;
-
+    const response = options.signal
+      ? await fetch(url, { signal: options.signal })
+      : await fetch(url);
+    if (response.status === 404) return [];
+    if (!response.ok) {
+      const error = new Error(`Could not load pending transactions (HTTP ${response.status}).`);
+    const response = await fetch(url);
+    if (response.status === 404) return [];
     const response = options.signal
       ? await fetch(url, { signal: options.signal })
       : await fetch(url);
@@ -964,12 +1273,44 @@ export async function getPendingTransactions(publicKey, options = {}) {
       error.status = response.status;
       throw error;
     }
+    const body = await response.json();
+    const records = Array.isArray(body)
+      ? body
+      : body?._embedded?.records || body?.records || [];
+    return selectPendingTransactions(records);
+  }, options);
+    return selectPendingTransactions(body?._embedded?.records || []);
+  });
+}
+
 
     const body = await response.json();
     const records = Array.isArray(body)
       ? body
       : body?._embedded?.records || body?.records || [];
 
+  return {
+    records: records.map((trade) => ({
+      id: trade.id,
+      ledger_close_time: trade.ledger_close_time,
+      offer_id: trade.offer_id,
+      base_account: trade.base_account,
+      base_amount: trade.base_amount,
+      base_asset_type: trade.base_asset_type,
+      base_asset_code: trade.base_asset_code,
+      base_asset_issuer: trade.base_asset_issuer,
+      counter_account: trade.counter_account,
+      counter_amount: trade.counter_amount,
+      counter_asset_type: trade.counter_asset_type,
+      counter_asset_code: trade.counter_asset_code,
+      counter_asset_issuer: trade.counter_asset_issuer,
+      price: trade.price,
+      base_is_seller: trade.base_is_seller,
+    })),
+    nextCursor: records.length > 0
+      ? records[records.length - 1].paging_token
+      : null,
+  };
     return selectPendingTransactions(records);
   }, options);
 }
