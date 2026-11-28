@@ -14,10 +14,26 @@ vi.mock("./api", () => ({
   fetchPaymentsViaApi: vi.fn(),
 }));
 
-const { loadAccountMock, paymentsCallMock, offersCallMock } = vi.hoisted(() => ({
+const {
+  loadAccountMock,
+  paymentsCallMock,
+  offersCallMock,
+  ledgerCallMock,
+  orderBookCallMock,
+  claimableCallMock,
+  assetCallMock,
+  accountSponsorMock,
+  accountsCallMock,
+} = vi.hoisted(() => ({
   loadAccountMock: vi.fn(),
   paymentsCallMock: vi.fn(),
   offersCallMock: vi.fn(),
+  ledgerCallMock: vi.fn(),
+  orderBookCallMock: vi.fn(),
+  claimableCallMock: vi.fn(),
+  assetCallMock: vi.fn(),
+  accountSponsorMock: vi.fn(),
+  accountsCallMock: vi.fn(),
 }));
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
@@ -29,6 +45,18 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
       Server: vi.fn(function () {
         return {
           loadAccount: loadAccountMock,
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({ call: ledgerCallMock }),
+            }),
+          }),
+          trades: () => ({
+            forAccount: () => ({
+              limit: () => ({
+                order: () => ({ cursor: () => ({ call: ledgerCallMock }) }),
+              }),
+            }),
+          }),
           offers: () => ({
             forAccount: () => ({
               order: () => ({ call: offersCallMock }),
@@ -37,7 +65,13 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
           payments: () => ({
             forAccount: () => ({
               limit: () => ({
-                order: () => ({ join: () => ({ call: paymentsCallMock }) }),
+                order: () => ({
+                  join: () => ({
+                    cursor: () => ({ call: paymentsCallMock }),
+                    call: paymentsCallMock,
+                  }),
+                  call: paymentsCallMock,
+                }),
               }),
             }),
           }),
@@ -48,6 +82,16 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
           }),
           claimableBalances: () => ({
             forSponsor: () => ({ limit: () => ({ call: claimableCallMock }) }),
+          }),
+          accounts: () => ({
+            sponsor: (sponsor) => {
+              accountSponsorMock(sponsor);
+              return {
+                limit: (limit) => ({
+                  call: () => accountsCallMock(sponsor, limit),
+                }),
+              };
+            },
           }),
           assets: () => ({
             forCode: () => ({ forIssuer: () => ({ call: assetCallMock }) }),
@@ -68,6 +112,7 @@ const {
   fundWithFriendbot,
   getLatestLedger,
   getAccountBalances,
+  getSponsoredTrustlines,
   getAccountDetails,
   getAccountOffers,
   getBalance,
@@ -80,6 +125,7 @@ const {
   validateDataValue,
   validateAccountMerge,
   mergeBlockersFromAccount,
+  resetHorizon429BackoffForTests,
 } = await import("./stellar");
 
 /** Minimal Horizon account payload: 3.5 XLM + an issued asset. */
@@ -113,6 +159,12 @@ beforeEach(() => {
   loadAccountMock.mockReset();
   paymentsCallMock.mockReset();
   offersCallMock.mockReset();
+  ledgerCallMock.mockReset();
+  orderBookCallMock.mockReset();
+  claimableCallMock.mockReset();
+  assetCallMock.mockReset();
+  accountSponsorMock.mockReset();
+  accountsCallMock.mockReset();
   resetHorizon429BackoffForTests();
 });
 
@@ -396,6 +448,16 @@ describe("getBalance", () => {
 
 describe("getLatestBaseReserve", () => {
   it("reads the base reserve from the latest Horizon ledger", async () => {
+    ledgerCallMock.mockResolvedValue({
+      records: [
+        {
+          sequence: 123456,
+          closed_at: "2026-11-20T15:00:00Z",
+          base_fee_in_stroops: 100,
+          base_reserve_in_stroops: 5000000,
+        },
+      ],
+    });
     await expect(getLatestBaseReserve()).resolves.toBe("5000000");
     expect(ledgerCallMock).toHaveBeenCalledTimes(1);
   });
@@ -476,6 +538,89 @@ describe("balance mapping", () => {
         expect.objectContaining({ code: "FOO", isNative: false }),
       ]),
       explorerUrl: "https://stellar.expert/explorer/testnet/account/GTEST",
+    });
+  });
+
+  describe("getSponsoredTrustlines", () => {
+    it("finds sponsored trustlines on other holders and follows all pages", async () => {
+      const sponsor = StellarSdk.Keypair.random().publicKey();
+      const holder = StellarSdk.Keypair.random().publicKey();
+      const secondHolder = StellarSdk.Keypair.random().publicKey();
+      const issuer = StellarSdk.Keypair.random().publicKey();
+      const otherSponsor = StellarSdk.Keypair.random().publicKey();
+      const firstPage = {
+        records: [
+          {
+            account_id: holder,
+            balances: [
+              {
+                asset_type: "credit_alphanum4",
+                asset_code: "USD",
+                asset_issuer: issuer,
+                sponsor,
+              },
+            ],
+          },
+          {
+            account_id: otherSponsor,
+            balances: [
+              {
+                asset_type: "credit_alphanum4",
+                asset_code: "EUR",
+                asset_issuer: issuer,
+                sponsor: otherSponsor,
+              },
+            ],
+          },
+          ...Array.from({ length: 198 }, (_, index) => ({
+            account_id: `GOTHER${index}`,
+            balances: [],
+          })),
+        ],
+        next: vi.fn(),
+      };
+      const secondPage = {
+        records: [
+          {
+            account_id: secondHolder,
+            balances: [
+              {
+                asset_type: "credit_alphanum4",
+                asset_code: "EUR",
+                asset_issuer: issuer,
+                sponsor,
+              },
+            ],
+          },
+        ],
+      };
+      firstPage.next.mockResolvedValue(secondPage);
+      accountsCallMock.mockResolvedValue(firstPage);
+
+      await expect(getSponsoredTrustlines(sponsor)).resolves.toEqual([
+        {
+          key: `${holder}:USD:${issuer}`,
+          holder,
+          code: "USD",
+          issuer,
+        },
+        {
+          key: `${secondHolder}:EUR:${issuer}`,
+          holder: secondHolder,
+          code: "EUR",
+          issuer,
+        },
+      ]);
+      expect(accountSponsorMock).toHaveBeenCalledWith(sponsor);
+      expect(accountsCallMock).toHaveBeenCalledWith(sponsor, 200);
+      expect(firstPage.next).toHaveBeenCalledOnce();
+    });
+
+    it("rejects an invalid sponsor before requesting Horizon", async () => {
+      await expect(getSponsoredTrustlines("not-an-account")).rejects.toThrow(
+        "Connect a valid Freighter address first."
+      );
+      expect(accountSponsorMock).not.toHaveBeenCalled();
     });
   });
 });

@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { loadAccountMock, submitTransactionMock, signTransactionMock } =
+const { loadAccountMock, submitTransactionMock, signTransactionMock, ledgerCallMock } =
   vi.hoisted(() => ({
     loadAccountMock: vi.fn(),
     submitTransactionMock: vi.fn(),
     signTransactionMock: vi.fn(),
+    ledgerCallMock: vi.fn().mockResolvedValue({
+      records: [{ base_reserve_in_stroops: "5000000" }],
+    }),
   }));
 
 vi.mock("@stellar/freighter-api", () => ({
@@ -28,6 +31,11 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
         return {
           loadAccount: loadAccountMock,
           submitTransaction: submitTransactionMock,
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({ call: ledgerCallMock }),
+            }),
+          }),
         };
       }),
     },
@@ -53,7 +61,12 @@ describe("createAccountWithFreighter", () => {
   it("locks the createAccount operation fields", async () => {
     loadAccountMock
       .mockRejectedValueOnce({ response: { status: 404 } })
-      .mockResolvedValueOnce(new StellarSdk.Account(SOURCE, "7"));
+      .mockResolvedValueOnce(
+        Object.assign(new StellarSdk.Account(SOURCE, "7"), {
+          balances: [{ asset_type: "native", balance: "100.0000000" }],
+          subentry_count: 0,
+        })
+      );
 
     await createAccountWithFreighter(SOURCE, DESTINATION, "2.5");
 

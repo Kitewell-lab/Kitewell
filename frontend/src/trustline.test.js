@@ -54,6 +54,7 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
 const StellarSdk = await import("@stellar/stellar-sdk");
 const {
   changeTrustWithFreighter,
+  revokeTrustlineSponsorshipWithFreighter,
   createAccountWithFreighter,
 } = await import("./freighter");
 
@@ -101,6 +102,31 @@ describe("changeTrustWithFreighter", () => {
     expect(parseFloat(op.limit)).toBeGreaterThan(0);
   });
 
+  it("builds revokeSponsorship for a sponsored trustline without removing it", async () => {
+    await revokeTrustlineSponsorshipWithFreighter(SOURCE, "usdc", ISSUER);
+
+    const operations = submitTransactionMock.mock.calls[0][0].operations;
+    expect(operations).toHaveLength(1);
+    expect(operations[0].type).toBe("revokeTrustlineSponsorship");
+    expect(operations[0].account).toBe(SOURCE);
+    expect(operations[0].asset.getCode()).toBe("USDC");
+    expect(operations[0].asset.getIssuer()).toBe(ISSUER);
+  });
+
+  it("uses the holder account for a trustline sponsored on another account", async () => {
+    const holder = StellarSdk.Keypair.random().publicKey();
+    await revokeTrustlineSponsorshipWithFreighter(
+      SOURCE,
+      "usdc",
+      ISSUER,
+      holder
+    );
+
+    const operation = submitTransactionMock.mock.calls[0][0].operations[0];
+    expect(loadAccountMock).toHaveBeenCalledWith(SOURCE);
+    expect(operation.account).toBe(holder);
+  });
+
   it("rejects an invalid issuer before submitting", async () => {
     await expect(
       changeTrustWithFreighter(SOURCE, "USDC", "not-a-key", "0")
@@ -110,7 +136,14 @@ describe("changeTrustWithFreighter", () => {
   });
 
   it("refuses a new trustline when two subentries leave no room for reserve and fee", async () => {
-    loadAccountMock.mockResolvedValue(sourceAccount("2.5000000", 2));
+    loadAccountMock.mockImplementation((accountId) => {
+      if (accountId === SOURCE) {
+        return sourceAccount("2.5000000", 2);
+      }
+      const error = new Error("Account not found");
+      error.response = { status: 404 };
+      throw error;
+    });
 
     await expect(
       changeTrustWithFreighter(SOURCE, "USDC", ISSUER)
@@ -132,6 +165,16 @@ describe("changeTrustWithFreighter", () => {
   });
 
   it("creates an account when both reserve checks pass", async () => {
+    loadAccountMock.mockImplementation((accountId) => {
+      if (accountId === SOURCE) {
+        return sourceAccount();
+      }
+      // Destination doesn't exist yet (404)
+      const error = new Error("Account not found");
+      error.response = { status: 404 };
+      throw error;
+    });
+
     await createAccountWithFreighter(SOURCE, DESTINATION, "2.5");
 
     const operation = submitTransactionMock.mock.calls[0][0].operations[0];
@@ -142,7 +185,15 @@ describe("changeTrustWithFreighter", () => {
   });
 
   it("refuses account creation when the source would fall below its minimum", async () => {
-    loadAccountMock.mockResolvedValue(sourceAccount("4.5000000", 2));
+    loadAccountMock.mockImplementation((accountId) => {
+      if (accountId === SOURCE) {
+        return sourceAccount("4.5000000", 2);
+      }
+      // Destination doesn't exist yet (404)
+      const error = new Error("Account not found");
+      error.response = { status: 404 };
+      throw error;
+    });
 
     await expect(
       createAccountWithFreighter(SOURCE, DESTINATION, "2.5")
