@@ -52,6 +52,8 @@ import {
   getAccountDetails,
   getOpenOffers,
   getPendingTransactions,
+  getClaimableBalances,
+  getOutgoingSponsorships,
   getSponsoredClaimableBalances,
   getOrderBook,
   getAccountTrades,
@@ -326,6 +328,8 @@ export default function App() {
   const [simulatedRegisterKey, setSimulatedRegisterKey] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
+  const [outgoingSponsorships, setOutgoingSponsorships] = useState(null);
+  const [sponsorshipsError, setSponsorshipsError] = useState(null);
   const [builderAddress, setBuilderAddress] = useState("");
   const [builderLookupResult, setBuilderLookupResult] = useState(null);
   const [builderLookupError, setBuilderLookupError] = useState(null);
@@ -567,6 +571,35 @@ export default function App() {
   }, []);
 
   useEffect(() => () => cancelHorizonReads(), []);
+
+  // Outgoing sponsorships are a read-only Horizon view. Reload them when the
+  // connected account or the selected network changes.
+  useEffect(() => {
+    if (!publicKey) {
+      setOutgoingSponsorships([]);
+      setSponsorshipsError(null);
+      return undefined;
+    }
+
+    let cancelled = false;
+    setOutgoingSponsorships(null);
+    setSponsorshipsError(null);
+    getOutgoingSponsorships(publicKey)
+      .then((rows) => {
+        if (!cancelled) setOutgoingSponsorships(rows);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setOutgoingSponsorships([]);
+        setSponsorshipsError(
+          err.message || "Could not read sponsorships from Horizon."
+        );
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [publicKey, networkId]);
 
   useEffect(() => {
     if (activeTab !== "Offers" || !publicKey) return;
@@ -3384,6 +3417,34 @@ export default function App() {
                       </a>
                     </div>
                   )}
+                  <div className="info-box">
+                    <span className="eyebrow">Sponsorships given</span>
+                    {sponsorshipsError ? (
+                      <p className="muted">{sponsorshipsError}</p>
+                    ) : outgoingSponsorships === null ? (
+                      <p className="muted">Reading sponsorships…</p>
+                    ) : outgoingSponsorships.length === 0 ? (
+                      <p className="muted">No outgoing sponsorships.</p>
+                    ) : (
+                      <ul className="balance-list">
+                        {outgoingSponsorships.map((sponsorship) => (
+                          <li
+                            key={`${sponsorship.sponsoredAccount}-${sponsorship.entryType}`}
+                            className="balance-row"
+                          >
+                            <div>
+                              <strong>
+                                {shortenAddress(sponsorship.sponsoredAccount)}
+                              </strong>
+                              <span className="muted balance-row__issuer">
+                                {sponsorship.entryType}
+                              </span>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
                   <div className="section__row">
                     <button className="btn btn--secondary" type="button" onClick={handleDisconnect}>
                       Disconnect
