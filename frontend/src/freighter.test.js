@@ -9,14 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * - The real SDK is used for tx building, XDR round-trips, and scVal decoding.
  */
 
-const {
-  sorobanServerMock,
-  signTransactionMock,
-  horizonLoadAccountMock,
-  horizonSubmitMock,
-  getNetworkDetailsMock,
-} = vi.hoisted(() => ({
-  getNetworkDetailsMock: vi.fn(),
+const { sorobanServerMock, signTransactionMock, horizonLoadAccountMock, horizonSubmitMock, getNetworkDetailsMock } = vi.hoisted(() => ({
   sorobanServerMock: {
     simulateTransaction: vi.fn(),
     prepareTransaction: vi.fn(),
@@ -27,6 +20,10 @@ const {
   signTransactionMock: vi.fn(),
   horizonLoadAccountMock: vi.fn(),
   horizonSubmitMock: vi.fn(),
+  getNetworkDetailsMock: vi.fn().mockResolvedValue({
+    network: "TESTNET",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  }),
 }));
 
 vi.mock("@stellar/freighter-api", () => ({
@@ -61,6 +58,15 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
         return sorobanServerMock;
       }),
     },
+    Horizon: {
+      ...actual.Horizon,
+      Server: vi.fn(function () {
+        return {
+          loadAccount: horizonLoadAccountMock,
+          submitTransaction: horizonSubmitMock,
+        };
+      }),
+    },
   };
 });
 
@@ -77,6 +83,8 @@ const {
 
 const CONTRACT_ID =
   "CCWLNS5HECRJ2GM3Q6JZZDV334ZXYO6EKZLFPLQRXO6SUDAKMS4U3E3X";
+const CONTRACT_HASH =
+  "CST5BHQPSIWSFMYZUE5RZ7AXZBKTUY76HNISQ7GZYD7U7JKGJBMRQR52";
 const USER = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
 /** Build the same tx shape the helpers build, for XDR round-trip asserts. */
@@ -158,11 +166,13 @@ describe("readKitewellState", () => {
       labName: "Kitewell",
       builderCount: 2,
       builder: "alice",
+      paused: false,
+      admin: USER,
       archived: false,
     });
 
-    // Five parallel reads, each a single invokeHostFunction op.
-    expect(sorobanServerMock.simulateTransaction).toHaveBeenCalledTimes(5);
+    // Four parallel reads, each a single invokeHostFunction op.
+    expect(sorobanServerMock.simulateTransaction).toHaveBeenCalledTimes(4);
     const ops = sorobanServerMock.simulateTransaction.mock.calls.map(
       ([tx]) => tx.operations[0]
     );
@@ -170,7 +180,6 @@ describe("readKitewellState", () => {
       "lab_name",
       "builder_count",
       "get_builder",
-      "paused",
       "get_admin",
     ]);
   });
@@ -186,7 +195,7 @@ describe("readKitewellState", () => {
 
     const state = await readKitewellState(CONTRACT_ID, null);
 
-    expect(state).toEqual({ labName: "Kitewell", builderCount: 0, builder: null, archived: false });
+    expect(state).toEqual({ labName: "Kitewell", builderCount: 0, builder: null, paused: false, admin: null, archived: false });
   });
 
   it("falls back to the zero address when no viewer is passed", async () => {
