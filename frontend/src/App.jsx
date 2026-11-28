@@ -138,6 +138,7 @@ import LabAdminPanel from "./LabAdminPanel";
 import { completeWebAuthChallenge } from "./sep10WebAuth";
 import { loadIssuerCurrencyList } from "./issuerToml";
 import { createPaymentStreamController } from "./paymentStream";
+import LabContractState from "./LabContractState";
 import {
   normaliseTxHash,
   txStatusPresentation,
@@ -1062,6 +1063,7 @@ export default function App() {
       showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
       if (publicKey) refreshBalances();
       else if (activeTab === "Assets") refreshReserve();
+      if (activeTab === "Lab") loadLabInfo();
     } catch (e) {
       showToast(e.message || "Could not switch network.", "error");
     }
@@ -1083,6 +1085,7 @@ export default function App() {
     setNetworkId(network.id);
     setCustomNetworkForm({ name: "", horizonUrl: "", rpcUrl: "", passphrase: "" });
     showToast("Custom network removed. Switched to Testnet.", "info");
+    if (activeTab === "Lab") loadLabInfo();
   };
 
   const loadTrades = async (cursor) => {
@@ -2226,11 +2229,14 @@ export default function App() {
   const loadLabInfo = async () => {
     setLoading("lab");
     setLabError(null);
+    setLabState(null);
+    setLabStateError(null);
+    setAdminState(null);
     try {
       const [health, network] = await Promise.all([fetchHealth(), fetchNetworkInfo()]);
       setLabInfo({ health, network });
-      // Use the freshly fetched id rather than stale state from this render.
-      await readLabState(sessionContractId || network.contract?.kitewell);
+      await refreshLabState(sessionContractId || network.contract?.kitewell || null);
+      return { health, network };
     } catch (e) {
       setLabInfo(null);
       setLabError(
@@ -2265,26 +2271,15 @@ export default function App() {
     checkRpc();
   }, [checkRpc, networkId]);
 
-  const refreshLabState = useCallback(async () => {
-    const contractId = labInfo?.network?.contract?.kitewell;
+  const refreshLabState = useCallback(async (explicitContractId) => {
+    const contractId =
+      explicitContractId !== undefined
+        ? explicitContractId
+        : sessionContractId || labInfo?.network?.contract?.kitewell;
     if (!contractId) {
       setLabState(null);
       setLabStateError(null);
       setAdminState(null);
-      return;
-    }
-
-    // The Soroban RPC must be reachable before the Lab tab simulates or
-    // deploys anything. The backend's Horizon requests are intentionally
-    // unaffected: classic payments only need the Horizon server, not the RPC.
-    if (!rpcHealth.ok) {
-      setLabState(null);
-      setAdminState(null);
-      setLabStateError(
-        rpcHealth.error ||
-          `Soroban RPC unreachable (${rpcHealth.description}). ` +
-          "Switch networks and refresh to recheck."
-      );
       return;
     }
 
@@ -2309,12 +2304,12 @@ export default function App() {
     } catch (e) {
       setLabState(null);
       setLabStateError(
-        e.message || "Could not read the kitewell contract via Soroban RPC."
+        e.message || "Could not load the lab name from the contract."
       );
     } finally {
       setLoading("");
     }
-  }, [labInfo, publicKey, rpcHealth]);
+  }, [labInfo, publicKey, sessionContractId]);
 
   const handleBuilderLookup = async (e) => {
     e.preventDefault();
@@ -2887,7 +2882,7 @@ export default function App() {
       setSessionContractId(result.contractId);
       setDeployedContracts((previous) => [...previous, result]);
       setConfirmRedeploy(false);
-      await readLabState(result.contractId);
+      await refreshLabState(result.contractId);
       const copied = await copyToClipboardResult(result.contractId);
       showToast(
         copied.ok
@@ -3069,7 +3064,6 @@ export default function App() {
     if (tab === "Lab") {
       loadLabInfo().then((info) => {
         const contractId = info?.network?.contract?.kitewell;
-        refreshLabState(contractId);
         refreshTtlInfo(contractId);
         loadBuilderPage(0, contractId);
       });
@@ -5624,8 +5618,8 @@ export default function App() {
                     <button
                       className="btn btn--secondary"
                       type="button"
-                      onClick={refreshLabState}
-                      disabled={loading === "labstate" || !rpcHealth.ok}
+                      onClick={() => refreshLabState()}
+                      disabled={loading === "labstate"}
                     >
                       {loading === "labstate" ? (
                         <>
@@ -5645,40 +5639,12 @@ export default function App() {
                     </div>
                   )}
                   {labState ? (
-                    <div className="info-box">
-                      <span className="eyebrow">Contract state</span>
-                      <div className="metadata-grid">
-                        <div>
-                          <span className="metadata-label">lab_name</span>
-                          <span className="metadata-value">{labState.labName ?? "—"}</span>
-                        </div>
-                        <div>
-                          <span className="metadata-label">builder_count</span>
-                          <span className="metadata-value">{labState.builderCount ?? 0}</span>
-                        </div>
-                        <div>
-                          <span className="metadata-label">get_builder (you)</span>
-                          <span className="metadata-value">
-                            {publicKey ? labState.builder ?? "Not registered" : "Connect to check"}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="metadata-label">paused</span>
-                          <span className="metadata-value">
-                            {labState.paused ? "Yes — registration paused" : "No"}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="metadata-label">get_admin</span>
-                          <span className="metadata-value">
-                            {labState.admin ? shortenAddress(labState.admin) : "Not set"}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
+                    <LabContractState labState={labState} publicKey={publicKey} />
                   ) : (
                     <p className="muted">
-                      Reads lab_name, builder_count, and get_builder via Soroban RPC.
+                      {activeContractId
+                        ? "Reads lab_name, builder_count, and get_builder via Soroban RPC."
+                        : "No contract is configured; there is no lab state to read."}
                     </p>
                   )}
                   <LabAdminPanel
@@ -5694,7 +5660,9 @@ export default function App() {
                   {labStateError && (
                     <div className="info-box info-box--warning">
                       <span className="eyebrow">Contract state</span>
-                      <p className="muted">{labStateError}</p>
+                      <p className="muted">
+                        Could not load the lab name: {labStateError}
+                      </p>
                     </div>
                   )}
 
